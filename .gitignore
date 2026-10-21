@@ -28,6 +28,7 @@ top_gear_rom/**
 *.pdb
 
 # Per-user runtime data and capture files.
+tgod.ini
 *.sav
 *.srm
 *.eep

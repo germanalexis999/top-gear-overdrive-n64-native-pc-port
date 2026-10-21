@@ -139,6 +139,139 @@ static void check_tile_sampling(uint8_t* ram) {
         "Fractional SETTILESIZE origin is truncated before sampling");
 }
 
+static void check_intro_texture_masks(uint8_t* ram) {
+    F3DEX2Interpreter r(ram);
+    r.color_image_addr=0x20000;
+    // Synthetic 320x6 logo strip, using the same COPY/DXT/mask fields as the intro.
+    const uint16_t row_colors[6] = {0xF801,0x07C1,0x003F,0xFFC1,0x07FF,0xF83F};
+    for (int y=0;y<6;++y) for (int x=0;x<320;++x)
+        put16(ram,0x8000+(y*320+x)*2,row_colors[y]);
+    std::memset(ram+r.color_image_addr,0,320*240*2);
+    r.other_mode_h=2u<<20;
+    commands(r,{{0xFD100000,0x8000},{0xF5100000,0x07000000},{0xF3000000,0x0777F01A},
+        {0xF510A000,0x0003C0F0},{0xF2000000,0x004FC014},
+        {0xE44FC014,0},{0xE1000000,0},{0xF1000000,0x10000400}});
+    require(r.tiles[0].mask_s==15 && r.tiles[0].mask_t==15,"Intro masks not decoded");
+    for (int y=0;y<6;++y) for (int x=0;x<320;++x) {
+        uint16_t pixel;std::memcpy(&pixel,ram+r.color_image_addr+(y*320+x)*2,2);
+        require(pixel==row_colors[y],"320x6 COPY strip rejected or misaddressed with masks 15");
+    }
+    auto& tile=r.tiles[0];
+    tile.line=1;tile.lrs=1;tile.lrt=0;tile.mask_s=tile.mask_t=0;
+    const uint16_t colors[4]={0xF801,0x07C1,0x003F,0xFFFF};
+    for (int i=0;i<4;++i) {r.tmem[i*2]=uint8_t(colors[i]>>8);r.tmem[i*2+1]=uint8_t(colors[i]);}
+    uint8_t color[4]{};
+    require(r.sample_tile(tile,2,0,false,color) && color[2]==255 && color[0]==0,
+        "Unmasked coordinates incorrectly wrap at the SETTILESIZE extent");
+    tile.mask_s=3;
+    require(r.sample_tile(tile,2,0,false,color) && color[2]==255 && color[0]==0,
+        "Wrapping mask incorrectly clamps coordinates to the tile extent");
+    tile.mask_s=1;tile.lrs=3;tile.clamp_s=1;
+    require(r.sample_tile(tile,5,0,false,color) && color[1]==255 && color[0]==0,
+        "Clamp and mask must both apply, in that order");
+    tile.clamp_s=0;tile.mask_s=15;
+    require(r.sample_tile(tile,32768,0,false,color) && color[0]==255 && color[1]==0,
+        "Maximum coordinate mask does not wrap at 32768");
+    tile.format=4;tile.size=0;tile.mask_s=0;r.tmem[4095]=0xAB;
+    require(r.sample_tile(tile,-1,0,false,color) && color[0]==187 && color[3]==187,
+        "Unmasked negative 4-bit coordinate does not select the last TMEM nibble");
+    tile.format=0;tile.size=2;
+    tile.mask_s=tile.mask_t=15;
+    r.tiles[1]=tile;r.tiles[0].tmem_addr=32;
+    r.tmem[32]=0x07;r.tmem[33]=0xC1;
+    r.texture_tile=1;r.other_mode_h=0;
+    Vertex3D a{},b{},c{};
+    a.screen_x=4;a.screen_y=4;b.screen_x=12;b.screen_y=4;c.screen_x=4;c.screen_y=12;
+    r.rasterize_triangle_screen(a,b,c);
+    uint16_t pixel;std::memcpy(&pixel,ram+r.color_image_addr+(5*320+5)*2,2);
+    require(pixel==0xF801,"Large triangle masks cause a stale tile-zero fallback");
+}
+
+static void check_render_resolution(uint8_t* ram) {
+    const uint32_t base=0x20000;
+    std::memset(ram+base,0,320*240*2);
+    F3DEX2Interpreter r(ram);r.color_image_addr=base;r.texture_enabled=false;
+    Vertex3D a{},b{},c{};
+    a.screen_x=4.05f;a.screen_y=4.05f;b=a;c=a;b.screen_x=4.45f;c.screen_y=4.45f;
+    a.r=b.r=c.r=255;a.g=b.g=c.g=a.b=b.b=c.b=0;
+    r.rasterize_triangle_screen(a,b,c);
+    uint16_t pixel;std::memcpy(&pixel,ram+base+(4*320+4)*2,2);
+    require(pixel==0,"Native tiny triangle unexpectedly covers a pixel center");
+    require(!r.render_surfaces.set_height(1440),"Unsupported render height accepted");
+    require(r.render_surfaces.set_height(1080),"1080p selection failed");
+    r.rasterize_triangle_screen(a,b,c);
+    std::vector<uint16_t> image;uint32_t width=0,height=0;
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && width==1440 && height==1080,
+        "1080p target does not preserve 4:3 dimensions");
+    require(std::count(image.begin(),image.end(),uint16_t(0xF801))>0,
+        "1080p only scales native pixels instead of rasterizing additional geometry");
+    r.render_surfaces.sync_all();
+    std::memcpy(&pixel,ram+base+(4*320+4)*2,2);
+    require(pixel==0,"Native readback samples a different point than the native pixel center");
+    // Shared color/depth surfaces must see GPU clears through SETCIMG and FILLRECT.
+    r.render_surfaces.set_height(720);
+    r.depth_image_addr=0x50000;
+    commands(r,{{0xFF10013F,0x50000},{0xF7000000,0x0BB80BB8},{0xF6030030,0},
+        {0xFF10013F,base}});
+    a.screen_x=4;a.screen_y=4;b=a;c=a;b.screen_x=12;c.screen_y=12;
+    a.screen_z=b.screen_z=c.screen_z=100;
+    r.geometry_mode=1;r.other_mode_l=0x10;
+    r.rasterize_triangle_screen(a,b,c);
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && width==960 && height==720,
+        "720p dimensions are wrong");
+    require(image[15*width+15]==0,"High-resolution depth ignores a clear through the color target");
+    r.other_mode_l=0x20;r.rasterize_triangle_screen(a,b,c);r.render_surfaces.sync_all();
+    std::memcpy(&pixel,ram+0x50000+(5*320+5)*2,2);
+    require(pixel==3200,"High-resolution depth writes are not mirrored to native RDRAM");
+    r.other_mode_l=0;r.geometry_mode=4;
+    r.tiles[0]=F3DEX2Interpreter::Tile{};r.tiles[0].size=2;r.tiles[0].line=1;
+    r.tiles[0].clamp_s=r.tiles[0].clamp_t=1;r.tmem[0]=0xF8;r.tmem[1]=1;
+    commands(r,{{0xE4020020,0x00010010},{0xE1000000,0},{0xF1000000,0}});
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && image[15*width+15]==0xF801,
+        "HUD rectangles use a native stride on the enlarged target");
+    a.screen_y=b.screen_y=16;a.screen_x=4;b.screen_x=12;
+    a.is_screen_space=b.is_screen_space=true;
+    r.rasterize_line(a,b,1,a);
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && image[48*width+18]==0xF801,
+        "L3DEX2 lines do not follow the internal resolution");
+    // CPU edits between display lists import into the cached target.
+    pixel=0x003F;std::memcpy(ram+base+(5*320+5)*2,&pixel,2);
+    r.render_surfaces.begin_task(ram);
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && image[15*width+15]==0x003F,
+        "CPU framebuffer changes are lost in the high-resolution cache");
+    auto surface=r.render_buffer(base);surface.pixels[3*surface.width]=0x07C1;
+    require(r.render_surfaces.copy_scanout(base+640,320,240,image,width,height) && image[0]==0x07C1,
+        "VI origin row offset is not applied to the enlarged framebuffer");
+    // Fill both native pixels in the word: framebuffer rows retain the existing
+    // host-pixel layout while texture DMA uses the asset word-swapped layout.
+    surface.pixels[surface.width+1]=surface.pixels[surface.width+4]=0xF801;
+    commands(r,{{0xFD100003,base},{0xF5100000,0x07000000},{0xF3000000,0x07003000}});
+    require(r.tmem[0]==0xF8 && r.tmem[1]==1,"Framebuffer textures read stale native data before LOADBLOCK");
+    r.render_surfaces.sync_range(base,2);
+    require(r.render_surfaces.set_height(0) && !r.render_surfaces.copy_scanout(base,320,240,image,width,height),
+        "Switching back to native leaves high-resolution targets active");
+    r.render_surfaces.set_height(1080);r.color_image_width=640;
+    surface=r.render_buffer(0x100000);
+    require(surface.width==1440 && surface.height==1080 && surface.scale==2.25f,
+        "Interlaced/showroom target uses the race scale");
+    // Bound cache memory and preserve dirty native readback when evicting targets.
+    r.color_image_width=320;
+    for (int i=0;i<10;++i) {
+        surface=r.render_buffer(0x200000+i*0x30000);
+        surface.pixels[2*surface.width+2]=uint16_t(0x1001+i);
+    }
+    std::memcpy(&pixel,ram+0x200000,2);
+    require(pixel==0x1001,"Evicting an enlarged target loses its native readback");
+    const std::vector<uint8_t> native_before(ram,ram+8*1024*1024);
+    std::vector<uint8_t> private_ram=native_before;
+    F3DEX2Interpreter replay=r;
+    replay.rdram=private_ram.data();replay.render_surfaces.clear();replay.render_surfaces.set_height(1080);
+    replay.color_image_addr=base;replay.geometry_mode=0;replay.other_mode_l=0;
+    replay.rasterize_triangle_screen(a,b,c);replay.render_surfaces.sync_all();
+    require(!std::memcmp(native_before.data(),ram,native_before.size()),
+        "HD replay changes authoritative game RDRAM");
+}
+
 static void check_second_texture(uint8_t* ram) {
     F3DEX2Interpreter r(ram);
     r.color_image_addr = 0x20000;
@@ -587,6 +720,8 @@ int main() {
         std::vector<uint8_t> ram(8 * 1024 * 1024);
         check_texture_rows(ram.data());
         check_tile_sampling(ram.data());
+        check_intro_texture_masks(ram.data());
+        check_render_resolution(ram.data());
         check_second_texture(ram.data());
         check_texture_lod(ram.data());
         check_texture_formats(ram.data());
@@ -598,7 +733,7 @@ int main() {
         check_hud_combiner_and_depth(ram.data());
         check_lighting(ram.data());
         check_line_microcode(ram.data());
-        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting, texgen and L3DEX2 lines/switches\n";
+        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats/masks, intro COPY strips, internal 720p/1080p rendering/readback, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting, texgen and L3DEX2 lines/switches\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

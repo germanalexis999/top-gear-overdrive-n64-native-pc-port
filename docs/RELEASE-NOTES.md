@@ -1,4 +1,4 @@
-## v0.1.0-preview.5 — Windows 10/11 x64
+## v0.1.0-preview.6 — Windows 10/11 x64
 
 Descarga el ZIP de Windows de los archivos adjuntos, extráelo completo y abre
 `Jugar.cmd` o `tgod_native.exe`. Selecciona una **ROM propia de Top Gear Overdrive
@@ -11,6 +11,15 @@ capturas, música ni guardados.** La ROM se lee localmente y no se envía a serv
 
 Cambios principales:
 
+- Reparada la intro: KEMCO, Snowblind y portada vuelven a dibujarse. Las máscaras
+  de coordenadas ya no se confunden con las dimensiones de las texturas.
+- F6 selecciona resolución nativa, 720p o 1080p y guarda la preferencia en
+  `tgod.ini`. Se mantiene 4:3: 960x720 y 1440x1080, con barras laterales en 16:9.
+- El trabajo HD se realiza en un hilo separado sobre copias privadas. El juego
+  conserva el render y los eventos nativos para evitar la alteración de físicas
+  observada cuando el modo HD se ejecutaba de forma sincrónica.
+- Comparación del mismo cuadro en tres resoluciones con `--resolution-check`,
+  y recorrido completo de la intro mediante `--intro-check`, ambos headless.
 - Implementado el dibujo de líneas L3DEX2, que antes se descartaban durante
   la carrera: ancho, color plano/suave, mezcla, recorte y controles de profundidad.
 - Selección de microcódigo desde cada tarea y cambios mediante LOAD_UCODE,
@@ -26,12 +35,19 @@ Cambios principales:
 - MODIFYVTX conserva clip W/Z y respeta los modos de perspectiva/filtrado.
 - Recorrido de diagnóstico con frenado/derrape mediante --graphics-check.
 
-Las pruebas de fuentes incluyen líneas, cambios de microcódigo, HUD, mezcla/alfa,
-controles Z, profundidad primitiva y filtrado. Un recorrido de gráficos de 60 s
-mantuvo carrera, 4/4 catálogos, EEPROM y cero descartes de audio; no se registraron
-comandos desconocidos ni microcódigos sin reconocer.
+**720p/1080p son experimentales: la imagen HD todavía tiene pocos FPS y retraso
+con el renderer por CPU. Nativo es el valor predeterminado recomendado para jugar.**
+El hilo HD descarta cuadros pendientes para conservar el avance nativo del juego.
+Las texturas siguen siendo las originales; aumentar resolución mejora contornos
+pero no crea detalle en sus imágenes.
+
+Las pruebas de fuentes incluyen máscaras de intro, resoluciones, readback,
+aislamiento de RDRAM, HUD, profundidad y líneas. Los recorridos de 30 s en
+720p/1080p mantuvieron carrera, 4/4 catálogos, EEPROM y cero descartes/reemplazos
+de audio. Se verificó la intro completa durante 38 s.
 El ZIP se comprueba por separado con PATH limitado a Windows, tres órdenes de
-bytes de ROM y una carrera de 16 s. La ROM de prueba no forma parte del paquete.
+bytes de ROM, una carrera de 16 s en nativo y otra de 20 s con salida 1080p
+asíncrona. La ROM de prueba no forma parte del paquete.
 
 El usuario confirmó que el HUD y el humo quedaron corregidos en sus pruebas.
 Persisten diferencias de coverage, profundidad comprimida, dither, mezcla y

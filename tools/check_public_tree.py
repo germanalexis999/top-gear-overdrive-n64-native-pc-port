@@ -17,6 +17,7 @@ EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
          "LICENSES/RT64-MIT.txt", "LICENSES/N64ModernRuntime-GPL-3.0.txt"}
 EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "include/vi_scanout.hpp",
+              "include/render_surface.hpp",
               "tools/package_windows.py", "tools/publish_release.py", "tools/test_windows_package.py",
               "tools/release_windows.ps1",
               "docs/RELEASES.md", "docs/RELEASE-NOTES.md",

@@ -21,6 +21,11 @@ Arranca, recorre los menús y entra a carrera. Se corrigieron la sobreproducció
 de audio, bloqueos del scheduler y la corrupción del viewport que ocultaba la
 escena 3D. La fidelidad visual y de audio todavía está en desarrollo.
 
+Las fuentes posteriores a preview.5 añaden resolución interna nativa/720p/1080p
+con F6 y configuración persistente en `tgod.ini`. Los modos HD son experimentales
+y lentos con el renderer por CPU; consulta los límites y la comparación de cuadros
+en [BUILDING.md](docs/BUILDING.md#resolución-interna-y-configuración-gráfica).
+
 - [Compilación, ROM local, pruebas y controles](docs/BUILDING.md)
 - [Estado, evidencia y pendientes](docs/STATUS.md)
 - [Dependencias y avisos de terceros](THIRD_PARTY_NOTICES.md)

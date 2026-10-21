@@ -20,8 +20,18 @@ Los programas y DLL del paquete no tienen firma Authenticode.
 Controles:
   Enter = Start; X/Espacio = A; Z/Retroceso = B; C = gatillo Z
   A/S = L/R; flechas = direccion; Escape = salir
-  F1-F4 = escala; F5 = filtro; F11 o Alt+Enter = pantalla completa
+  F1-F4 = ventana; F5 = filtro; F6 = resolucion interna
+  F11 o Alt+Enter = pantalla completa
   Tambien se detectan mandos XInput.
+
+F6 alterna nativo/720p/1080p y guarda RenderHeight=0/720/1080 en la seccion
+[Graphics] de tgod.ini junto al EXE. El formato sigue siendo 4:3: 1080p dibuja
+1440x1080, con barras laterales en un monitor 1920x1080.
+HD es experimental y lento con el renderer por CPU actual. Se dibuja en un
+hilo separado; el juego conserva el avance nativo. La imagen HD puede tener
+pocos FPS y retraso. Usa nativo para jugar con la menor latencia.
+HD sirve para comparar contornos y detalle. Las texturas son las
+originales. F1-F4/F5 solo cambian la ventana y el filtro de presentacion.
 
 Esta version recupera numeros del HUD y el titulo del showroom, y corrige
 mezcla, profundidad y filtrado de particulas. HUD y humo confirmados como

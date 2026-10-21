@@ -9,6 +9,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <iomanip>
 #include <algorithm>
 
@@ -45,6 +46,11 @@ static std::atomic<float> g_stick_x{0.0f};
 static std::atomic<float> g_stick_y{0.0f};
 static std::atomic<bool> g_running{true};
 static bool g_is_headless = false;
+static std::atomic<uint32_t> g_render_height{0};
+static bool g_resolution_check = false;
+static std::atomic<bool> g_resolution_check_done{false};
+static std::atomic<uint64_t> g_native_render_us{0},g_native_render_count{0},g_native_render_max_us{0};
+static std::filesystem::path g_graphics_config;
 static HWND g_hwnd = nullptr;
 static std::atomic<uint64_t> g_rsp_task_types[5]{}; // 0..3 plus unclassified.
 
@@ -507,6 +513,118 @@ public:
 
 static Win32AudioBackend g_audio_backend;
 
+static uint32_t graphics_scene(const uint8_t* ram) {
+    uint32_t mode=0;std::memcpy(&mode,ram+0x117DA4,4);
+    return (mode&255)|(uint32_t(ram[0xE97C2^3])<<8)|
+        (mode==0 ? uint32_t(ram[0x53650^3])<<16 : 0);
+}
+
+// Native RDP work remains authoritative for RSP/DP completion and game timing.
+// HD replays run on private RDRAM; a slow frame never holds up those events.
+class AsyncHDRenderer {
+    struct Job {
+        std::vector<uint8_t> ram;
+        F3DEX2Interpreter interpreter;
+        uint32_t dl=0,data=0,data_size=0,height=0,scene=0,offset=0;
+        uint32_t scanout_width=0,scanout_height=0;
+        uint64_t generation=0;
+    };
+    struct Frame {
+        std::vector<uint16_t> pixels;
+        uint32_t width=0,height=0,scene=0,requested_height=0;
+        uint64_t generation=0;
+    };
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::unique_ptr<Job> pending;
+    Frame latest;
+    std::thread worker;
+    bool stopping=false;
+    uint32_t requested_height=0;
+    uint64_t generation=0;
+    std::chrono::steady_clock::time_point last_capture{};
+    std::atomic<uint64_t> completed{0},replaced{0},last_ms{0};
+    void run() {
+        SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+            std::unique_ptr<Job> job;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock,[&] {return stopping || pending!=nullptr;});
+                if (stopping) return;
+                job=std::move(pending);
+            }
+            const auto start=std::chrono::steady_clock::now();
+            auto& r=job->interpreter;
+            r.rdram=job->ram.data();r.diagnostics_enabled=false;
+            r.render_surfaces.clear();r.render_surfaces.set_height(job->height);
+            r.process_display_list(job->dl,job->data,job->data_size);
+            Frame frame;
+            frame.scene=job->scene;frame.requested_height=job->height;frame.generation=job->generation;
+            const bool matching_scanout=job->scanout_width==r.color_image_width && job->scanout_height;
+            const bool valid=r.render_surfaces.copy_scanout(r.color_image_addr+(matching_scanout ? job->offset : 0),
+                r.color_image_width,matching_scanout ? job->scanout_height : r.framebuffer_height(),
+                frame.pixels,frame.width,frame.height);
+            last_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
+            std::lock_guard lock(mutex);
+            if (valid && !stopping && job->generation==generation && job->height==requested_height) {
+                latest=std::move(frame);completed.fetch_add(1);
+            }
+        }
+    }
+public:
+    void submit(const F3DEX2Interpreter& interpreter,const OSTask* task,uint32_t height) {
+        const auto now=std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(mutex);
+            if (stopping) return;
+            if (height!=requested_height) {
+                requested_height=height;++generation;pending.reset();latest=Frame{};last_capture={};
+            }
+            if (!height || now-last_capture<std::chrono::milliseconds(100)) return;
+            last_capture=now;
+        }
+        auto job=std::make_unique<Job>();
+        job->ram.assign(interpreter.rdram,interpreter.rdram+8*1024*1024);
+        job->interpreter=interpreter;
+        job->dl=task->t.data_ptr;job->data=task->t.ucode_data;job->data_size=task->t.ucode_data_size;
+        job->height=height;job->scene=graphics_scene(job->ram.data());
+        auto vi=ultramodern::renderer::get_vi_regs();
+        if (vi) {
+            const auto frame=tgod::vi_frame_layout(*vi);
+            if (frame.visible) {job->scanout_width=frame.width;job->scanout_height=frame.height;}
+            const uint32_t origin=vi->VI_ORIGIN_REG&0x1FFFFFFF;
+            if (origin>=interpreter.color_image_addr &&
+                origin-interpreter.color_image_addr<interpreter.color_image_width*8)
+                job->offset=origin-interpreter.color_image_addr;
+        }
+        std::lock_guard lock(mutex);
+        if (stopping || height!=requested_height) return;
+        job->generation=generation;
+        if (pending) replaced.fetch_add(1);
+        pending=std::move(job);
+        if (!worker.joinable()) worker=std::thread([this] {run();});
+        wake.notify_one();
+    }
+    bool copy_frame(uint32_t scene,uint32_t height,std::vector<uint16_t>& pixels,uint32_t& w,uint32_t& h) {
+        std::lock_guard lock(mutex);
+        if (!height || latest.pixels.empty() || latest.scene!=scene || latest.requested_height!=height ||
+            latest.generation!=generation) return false;
+        pixels=latest.pixels;w=latest.width;h=latest.height;
+        return true;
+    }
+    void shutdown() {
+        {std::lock_guard lock(mutex);stopping=true;pending.reset();}
+        wake.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+    void diagnostics() const {
+        std::cout << "[HD worker] Completed: " << completed.load() << ", pending snapshots replaced: "
+                  << replaced.load() << ", last replay: " << last_ms.load() << " ms; native timing path retained.\n";
+    }
+};
+static AsyncHDRenderer g_hd_renderer;
+
 // Native implementation of __osAiDeviceBusy (func_8004A580)
 // Return 0 so game audio engine never triggers assertion failure (func_80009480)
 extern "C" void func_8004A580(uint8_t* rdram, recomp_context* ctx) {
@@ -562,11 +680,27 @@ class PresentedFrame {
     std::vector<uint8_t> pixels;
     uint32_t width = 0, height = 0;
 public:
-    void update(const uint8_t* ram, uint32_t origin, uint32_t w, uint32_t h) {
+    void update(F3DEX2Interpreter& interpreter,const uint8_t* ram, uint32_t origin, uint32_t w, uint32_t h) {
         if (!origin || origin + uint64_t(w)*h*2 > 8*1024*1024) return;
         std::lock_guard lock(mutex);
-        width = w; height = h;
-        pixels.assign(ram + origin, ram + origin + size_t(w)*h*2);
+        std::vector<uint16_t> rendered;
+        if (g_hd_renderer.copy_frame(graphics_scene(ram),g_render_height.load(),rendered,width,height) ||
+            interpreter.render_surfaces.copy_scanout(origin,w,h,rendered,width,height)) {
+            pixels.resize(rendered.size()*2);
+            std::memcpy(pixels.data(),rendered.data(),pixels.size());
+        } else {
+            width = w; height = h;
+            pixels.assign(ram + origin, ram + origin + size_t(w)*h*2);
+        }
+    }
+    void rgba(std::vector<uint32_t>& output,uint32_t& w,uint32_t& h) {
+        std::lock_guard lock(mutex);
+        w=width;h=height;output.resize(size_t(w)*h);
+        const auto* source=reinterpret_cast<const uint16_t*>(pixels.data());
+        for (size_t i=0;i<output.size();++i) {
+            const uint16_t px=source[i];
+            output[i]=(((px>>11)&31)*255/31<<16)|(((px>>6)&31)*255/31<<8)|(((px>>1)&31)*255/31);
+        }
     }
     void save(const char* path) {
         std::lock_guard lock(mutex);
@@ -578,6 +712,48 @@ public:
     }
 };
 static PresentedFrame g_presented_frame;
+
+static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* task) {
+    if (!task || !task->t.data_ptr) return;
+    interpreter.render_surfaces.set_height(0);
+    g_hd_renderer.submit(interpreter,task,g_render_height.load());
+    auto render_native=[&] {
+        const auto start=std::chrono::steady_clock::now();
+        interpreter.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
+        const uint64_t us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+        g_native_render_us.fetch_add(us);g_native_render_count.fetch_add(1);
+        g_native_render_max_us.store(std::max(g_native_render_max_us.load(),us));
+    };
+    static uint32_t race_frames=0;
+    uint32_t mode=0;std::memcpy(&mode,interpreter.rdram+0x117DA4,4);
+    if (g_resolution_check && !g_resolution_check_done.load() && mode==2 && ++race_frames==100) {
+        // Replay one captured display list with its initial RDRAM and RSP/RDP state
+        // at each height. This compares identical geometry rather than two moving races.
+        const std::vector<uint8_t> initial_ram(interpreter.rdram,interpreter.rdram+8*1024*1024);
+        const F3DEX2Interpreter initial_state=interpreter;
+        render_native();
+        save_fb_to_bmp("framebuffer_compare_native.bmp",interpreter.rdram,interpreter.color_image_addr,
+            interpreter.color_image_width,interpreter.framebuffer_height());
+        for (const uint32_t height : {720u,1080u}) {
+            std::vector<uint8_t> ram=initial_ram;
+            F3DEX2Interpreter replay=initial_state;
+            replay.diagnostics_enabled=false;
+            replay.rdram=ram.data();replay.render_surfaces.clear();replay.render_surfaces.set_height(height);
+            const auto start=std::chrono::steady_clock::now();
+            replay.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
+            const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+            std::vector<uint16_t> pixels;uint32_t w=0,h=0;
+            if (replay.render_surfaces.copy_scanout(replay.color_image_addr,replay.color_image_width,
+                replay.framebuffer_height(),pixels,w,h)) {
+                const std::string name="framebuffer_compare_"+std::to_string(height)+"p.bmp";
+                save_fb_to_bmp(name.c_str(),reinterpret_cast<const uint8_t*>(pixels.data()),0,w,h);
+                std::cout << "[Resolution comparison] Same DL rendered at native and " << w << 'x' << h
+                          << "; " << height << "p replay took " << ms << " ms.\n";
+                if (height==1080) g_resolution_check_done.store(true);
+            }
+        }
+    } else render_native();
+}
 
 // Minimal Null Renderer Context for headless execution & verification
 class NullRendererContext : public ultramodern::renderer::RendererContext {
@@ -597,7 +773,7 @@ public:
     void send_dl(const OSTask* task) override {
         uint32_t count = dl_count++;
         if (task && task->t.data_ptr) {
-            interpreter.process_display_list(task->t.data_ptr, task->t.ucode_data, task->t.ucode_data_size);
+            process_graphics_task(interpreter,task);
         }
         if (count < 3 && task) {
             std::cout << "[GFX DL #" << count << "] Type: " << task->t.type
@@ -614,7 +790,7 @@ public:
         auto vi = ultramodern::renderer::get_vi_regs();
         if (vi) {
             const auto frame = tgod::vi_frame_layout(*vi);
-            if (frame.visible) g_presented_frame.update(rdram, frame.origin, frame.width, frame.height);
+            if (frame.visible) g_presented_frame.update(interpreter,rdram, frame.origin, frame.width, frame.height);
             else g_presented_frame.blank();
         }
         if (count < 3) {
@@ -627,7 +803,10 @@ public:
     }
     void shutdown() override {}
     uint32_t get_display_framerate() const override { return 60; }
-    float get_resolution_scale() const override { return 1.0f; }
+    float get_resolution_scale() const override {
+        const auto height=interpreter.render_surfaces.height();
+        return height ? float(height)/interpreter.framebuffer_height() : 1.0f;
+    }
 };
 
 static std::atomic<bool> g_filter_smooth{true};
@@ -751,7 +930,7 @@ public:
     void send_dl(const OSTask* task) override {
         uint32_t count = dl_count++;
         if (task && task->t.data_ptr) {
-            interpreter.process_display_list(task->t.data_ptr, task->t.ucode_data, task->t.ucode_data_size);
+            process_graphics_task(interpreter,task);
         }
         if (count < 3 && task) {
             std::cout << "[GFX DL #" << count << "] Type: " << task->t.type
@@ -793,25 +972,15 @@ public:
 
         if (origin + width * height * 2 <= 8 * 1024 * 1024) {
             std::lock_guard lock(presentation_mutex);
-            g_presented_frame.update(rdram, origin, width, height);
-            rgba_pixels.resize(size_t(width) * height);
-            bmi.bmiHeader.biWidth = width;
-            bmi.bmiHeader.biHeight = -int32_t(height);
-            const uint16_t* src = reinterpret_cast<const uint16_t*>(rdram + origin);
-            for (size_t y = 0; y < height; y++) {
-                size_t src_y = (y >= height - 1) ? (height - 2) : y;
-                for (size_t x = 0; x < width; x++) {
-                    uint16_t px = src[src_y * width + x];
-                    uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
-                    uint8_t g = ((px >> 6) & 0x1F) * 255 / 31;
-                    uint8_t b = ((px >> 1) & 0x1F) * 255 / 31;
-                    rgba_pixels[y * width + x] = (r << 16) | (g << 8) | b;
-                }
-            }
+            g_presented_frame.update(interpreter,rdram, origin, width, height);
+            uint32_t rendered_width=0,rendered_height=0;
+            g_presented_frame.rgba(rgba_pixels,rendered_width,rendered_height);
+            bmi.bmiHeader.biWidth = rendered_width;
+            bmi.bmiHeader.biHeight = -int32_t(rendered_height);
 
             HDC hdc = GetDC(hwnd);
             if (hdc) {
-                render_frame_to_dc(hdc, hwnd, rgba_pixels.data(), &bmi, width, height);
+                render_frame_to_dc(hdc, hwnd, rgba_pixels.data(), &bmi, rendered_width, rendered_height);
                 ReleaseDC(hwnd, hdc);
             }
         }
@@ -819,7 +988,10 @@ public:
 
     void shutdown() override {}
     uint32_t get_display_framerate() const override { return 60; }
-    float get_resolution_scale() const override { return 1.0f; }
+    float get_resolution_scale() const override {
+        const auto height=interpreter.render_surfaces.height();
+        return height ? float(height)/interpreter.framebuffer_height() : 1.0f;
+    }
 };
 
 static NullRendererContext* g_renderer_null = nullptr;
@@ -923,6 +1095,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 resize_window_scale(hwnd, 4); // 1280x960
             } else if (wParam == VK_F5) {
                 g_filter_smooth.store(!g_filter_smooth.load());
+            } else if (wParam == VK_F6 && !(lParam&(1l<<30))) {
+                const auto current=g_render_height.load();
+                const uint32_t next=current==0 ? 720 : current==720 ? 1080 : 0;
+                g_render_height.store(next);
+                const auto value=std::to_wstring(next);
+                if (!WritePrivateProfileStringW(L"Graphics",L"RenderHeight",value.c_str(),g_graphics_config.c_str()))
+                    std::cerr << "[Graphics] Could not save tgod.ini; resolution applies to this session.\n";
             } else if (wParam == VK_F11) {
                 toggle_fullscreen(hwnd);
             }
@@ -962,9 +1141,11 @@ int main(int argc, char** argv) {
 
     bool headless = false;
     bool graphics_check = false;
+    bool intro_check = false;
     bool verify_only = false;
     bool explicit_rom = false;
     int headless_seconds = 4;
+    int render_height_override = -1;
     std::filesystem::path rom_path = "top_gear_rom/normalized/Top Gear Overdrive (USA).z64";
 
     // The Unicode command line preserves non-ASCII ROM paths and drag-and-drop.
@@ -981,6 +1162,16 @@ int main(int argc, char** argv) {
             g_is_headless = true;
         } else if (arg == L"--graphics-check") {
             graphics_check = true;
+        } else if (arg == L"--intro-check") {
+            intro_check = true;
+        } else if (arg == L"--resolution-check") {
+            g_resolution_check = true;
+        } else if (arg == L"--render-height" && i+1<arguments.size()) {
+            const auto& value=arguments[++i];
+            if (value==L"0" || value==L"native") render_height_override=0;
+            else if (value==L"720") render_height_override=720;
+            else if (value==L"1080") render_height_override=1080;
+            else {std::cerr << "--render-height expects native, 720 or 1080.\n";return 2;}
         } else if (arg == L"--verify-rom") {
             verify_only = true;
         } else if (arg == L"--seconds" && i + 1 < arguments.size()) {
@@ -989,7 +1180,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--headless --seconds N [--graphics-check]] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -1002,6 +1193,14 @@ int main(int argc, char** argv) {
 
     if (graphics_check && !headless) {
         std::cerr << "--graphics-check requires --headless.\n";
+        return 2;
+    }
+    if (intro_check && (!headless || graphics_check)) {
+        std::cerr << "--intro-check requires --headless and cannot be combined with --graphics-check.\n";
+        return 2;
+    }
+    if (g_resolution_check && (!headless || intro_check || render_height_override>0)) {
+        std::cerr << "--resolution-check requires --headless, native rendering and no --intro-check.\n";
         return 2;
     }
     std::error_code path_error;
@@ -1022,6 +1221,15 @@ int main(int argc, char** argv) {
     // Keep saves/diagnostics with the portable program even when launched from
     // a shortcut, a different working directory, or by dropping a ROM onto it.
     const auto program_directory = tgod::executable_directory();
+    g_graphics_config=program_directory/L"tgod.ini";
+    uint32_t selected_height=headless ? 0 : GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,g_graphics_config.c_str());
+    if (selected_height!=720 && selected_height!=1080) selected_height=0;
+    if (render_height_override>=0) selected_height=uint32_t(render_height_override);
+    g_render_height.store(selected_height);
+    if (!headless && !std::filesystem::exists(g_graphics_config))
+        WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"0",g_graphics_config.c_str());
+    std::cout << "[Graphics] Internal resolution: " << (selected_height ? std::to_string(selected_height)+"p (4:3)" : "native")
+              << "; F6 cycles native/720p/1080p. Software rendering.\n";
     if (!program_directory.empty()) {
         std::filesystem::current_path(program_directory, path_error);
         if (path_error) {
@@ -1103,7 +1311,7 @@ int main(int argc, char** argv) {
     ultramodern::input::set_callbacks(input_cbs);
     std::cout << "[Host] Input callbacks registered:\n"
               << "       Enter=Start | X/Space=A | Z/Back=B | C=Z-Trig | A/S=L/R | Arrows=D-Pad/Stick | Esc=Quit\n"
-              << "       F1-F4=Scale (1x-4x) | F5=Toggle Filter (Crisp/Smooth) | F11 / Alt+Enter=Fullscreen\n";
+              << "       F1-F4=Window Scale | F5=Output Filter | F6=Internal Resolution | F11 / Alt+Enter=Fullscreen\n";
 
     ultramodern::rsp::callbacks_t rsp_cbs{};
     rsp_cbs.init = []() {};
@@ -1246,9 +1454,10 @@ int main(int argc, char** argv) {
                 uint32_t tris = g_renderer_win32 ? g_renderer_win32->interpreter.triangles_drawn : 0;
                 char title_buf[256];
                 std::snprintf(title_buf, sizeof(title_buf),
-                    "Top Gear Overdrive (PC) | %s | %.1f FPS | Tris: %u | Audio: %u buf | Filter: %s [F5]",
+                    "Top Gear Overdrive (PC) | %s | %.1f FPS | Tris: %u | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
                     mode_name, fps, tris, g_audio_backend.buffers_queued.load(),
-                    g_filter_smooth.load() ? "Smooth" : "Crisp");
+                    g_filter_smooth.load() ? "Smooth" : "Crisp",
+                    g_render_height.load()==1080 ? "1080p" : g_render_height.load()==720 ? "720p" : "Native");
                 SetWindowTextA(g_hwnd, title_buf);
 
                 static auto last_console_log = std::chrono::steady_clock::now();
@@ -1272,7 +1481,8 @@ int main(int argc, char** argv) {
         }
         std::cout << "\n[Host] Window closed. Shutting down.\n";
     } else {
-        std::cout << "[Host] Waiting " << (headless_seconds * 1000) << " ms for background game threads (automated navigation to Mode 2)...\n";
+        std::cout << "[Host] Waiting " << (headless_seconds * 1000) << " ms for background game threads ("
+                  << (intro_check ? "uninterrupted intro capture" : "automated navigation to Mode 2") << ")...\n";
         for (int s = 0; s < headless_seconds * 10; s++) {
             // Periodic button pulses to navigate menus:
             // 2.5s-2.8s: Start + A (Intro -> Mode 1)
@@ -1297,7 +1507,14 @@ int main(int argc, char** argv) {
             uint32_t cur_mode = read_rdram_u32(rdram, 0x80117DA4);
             uint8_t sub = read_rdram_u8(rdram, 0x800E97C2);
 
-            if (cur_mode == 2) {
+            if (intro_check) {
+                g_buttons.store(0);
+                g_stick_x.store(0.0f);
+                if ((s+1)%5 == 0) {
+                    const std::string filename = "framebuffer_intro_"+std::to_string(s+1)+".bmp";
+                    g_presented_frame.save(filename.c_str());
+                }
+            } else if (cur_mode == 2) {
                 // In Mode 2 (Race):
                 static int race_ticks = 0;
                 race_ticks++;
@@ -1440,6 +1657,8 @@ int main(int argc, char** argv) {
     uint32_t rects = g_renderer_win32 ? g_renderer_win32->interpreter.rects_drawn : (g_renderer_null ? g_renderer_null->interpreter.rects_drawn : 0);
     std::cout << "[Host] 2D Textured rects rasterized: " << rects << "\n";
     const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
+    const float authoritative_scale=interp.render_surfaces.height() ?
+        float(interp.render_surfaces.height())/interp.framebuffer_height() : 1.0f;
     std::cout << "[Host] F3DEX2 Opcodes Encountered:\n";
     for (int op = 0; op < 256; op++) {
         if (interp.opcode_counts[op] > 0) {
@@ -1560,7 +1779,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "  Non-zero 16-bit pixels: " << non_zero << " / " << (width * height) << "\n";
 
-            save_fb_to_bmp("framebuffer.bmp", rdram, origin, width, height);
+            g_presented_frame.save("framebuffer.bmp");
             save_fb_to_bmp("framebuffer_0x1d6380.bmp", rdram, 0x1d6380, width, height);
             save_fb_to_bmp("framebuffer_0x1fbb80.bmp", rdram, 0x1fbb80, width, height);
         }
@@ -1569,6 +1788,10 @@ int main(int argc, char** argv) {
     std::cout << "\n[Host] Top Gear Overdrive runner completed.\n";
 
     ultramodern::quit();
+    g_hd_renderer.shutdown();
+    g_hd_renderer.diagnostics();
+    std::cout << "[Native render] Average: " << g_native_render_us.load()/std::max(uint64_t(1),g_native_render_count.load())
+              << " us, maximum: " << g_native_render_max_us.load() << " us; scale: " << authoritative_scale << ".\n";
     g_audio_backend.shutdown();
     ultramodern::join_saving_thread();
     if (std::filesystem::exists("saves/tgod_usa.bin")) {
@@ -1578,5 +1801,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::flush;
     std::fflush(stdout);
-    std::quick_exit((loaded_count == 4) ? 0 : 2);
+    if (g_resolution_check && !g_resolution_check_done.load())
+        std::cerr << "[Resolution comparison] Race frame was not captured; increase --seconds.\n";
+    std::quick_exit((loaded_count == 4 && (!g_resolution_check || g_resolution_check_done.load())) ? 0 : 2);
 }

@@ -2,6 +2,7 @@
 """Check a portable ZIP with Windows-only PATH and a private local test ROM."""
 import argparse
 import os
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -43,6 +44,13 @@ def main():
         run(["--headless", "--seconds", "1"], 2)
         run(["--unknown"], 2)
         run(["--graphics-check"], 2)
+        run(["--intro-check"], 2)
+        run(["--headless", "--intro-check", "--graphics-check"], 2)
+        run(["--render-height", "999"], 2)
+        run(["--render-height"], 2)
+        run(["--resolution-check"], 2)
+        run(["--headless", "--resolution-check", "--intro-check"], 2)
+        run(["--headless", "--resolution-check", "--render-height", "1080"], 2)
         run(["--verify-rom", "--rom", rom])
         cases = temporary / "ROM con espacios y acentos á"
         cases.mkdir()
@@ -69,7 +77,14 @@ def main():
         if not all(marker in log for marker in required):
             raise RuntimeError("Packaged race/audio/save check failed:\n" + log[-2500:])
         (ROOT / "build/package-test.log").write_text(log, encoding="utf-8")
+        hd_log=run(["--headless","--render-height","1080","--seconds","20","--rom",rom],timeout=45)
+        if not all(marker in hd_log for marker in required) or not re.search(r"\[HD worker\] Completed: [1-9]\d*",hd_log):
+            raise RuntimeError("Packaged asynchronous HD/native timing check failed:\n"+hd_log[-2500:])
+        if not re.search(r"\[Native render\].*scale: 1(?:\.0+)?\.",hd_log):
+            raise RuntimeError("HD changed the authoritative native rendering path")
+        (ROOT / "build/package-test-hd.log").write_text(hd_log,encoding="utf-8")
         print("PASS: Windows-only PATH, included DLLs, Unicode paths, 3 ROM byte orders, invalid ROM rejection, race/audio/save")
+        print("PASS: asynchronous 1080p output with native game timing, race, audio and save")
     # The tested extraction is discarded, never repackaged with its private data.
 
 

@@ -274,6 +274,158 @@ no implica fidelidad completa de líneas ni validación de todos los circuitos.
 Esta corrección se incorpora al paquete preview.5; la descarga preview.4
 conserva el renderer anterior sin soporte de líneas L3DEX2.
 
+## Intro: logos negros y nieve sin fondo
+
+### Reproducción y causa
+
+El usuario informó gráficos rotos en los logos de arranque, incluido Snowblind.
+La navegación automática usada antes pulsaba Start/A a partir de 2,5 s, antes
+de observar la animación completa. El nuevo recorrido `--headless --intro-check`
+mantiene los botones en cero y captura un cuadro presentado cada 0,5 s.
+
+En la reproducción de 40 s, KEMCO salía negro; después solo se veían puntos de
+nieve y restos del mismo patrón al avanzar a la portada. No aparecían comandos
+desconocidos. La imagen fuente de KEMCO estaba intacta en RDRAM: el fallo ocurría
+al muestrear TMEM, sin modificar ni sustituir los assets de la ROM.
+
+La traza identificó bandas RGBA16 de 320x6, COPY, stride de 640 bytes y máscaras
+S/T de 15. El código confundía el período de máscara `1 << 15` con las dimensiones
+de la imagen y rechazaba el muestreo por exceder 1024. Los píxeles de fondo no
+se escribían, aunque la carga a TMEM contenía datos válidos. Las partículas sí
+usaban tiles pequeños y aparecían sobre negro. La portada quedaba afectada por
+el mismo rechazo de sus bandas.
+
+### Corrección y alcance
+
+- Las dimensiones/stride se calculan desde SETTILESIZE y `line`, independientes
+  de las máscaras. Se aceptan máscaras 15 sin crear una imagen de 32768x32768.
+- Clamp usa los límites del tile; después se aplican máscara y mirror. Sin clamp
+  ni máscara, no se añade un wrap artificial en el borde de SETTILESIZE. Los
+  accesos a TMEM siguen siendo circulares y el direccionamiento de nibbles
+  negativos conserva división hacia menos infinito.
+- Se elimina la misma confusión en la elección de tiles de triángulos, que podía
+  seleccionar un tile 0 residual al encontrar máscaras grandes.
+- La semántica se contrastó con `TextureSampler.hlsli::clampWrapMirrorSample`
+  y `Math.hlsli::modulo` de la referencia RT64 local; se conserva el aviso MIT.
+  No fue necesario cambiar los logos, emisores de nieve ni código generado.
+
+### Evidencia y límites
+
+La secuencia final corregida de 38 s mostró KEMCO, Snowblind con su animación de nieve,
+portada y menú. Se verificaron 4/4 catálogos, EEPROM de 2048 bytes y cero
+overruns/descartes/reemplazos de audio; hubo 1 transición observada a dispositivo
+vacío y ningún microcódigo sin reconocer. La carrera con frenado/derrape se repitió
+durante 30 s: Modo 2 activo hasta el final, HUD/partículas visibles, 4/4 catálogos,
+EEPROM y cero descartes/reemplazos; 2 transiciones observadas a dispositivo vacío.
+
+Las regresiones sin ROM incluyen una banda COPY sintética 320x6 con máscaras 15,
+clamp+mask, ausencia de wrap artificial sin máscara, nibbles negativos y selección
+de textura de triángulos. Los controles del recorrido de intro también rechazan
+combinaciones inválidas. Las capturas y los volcados temporales de diagnóstico
+permanecen en build ignorado y no se distribuyen.
+
+Es una comprobación visual local; no implica paridad de timing, coverage o VI
+con consola. La corrección se incorpora a preview.6; preview.5 conserva la intro anterior.
+
+## Resolución interna: comparación de elementos lejanos
+
+El usuario preguntó por carteles y objetos lejanos con aspecto de baja resolución
+y pidió poder probar 1080p. Se verificó que F1–F4 únicamente cambiaban el tamaño
+de ventana y F5 el filtro GDI: el renderer de carrera seguía rasterizando 320x240.
+
+### Implementación
+
+- F6 selecciona nativo/720p/1080p al inicio de la siguiente lista de dibujo.
+  Se guarda `RenderHeight=0/720/1080` en `[Graphics]` de `tgod.ini`, junto al EXE.
+  `--render-height native|720|1080` permite una elección por sesión.
+- Se conserva 4:3: 960x720 o 1440x1080 en carrera. La pantalla completa 1920x1080
+  presenta barras laterales. No se modifica FOV, relación de aspecto ni assets.
+- `render_surface.hpp` aloja color y profundidad ampliados fuera de los 8 MiB de
+  RDRAM, con un máximo de ocho superficies. Se conservan direcciones y strides
+  nativos del juego y un espejo para texturas de framebuffer dentro del replay.
+- Triángulos, líneas, rectángulos y clears comparten escala. Las pruebas Z usan
+  profundidad ampliada; el LOD tiene en cuenta el tamaño de un píxel interno.
+  La presentación y las capturas leen el target ampliado y aplican el offset VI.
+- En la copia privada se sincroniza el espejo nativo al terminar un DL y antes de cargar una textura
+  que solape un framebuffer modificado. Los cambios de CPU entre tareas se
+  importan al cache. La RDRAM real y sus efectos producidos por CPU siguen siendo nativos;
+  esto no implementa fidelidad completa del framebuffer RDP ni su endian layout.
+- Nativo sigue siendo el valor predeterminado. En headless se ignora la preferencia
+  guardada salvo `--render-height`, para conservar el recorrido de pruebas.
+
+### Comparación y comprobaciones
+
+`--headless --resolution-check --seconds 30` captura una lista de carrera y su
+estado inicial/RDRAM y la reproduce en 720p y 1080p sobre copias privadas. Guarda
+`framebuffer_compare_native.bmp`, `framebuffer_compare_720p.bmp` y
+`framebuffer_compare_1080p.bmp`. No compara dos carreras que estén avanzando.
+La salida gráfica y los volcados temporales permanecen excluidos del repositorio.
+
+La batería sin ROM prueba que un triángulo pequeño sin píxeles en nativo sí
+genera muestras a 1080p: no es un reescalado de la imagen 320x240. También cubre
+dimensiones 4:3, target 640x480, cambios de resolución, Z/clears, HUD, L3DEX2,
+offset VI, escrituras CPU, readback antes de LOADBLOCK y expulsión del cache.
+Se rechazan valores y combinaciones CLI inválidos.
+
+En el recorrido final de 30 s con frenado/derrape y comparación: carrera activa,
+4/4 catálogos, EEPROM de 2048 bytes, cero overruns/descartes/reemplazos de audio,
+3 transiciones observadas a dispositivo vacío y ningún comando/microcódigo
+desconocido. Una ejecución separada de 8 s en 1080p presentó y capturó imágenes
+de intro de 1440x1080, con 4/4 catálogos y cero descartes/reemplazos de audio.
+
+### Resultado y límites
+
+El mismo cuadro de carrera se dibujó en aproximadamente 318 ms a 720p y 714 ms
+a 1080p en esta máquina. Es el coste de un replay concreto; no un promedio de
+FPS ni un benchmark de todos los modos. HD es muy lento con el rasterizador
+por CPU actual, por lo que se ofrece para diagnóstico y comparación. Para jugar
+en HD con fluidez hace falta acelerar el rasterizador o incorporar un backend GPU.
+
+En las capturas mejoran los contornos de coche, barreras y geometría lejana.
+Los carteles y otros materiales conservan el detalle de sus texturas y mipmaps
+originales. El usuario confirmó que la apariencia pixelada a distancia desaparece
+al activar HD. Aumentar resolución no permite concluir que todos los defectos a
+distancia sean propios del juego; sigue pendiente contrastar LOD/filtrado con
+una referencia. VI, coverage y efectos de CPU conservan las aproximaciones
+documentadas. Estos cambios son posteriores al ZIP preview.5.
+
+### Reporte de físicas y separación del trabajo HD
+
+El usuario observó físicas alteradas al activar 720p/1080p. La primera versión
+hacía el trabajo HD dentro de `RendererContext::send_dl`. La ruta de eventos del
+runtime emite `dp_complete()` después de que ese método retorna; un cuadro HD de
+cientos de ms retrasaba ese evento mientras avanzaban los VI. No era suficiente
+conservar las coordenadas y direcciones nativas para mantener el ritmo del juego.
+
+La corrección mantiene siempre el intérprete autoritativo y `get_resolution_scale`
+en nativo. Un hilo Windows separado, con prioridad reducida, reproduce las listas
+sobre RDRAM y estado RSP/RDP privados. El submit solo captura una instantánea como
+máximo cada 100 ms; hay un trabajo activo y uno pendiente, que se sustituye por
+el más reciente. Los cambios de F6 invalidan resultados anteriores y nunca esperan
+a que termine una imagen HD. Las transiciones de escena descartan imágenes viejas.
+
+El hilo HD no entrega eventos SP/DP, no modifica la RDRAM real ni controla el
+paso de simulación. La presentación usa el último resultado compatible; mientras
+no está disponible muestra el cuadro nativo. Esto conserva el avance habitual,
+pero la imagen HD aún puede ser poco fluida y tener retraso. Nativo sigue siendo
+recomendable para jugar con menor latencia. El replay sincrónico de
+`--resolution-check` es un diagnóstico headless de un cuadro, separado de F6.
+
+En dos recorridos de 30 s con aceleración/frenado/derrape:
+
+- 1080p: 765 listas nativas, 64 imágenes HD completadas y 204 instantáneas
+  pendientes sustituidas; último replay HD de 595 ms. Una transición de audio
+  a dispositivo vacío, cero overruns/descartes/reemplazos, 4/4 catálogos y EEPROM.
+- 720p: 783 listas nativas, 128 imágenes HD y 140 sustituciones; último replay
+  de 287 ms. Trabajo nativo medio de 29913 us, máximo 85450 us, escala lógica 1.
+  Dos transiciones de audio a vacío y cero descartes/reemplazos; 4/4 y EEPROM.
+
+Se observaron HUD, vehículo y partículas en las capturas HD de carrera. Estos
+recorridos verifican el avance del motor y la separación del evento DP, no una
+comparación completa de todas las colisiones/físicas contra consola. La prueba
+del ZIP incluye una carrera adicional de 20 s con salida 1080p asíncrona y
+comprueba que hay imágenes HD terminadas y que el renderer autoritativo sigue en 1x.
+
 ## Distribución
 
 Las fuentes se mantienen en main, las descargas en Releases y los ZIP locales

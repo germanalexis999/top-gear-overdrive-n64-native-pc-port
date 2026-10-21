@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include "render_surface.hpp"
 
 struct Matrix4x4 {
     float m[4][4]{};
@@ -25,6 +26,12 @@ public:
     uint8_t* rdram = nullptr;
     uint32_t segments[16]{};
     uint8_t tmem[4096]{};
+    bool diagnostics_enabled = true;
+    tgod::RenderSurfaces render_surfaces;
+    uint32_t framebuffer_height() const { return color_image_width==640 ? 480 : 240; }
+    tgod::RenderSurfaces::Buffer render_buffer(uint32_t address,bool dirty=true) {
+        return render_surfaces.acquire(rdram,address,color_image_width,framebuffer_height(),dirty);
+    }
 
     // Framebuffer targets
     uint32_t color_image_addr = 0;
