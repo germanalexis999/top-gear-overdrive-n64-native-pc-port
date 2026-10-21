@@ -2,7 +2,7 @@
 
 Seguimiento posterior a la primera descarga: el worker de audio ya se despierta
 por WOM_DONE y las pruebas recientes redujeron los vaciados observados de 56 a
-0–3 por recorrido de 16 s. También se implementaron iluminación direccional/
+0–4 por recorrido de 16 s. También se implementaron iluminación direccional/
 ambiente y texgen, con pruebas de normales, rotación y alfa. La fidelidad musical
 y los fallos gráficos restantes siguen abiertos. Evidencia y límites en
 [DIAGNOSTICS-2026-10-21.md](DIAGNOSTICS-2026-10-21.md).

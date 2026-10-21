@@ -14,6 +14,11 @@ este cambio registró 3 transiciones a cero y 668 bloques. Después de implement
 iluminación/texgen, otra prueba de 16 s mantuvo carrera, 4/4 catálogos y EEPROM,
 con 671 bloques, cero descartes/reemplazos y cero vaciados del dispositivo.
 
+La prueba final del paquete preview.2, extraído con PATH limitado a Windows,
+volvió a pasar carrera, catálogos y EEPROM: 664 bloques, cero descartes/reemplazos
+y 4 vaciados observados. Por tanto el rango observado tras el cambio es 0–4;
+todavía hay que distinguir las transiciones de arranque de huecos durante música.
+
 El contador mide el estado observado por el backend; no sustituye una escucha
 ni una medición del audio físico. El primer fragmento PCM analizado tiene 34,560
 frames (1.567 s a 22,050 Hz), RMS 2,093, pico 23,311 y L/R idénticos. Los saltos
