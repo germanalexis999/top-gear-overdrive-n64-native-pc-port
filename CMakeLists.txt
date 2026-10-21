@@ -28,6 +28,7 @@ endif()
 
 add_executable(tgod_native
     src/main.cpp
+    src/rom_loader.cpp
     src/f3dex2.cpp
     generated/RecompiledFuncs/lookup.cpp
     ${RECOMP_SOURCES}
@@ -51,6 +52,9 @@ target_link_libraries(tgod_native PRIVATE
     user32
     gdi32
     winmm
+    comdlg32
+    shell32
+    bcrypt
 )
 endif()
 
@@ -58,6 +62,7 @@ endif()
 add_executable(tgod_regression_checks EXCLUDE_FROM_ALL
     tools/renderer_regression_checks.cpp
     src/f3dex2.cpp
+    src/rom_loader.cpp
 )
 target_include_directories(tgod_regression_checks PRIVATE include)
-target_link_libraries(tgod_regression_checks PRIVATE ultramodern)
+target_link_libraries(tgod_regression_checks PRIVATE ultramodern comdlg32 bcrypt)

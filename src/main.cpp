@@ -11,10 +11,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <iomanip>
+#include <algorithm>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 
 #include "recomp.h"
 #include "librecomp/game.hpp"
@@ -25,6 +27,7 @@
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/input.hpp"
 #include "f3dex2.hpp"
+#include "rom_loader.hpp"
 
 // Recompiled function headers and overlay definitions
 #include "funcs.h"
@@ -206,7 +209,9 @@ public:
     std::atomic<uint64_t> pending_audio_frames_replaced{0};
     bool drop_announced = false;
 
-    Win32AudioBackend() {
+    void start() {
+        if (worker_thread.joinable()) return;
+        running = true;
         h_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         worker_thread = std::thread(&Win32AudioBackend::audio_worker, this);
     }
@@ -827,44 +832,73 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::cout << "====================================================\n";
     std::cout << " Top Gear Overdrive (N64) - Native PC Port Runner\n";
-    std::cout << " Phase 10: Visual Fidelity & Presentation Enhancements\n";
+    std::cout << " Experimental Windows port - user ROM required\n";
     std::cout << "====================================================\n\n";
 
     bool headless = false;
+    bool verify_only = false;
+    bool explicit_rom = false;
     int headless_seconds = 4;
     std::filesystem::path rom_path = "top_gear_rom/normalized/Top Gear Overdrive (USA).z64";
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--headless") {
+    // The Unicode command line preserves non-ASCII ROM paths and drag-and-drop.
+    int wide_argc = 0;
+    wchar_t** wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    std::vector<std::wstring> arguments;
+    if (!wide_argv) return 2;
+    for (int i = 1; i < wide_argc; ++i) arguments.emplace_back(wide_argv[i]);
+    LocalFree(wide_argv);
+    for (size_t i = 0; i < arguments.size(); i++) {
+        const auto& arg = arguments[i];
+        if (arg == L"--headless") {
             headless = true;
             g_is_headless = true;
-        } else if (arg == "--seconds" && i + 1 < argc) {
-            headless_seconds = std::atoi(argv[++i]);
-        } else if (arg.rfind("--", 0) != 0) {
+        } else if (arg == L"--verify-rom") {
+            verify_only = true;
+        } else if (arg == L"--seconds" && i + 1 < arguments.size()) {
+            headless_seconds = std::clamp(_wtoi(arguments[++i].c_str()), 1, 3600);
+        } else if (arg == L"--rom" && i + 1 < arguments.size()) {
+            rom_path = arguments[++i];
+            explicit_rom = true;
+        } else if (arg == L"--help") {
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--headless --seconds N] [--verify-rom]\n";
+            return 0;
+        } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
+            explicit_rom = true;
+        } else {
+            std::cerr << "Unknown or incomplete option. Use --help.\n";
+            return 2;
         }
     }
 
-    if (!std::filesystem::exists(rom_path)) {
-        std::cerr << "[ERROR] ROM file not found: " << rom_path << "\n";
-        return 1;
+    std::error_code path_error;
+    if (!std::filesystem::exists(rom_path, path_error) && !explicit_rom && !headless && !verify_only) {
+        rom_path = tgod::choose_rom_file();
+        if (rom_path.empty()) return 0; // Selection canceled.
+    }
+    rom_path = std::filesystem::absolute(rom_path, path_error);
+    auto selected_rom = tgod::load_verified_rom(rom_path);
+    if (!selected_rom) {
+        std::cerr << "[ERROR] " << selected_rom.error << "\n";
+        if (!headless && !verify_only) MessageBoxA(nullptr, selected_rom.error.c_str(), "Top Gear Overdrive - ROM", MB_OK | MB_ICONERROR);
+        return 2;
+    }
+    auto rom_bytes = std::move(selected_rom.bytes);
+    std::cout << "[Host] Verified Top Gear Overdrive USA v0 (" << rom_bytes.size() << " bytes).\n";
+    if (verify_only) return 0;
+    // Keep saves/diagnostics with the portable program even when launched from
+    // a shortcut, a different working directory, or by dropping a ROM onto it.
+    const auto program_directory = tgod::executable_directory();
+    if (!program_directory.empty()) {
+        std::filesystem::current_path(program_directory, path_error);
+        if (path_error) {
+            std::cerr << "[ERROR] Cannot access the program directory.\n";
+            return 2;
+        }
     }
 
-    std::ifstream rom_file(rom_path, std::ios::binary | std::ios::ate);
-    if (!rom_file.is_open()) {
-        std::cerr << "[ERROR] Failed to open ROM: " << rom_path << "\n";
-        return 1;
-    }
-
-    std::streamsize rom_size = rom_file.tellg();
-    rom_file.seekg(0, std::ios::beg);
-    std::vector<uint8_t> rom_bytes(rom_size);
-    if (!rom_file.read(reinterpret_cast<char*>(rom_bytes.data()), rom_size)) {
-        std::cerr << "[ERROR] Failed to read ROM contents.\n";
-        return 1;
-    }
-    std::cout << "[Host] Loaded ROM: " << rom_path.string() << " (" << rom_size << " bytes)\n";
+    g_audio_backend.start();
 
     // 2. Setup Win32 Window if in interactive mode
     if (!headless) {

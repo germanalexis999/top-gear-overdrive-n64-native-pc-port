@@ -1,4 +1,5 @@
 #include "f3dex2.hpp"
+#include "rom_loader.hpp"
 #include <ultramodern/ultramodern.hpp>
 #include <array>
 #include <cstring>
@@ -103,11 +104,21 @@ static void check_thread_queue(uint8_t* rdram) {
 
 int main() {
     try {
+        const std::vector<uint8_t> expected = {0x80, 0x37, 0x12, 0x40, 1, 2, 3, 4};
+        auto big_endian = expected;
+        std::vector<uint8_t> swapped16 = {0x37, 0x80, 0x40, 0x12, 2, 1, 4, 3};
+        std::vector<uint8_t> swapped32 = {0x40, 0x12, 0x37, 0x80, 4, 3, 2, 1};
+        std::vector<uint8_t> invalid = {0, 0, 0, 0};
+        std::vector<uint8_t> truncated = {0x80, 0x37, 0x12};
+        require(tgod::normalize_rom_bytes(big_endian) && big_endian == expected, "z64 normalization failed");
+        require(tgod::normalize_rom_bytes(swapped16) && swapped16 == expected, "v64 normalization failed");
+        require(tgod::normalize_rom_bytes(swapped32) && swapped32 == expected, "n64 normalization failed");
+        require(!tgod::normalize_rom_bytes(invalid) && !tgod::normalize_rom_bytes(truncated), "Invalid ROM header accepted");
         std::vector<uint8_t> ram(8 * 1024 * 1024);
         check_texture_rows(ram.data());
         check_matrix_and_viewport(ram.data());
         check_thread_queue(ram.data());
-        std::cout << "PASS: texture rows, matrix push/pop, viewport isolation, thread queue removal\n";
+        std::cout << "PASS: ROM byte orders, texture rows, matrix push/pop, viewport isolation, thread queue removal\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

@@ -1,5 +1,19 @@
 # Estado del port — 2026-10-21
 
+## Distribución Windows preliminar
+
+Fuentes en `main`; binarios separados en GitHub Releases y localmente en
+`../release-packages/`. El paquete x64 contiene el EXE, tres DLL MinGW, launcher,
+instrucciones, GPLv3/avisos upstream, fuentes por revisión y manifiesto SHA-256.
+No contiene ROM ni datos extraídos. El selector carga una ROM local y verifica
+USA v0; `.z64`, `.v64` y `.n64` se normalizan solo en memoria.
+
+La extracción temporal del ZIP pasó con PATH limitado a Windows: inicio sin
+compilador instalado en PATH, rutas Unicode/con espacios, tres órdenes de bytes,
+rechazo de ROM truncada/modificada, 16 s de carrera, EEPROM y audio sin descartes.
+Las capturas, ROMs de prueba y guardados quedaron en la extracción privada y no
+se incorporaron al ZIP. Los glitches de fidelidad siguientes siguen abiertos.
+
 Port experimental para Windows x64. El ejecutable arranca, recorre los menús y
 entra a carrera con una ROM USA v0 local. No se declara paridad completa con N64.
 

@@ -15,6 +15,14 @@ EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
          "patches/n64modernruntime.patch", "patches/n64recomp.patch",
          "patches/runtime-recomp-header.patch", "LICENSES/N64Recomp-MIT.txt",
          "LICENSES/RT64-MIT.txt", "LICENSES/N64ModernRuntime-GPL-3.0.txt"}
+EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
+              "tools/package_windows.py", "tools/publish_release.py", "tools/test_windows_package.py",
+              "docs/RELEASES.md", "docs/RELEASE-NOTES.md",
+              "packaging/README-WINDOWS.txt", "packaging/Jugar.cmd"})
+EXACT.update("LICENSES/" + name + ".txt" for name in (
+    "miniz", "o1heap", "xxHash", "fmt", "rabbitizer", "ELFIO", "tomlplusplus",
+    "sljit", "concurrentqueue", "GCC-RUNTIME-EXCEPTION", "winpthreads",
+    "mingw-w64-runtime", "nlohmann-json"))
 
 
 def main():
