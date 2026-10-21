@@ -11,6 +11,12 @@ capturas, música ni guardados.** La ROM se lee localmente y no se envía a serv
 
 Cambios principales:
 
+- El backend de audio se despierta por WOM_DONE en vez de esperar sondeos de
+  hasta 20 ms. Los últimos recorridos redujeron los vaciados observados de 56
+  a 0–3, sin descartar audio; la escucha completa continúa pendiente.
+- Luces ambiente/direccionales y coordenadas de reflexión desde normales.
+  Pruebas de luz frontal/trasera, rotación del modelview, alfa y texgen.
+
 - Corregida la sobreproducción de audio y la espera del scheduler por eventos AI.
 - Corregida la interpretación del viewport, matrices y filas impares de texturas.
 - Selector de ROM, soporte de los tres órdenes de bytes y verificación de revisión.

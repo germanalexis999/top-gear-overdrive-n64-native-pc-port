@@ -101,6 +101,13 @@ void F3DEX2Interpreter::reset() {
     pixels_written = 0;
     std::memset(combine_cycle_triangles, 0, sizeof(combine_cycle_triangles));
     untextured_triangles = 0;
+    lit_vertices = 0;
+    light_commands = 0;
+    texgen_vertices = 0;
+    light_count = 0;
+    std::memset(lights, 0, sizeof(lights));
+    std::memset(look_at, 0, sizeof(look_at));
+    look_at[0][0] = look_at[1][1] = 1.0f;
     rdp_half_1 = 0;
     rdp_half_2 = 0;
     std::memset(opcode_counts, 0, sizeof(opcode_counts));
@@ -147,6 +154,45 @@ void F3DEX2Interpreter::transform_vertex(Vertex3D& v) {
     v.screen_y = -ndc_y * vs_y + vt_y;
     v.screen_z = ndc_z * vs_z + vt_z;
     v.clipped = (v.clip_z < -v.clip_w || v.clip_z > v.clip_w);
+}
+
+void F3DEX2Interpreter::light_and_texgen_vertex(Vertex3D& vertex, int8_t nx, int8_t ny, int8_t nz) {
+    const float normal[3] = {nx / 127.0f, ny / 127.0f, nz / 127.0f};
+    // With row-vector vertex transforms, M * L brings the view-space light
+    // direction into the normal's local space. Translation has no effect.
+    auto normal_dot_direction = [&](const float* direction) {
+        float local[3]{};
+        float length_squared = 0;
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column)
+                local[row] += modelview_mtx.m[row][column] * direction[column];
+            length_squared += local[row] * local[row];
+        }
+        if (length_squared < 1e-12f) return 0.0f;
+        const float inverse_length = 1.0f / std::sqrt(length_squared);
+        return std::clamp((normal[0] * local[0] + normal[1] * local[1] + normal[2] * local[2]) * inverse_length, -1.0f, 1.0f);
+    };
+    if (geometry_mode & 0x00020000) {
+        float color[3] = {float(lights[light_count].color[0]), float(lights[light_count].color[1]), float(lights[light_count].color[2])};
+        for (uint32_t light = 0; light < light_count; ++light) {
+            const float strength = std::max(0.0f, normal_dot_direction(lights[light].direction));
+            for (int channel = 0; channel < 3; ++channel) color[channel] += strength * lights[light].color[channel];
+        }
+        vertex.r = uint8_t(std::clamp(std::lround(color[0]), 0l, 255l));
+        vertex.g = uint8_t(std::clamp(std::lround(color[1]), 0l, 255l));
+        vertex.b = uint8_t(std::clamp(std::lround(color[2]), 0l, 255l));
+    }
+    if (geometry_mode & 0x00040000) {
+        ++texgen_vertices;
+        float generated[2]{};
+        for (int axis = 0; axis < 2; ++axis) {
+            const float dot = normal_dot_direction(look_at[axis]);
+            generated[axis] = (geometry_mode & 0x00080000)
+                ? std::acos(-dot) * (1024.0f / 3.14159265358979323846f) : (dot + 1.0f) * 512.0f;
+        }
+        vertex.u = generated[0] * texture_scale_s / 65536.0f;
+        vertex.v = generated[1] * texture_scale_t / 65536.0f;
+    }
 }
 
 void F3DEX2Interpreter::rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2) {
@@ -779,6 +825,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
             case 0xDC: { // G_MOVEMEM
                 uint8_t type = w0 & 0xFF;
                 uint32_t mem_addr = resolve_segmented_address(w1);
+                if (type == 10) ++light_commands;
                 if (type == 8 && mem_addr + 16 <= 8 * 1024 * 1024) { // G_MV_VIEWPORT
                     viewport_scale[0] = f3d_read_s16(rdram, mem_addr + 0);
                     viewport_scale[1] = f3d_read_s16(rdram, mem_addr + 2);
@@ -786,6 +833,20 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                     viewport_trans[0] = f3d_read_s16(rdram, mem_addr + 8);
                     viewport_trans[1] = f3d_read_s16(rdram, mem_addr + 10);
                     viewport_trans[2] = f3d_read_s16(rdram, mem_addr + 12);
+                } else if (type == 10 && mem_addr + 12 <= 8 * 1024 * 1024) {
+                    const uint32_t slot = (((w0 >> 8) & 0xFF) * 8) / 24;
+                    float direction[3]{};
+                    for (int channel = 0; channel < 3; ++channel)
+                        direction[channel] = static_cast<int8_t>(f3d_read_u8(rdram, mem_addr + 8 + channel));
+                    if (slot < 2) {
+                        std::copy(direction, direction + 3, look_at[slot]);
+                    } else if (slot - 2 < 8) {
+                        auto& light = lights[slot - 2];
+                        for (int channel = 0; channel < 3; ++channel) {
+                            light.color[channel] = f3d_read_u8(rdram, mem_addr + channel);
+                            light.direction[channel] = direction[channel];
+                        }
+                    }
                 }
                 break;
             }
@@ -810,6 +871,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                         uint8_t ca = f3d_read_u8(rdram, addr + 15);
 
                         Vertex3D& v = vertex_buffer[dest_idx + i];
+                        if (geometry_mode & 0x00020000) ++lit_vertices;
                         v.x = (float)ox;
                         v.y = (float)oy;
                         v.z = (float)oz;
@@ -822,6 +884,9 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                         v.b = cb;
                         v.a = ca;
                         v.is_screen_space = false;
+
+                        if (geometry_mode & (0x00020000 | 0x00040000))
+                            light_and_texgen_vertex(v, static_cast<int8_t>(cr), static_cast<int8_t>(cg), static_cast<int8_t>(cb));
 
                         transform_vertex(v);
                     }
@@ -895,6 +960,13 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 if (type == 0x06) { // G_MW_SEGMENT
                     uint32_t seg_idx = (offset >> 2) & 0x0F;
                     segments[seg_idx] = w1;
+                } else if (type == 0x02) { // G_MW_NUMLIGHT
+                    light_count = std::min(w1 / 24, 7u);
+                } else if (type == 0x0A && offset / 24 < 8) { // G_MW_LIGHTCOL
+                    auto& light = lights[offset / 24];
+                    light.color[0] = uint8_t(w1 >> 24);
+                    light.color[1] = uint8_t(w1 >> 16);
+                    light.color[2] = uint8_t(w1 >> 8);
                 }
                 break;
             }

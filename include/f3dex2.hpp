@@ -91,6 +91,15 @@ public:
     uint64_t pixels_written = 0;
     uint64_t combine_cycle_triangles[4]{};
     uint32_t untextured_triangles = 0;
+    uint64_t lit_vertices = 0;
+    uint64_t light_commands = 0;
+    uint64_t texgen_vertices = 0;
+    struct DirectionalLight {
+        uint8_t color[3]{};
+        float direction[3]{};
+    } lights[8];
+    uint32_t light_count = 0;
+    float look_at[2][3] = {{1, 0, 0}, {0, 1, 0}};
     uint32_t rdp_half_1 = 0;
     uint32_t rdp_half_2 = 0;
     uint32_t opcode_counts[256]{};
@@ -113,6 +122,7 @@ public:
 
     void update_mvp();
     void transform_vertex(Vertex3D& v);
+    void light_and_texgen_vertex(Vertex3D& v, int8_t nx, int8_t ny, int8_t nz);
     void rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
     void rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
 

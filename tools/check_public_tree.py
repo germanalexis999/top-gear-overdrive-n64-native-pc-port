@@ -18,6 +18,7 @@ EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
 EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "tools/package_windows.py", "tools/publish_release.py", "tools/test_windows_package.py",
               "docs/RELEASES.md", "docs/RELEASE-NOTES.md",
+              "docs/DIAGNOSTICS-2026-10-21.md",
               "packaging/README-WINDOWS.txt", "packaging/Jugar.cmd"})
 EXACT.update("LICENSES/" + name + ".txt" for name in (
     "miniz", "o1heap", "xxHash", "fmt", "rabbitizer", "ELFIO", "tomlplusplus",

@@ -2,6 +2,7 @@
 #include "rom_loader.hpp"
 #include <ultramodern/ultramodern.hpp>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -102,6 +103,43 @@ static void check_thread_queue(uint8_t* rdram) {
     require(ultramodern::thread_queue_empty(rdram, queue), "Thread queue retains stale links");
 }
 
+static void check_lighting(uint8_t* ram) {
+    F3DEX2Interpreter r(ram);
+    auto byte = [&](uint32_t address, uint8_t value) { ram[address ^ 3] = value; };
+    const uint8_t directional[3] = {100, 20, 30};
+    const uint8_t ambient[3] = {10, 20, 30};
+    for (int i = 0; i < 3; ++i) {
+        byte(0x5400 + i, directional[i]);
+        byte(0x5500 + i, ambient[i]);
+    }
+    byte(0x5408, 127);
+    byte(0x560C, 127); // Vertex normal +X; alpha is independent.
+    byte(0x560D, 0); byte(0x560E, 0); byte(0x560F, 173);
+    commands(r, {{0xDC08060A, 0x5400}, {0xDC08090A, 0x5500},
+                 {0xDB020000, 24}, {0xD9000000, 0x00020000}, {0x01001002, 0x5600}});
+    auto v = r.vertex_buffer[0];
+    require(v.r == 110 && v.g == 40 && v.b == 60 && v.a == 173,
+        "Directional + ambient light or vertex alpha is wrong");
+    byte(0x560C, uint8_t(-127));
+    commands(r, {{0x01001002, 0x5600}});
+    v = r.vertex_buffer[0];
+    require(v.r == 10 && v.g == 20 && v.b == 30,
+        "A back-facing normal must receive only ambient light");
+    byte(0x560C, 127);
+    r.modelview_mtx.m[0][0] = r.modelview_mtx.m[1][1] = 0;
+    r.modelview_mtx.m[0][1] = 1;
+    r.modelview_mtx.m[1][0] = -1;
+    byte(0x5408, 0); byte(0x5409, 127);
+    commands(r, {{0xDC08060A, 0x5400}, {0x01001002, 0x5600}});
+    require(r.vertex_buffer[0].r == 110, "Rotated normals use the wrong light transform");
+    r.modelview_mtx = Matrix4x4::identity();
+    r.texture_scale_s = r.texture_scale_t = 0x07C0;
+    commands(r, {{0xD9000000, 0x00060000}, {0x01001002, 0x5600}});
+    require(std::abs(r.vertex_buffer[0].u - 31.0f) < 0.001f &&
+            std::abs(r.vertex_buffer[0].v - 15.5f) < 0.001f,
+        "Reflection texture coordinates ignore normal direction or texture scale");
+}
+
 int main() {
     try {
         const std::vector<uint8_t> expected = {0x80, 0x37, 0x12, 0x40, 1, 2, 3, 4};
@@ -118,7 +156,8 @@ int main() {
         check_texture_rows(ram.data());
         check_matrix_and_viewport(ram.data());
         check_thread_queue(ram.data());
-        std::cout << "PASS: ROM byte orders, texture rows, matrix push/pop, viewport isolation, thread queue removal\n";
+        check_lighting(ram.data());
+        std::cout << "PASS: ROM byte orders, texture rows, matrix push/pop, viewport isolation, thread queues, lighting and texgen\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

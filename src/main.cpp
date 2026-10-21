@@ -9,7 +9,6 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
-#include <condition_variable>
 #include <iomanip>
 #include <algorithm>
 
@@ -195,12 +194,12 @@ public:
     std::atomic<size_t> in_flight_blocks{0};
     std::atomic<uint64_t> device_blocks_submitted{0};
     std::atomic<uint64_t> device_blocks_completed{0};
+    std::atomic<uint64_t> device_starvation_transitions{0};
     std::atomic<uint64_t> non_silent_queue_accepts{0};
     std::atomic<uint64_t> non_silent_device_blocks_submitted{0};
     std::atomic<size_t> ai_frames_pending{0};
 
     std::mutex queue_mutex;
-    std::condition_variable cv_queue;
     std::vector<int16_t> pending_samples;
     std::thread worker_thread;
     bool enabled = true;
@@ -226,7 +225,6 @@ public:
 
     void shutdown() {
         running = false;
-        cv_queue.notify_all();
         if (h_event) {
             SetEvent(h_event);
         }
@@ -242,6 +240,7 @@ public:
     void set_frequency(uint32_t freq) {
         if (freq == 0) freq = 22050;
         current_freq.store(freq);
+        if (h_event) SetEvent(h_event);
     }
 
     void queue_samples(const int16_t* samples, size_t sample_count) {
@@ -318,7 +317,7 @@ public:
             std::cout << "[Audio Buffer #" << count << "] Queued " << sample_count
                       << " samples at " << current_freq.load() << " Hz\n";
         }
-        cv_queue.notify_one();
+        if (h_event) SetEvent(h_event);
     }
 
     size_t get_frames_remaining() {
@@ -364,6 +363,7 @@ public:
 
         auto reap_completed_buffers = [&]() {
             if (!hwo) return;
+            const bool was_playing = in_flight_blocks.load(std::memory_order_relaxed) != 0;
             for (auto& b : blocks) {
                 if ((b.hdr.dwFlags & (WHDR_PREPARED | WHDR_DONE)) == (WHDR_PREPARED | WHDR_DONE)) {
                     if (waveOutUnprepareHeader(hwo, &b.hdr, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
@@ -378,6 +378,8 @@ public:
                     }
                 }
             }
+            if (was_playing && in_flight_blocks.load(std::memory_order_relaxed) == 0)
+                device_starvation_transitions.fetch_add(1, std::memory_order_relaxed);
         };
 
         while (running.load()) {
@@ -407,16 +409,20 @@ public:
 
             std::vector<int16_t> chunk;
             {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                cv_queue.wait_for(lock, std::chrono::milliseconds(20), [&]() {
-                    return !running.load() || pending_samples.size() >= BUFFER_CHUNK_SAMPLES;
-                });
+                std::lock_guard<std::mutex> lock(queue_mutex);
                 if (!running.load()) break;
 
                 if (pending_samples.size() >= BUFFER_CHUNK_SAMPLES) {
                     chunk.assign(pending_samples.begin(), pending_samples.begin() + BUFFER_CHUNK_SAMPLES);
                     pending_samples.erase(pending_samples.begin(), pending_samples.begin() + BUFFER_CHUNK_SAMPLES);
                 }
+            }
+
+            if (chunk.empty()) {
+                // Wake for either new PCM or WOM_DONE, so the game's AI wait
+                // resumes as soon as a DMA block ends instead of polling at 20 ms.
+                WaitForSingleObject(h_event, 20);
+                continue;
             }
 
             if (!chunk.empty() && hwo) {
@@ -1360,6 +1366,7 @@ int main(int argc, char** argv) {
         }
     }
     std::cout << "[Host] 3D Triangles - Untextured: " << interp.untextured_triangles << "\n";
+    std::cout << "[Host] Lighting diagnostics - vertices/light commands/texgen: " << interp.lit_vertices << "/" << interp.light_commands << "/" << interp.texgen_vertices << "\n";
     std::cout << "[Host] Raster diagnostics - culled triangles: " << interp.triangles_culled
               << ", depth-rejected pixels: " << interp.pixels_depth_rejected
               << ", invalid-texel pixels: " << interp.pixels_texel_invalid
@@ -1395,6 +1402,7 @@ int main(int argc, char** argv) {
               << g_audio_backend.non_silent_queue_accepts.load() << "/"
               << g_audio_backend.non_silent_device_blocks_submitted.load() << "\n";
     std::cout << "[Host] Audio current frequency: " << g_audio_backend.current_freq.load() << " Hz\n";
+    std::cout << "[Host] Audio device empty transitions: " << g_audio_backend.device_starvation_transitions.load() << "\n";
 
     // Engine & Thread Diagnostics
     uint32_t val_8006ac24 = read_rdram_u32(rdram, 0x8006AC24);
