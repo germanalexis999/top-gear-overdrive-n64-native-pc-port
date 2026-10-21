@@ -208,6 +208,11 @@ static void check_render_resolution(uint8_t* ram) {
     r.render_surfaces.sync_all();
     std::memcpy(&pixel,ram+base+(4*320+4)*2,2);
     require(pixel==0,"Native readback samples a different point than the native pixel center");
+    require(r.render_surfaces.set_height(2160),"4K selection failed");
+    r.rasterize_triangle_screen(a,b,c);
+    require(r.render_surfaces.copy_scanout(base,320,240,image,width,height) && width==2880 && height==2160,
+        "4K target does not preserve 4:3 dimensions");
+    require(std::count(image.begin(),image.end(),uint16_t(0xF801))>0,"4K additional geometry missing");
     // Shared color/depth surfaces must see GPU clears through SETCIMG and FILLRECT.
     r.render_surfaces.set_height(720);
     r.depth_image_addr=0x50000;
@@ -733,7 +738,7 @@ int main() {
         check_hud_combiner_and_depth(ram.data());
         check_lighting(ram.data());
         check_line_microcode(ram.data());
-        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats/masks, intro COPY strips, internal 720p/1080p rendering/readback, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting, texgen and L3DEX2 lines/switches\n";
+        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats/masks, intro COPY strips, internal 720p/1080p/4K rendering/readback, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting, texgen and L3DEX2 lines/switches\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

@@ -84,9 +84,9 @@ y no puede combinarse con `--graphics-check`. No modifica la intro normal.
 
 ## Resolución interna y configuración gráfica
 
-F6 alterna **nativo → 720p → 1080p → nativo**. La elección aparece en el título
+F6 alterna **nativo → 720p → 1080p → 4K → nativo**. La elección aparece en el título
 y se guarda en `tgod.ini`, junto al EXE, en `[Graphics]`, clave `RenderHeight`:
-`0` conserva el modo del juego; `720` y `1080` dibujan a mayor resolución.
+`0` conserva el modo del juego; `720`, `1080` y `2160` (4K) dibujan a mayor resolución.
 Se puede editar ese archivo con el juego cerrado o elegir solo para una sesión:
 
 ```powershell
@@ -99,15 +99,63 @@ laterales. F1–F4 cambian el tamaño de ventana; F5 cambia el filtro de present
 Esos controles no reemplazan la resolución interna de F6. Los modos 2D/VI
 pueden tener recortes propios del juego.
 
-**720p/1080p son experimentales y lentos con el renderer por CPU actual.**
-Un mismo cuadro de carrera tardó aproximadamente 318 ms a 720p y 714 ms a 1080p
-en la comparación local. No son medidas de un recorrido completo ni una promesa
-de FPS; nativo sigue siendo el valor predeterminado para jugar. El juego y sus
-eventos gráficos avanzan siempre con el renderer nativo. Un hilo separado dibuja
-las copias HD y descarta instantáneas intermedias si no llega a tiempo; la imagen
-HD puede verse poco fluida y retrasada. Cambiar F6 no introduce la espera HD en
-el avance de la simulación. Para HD fluido
-queda pendiente acelerar el rasterizador o incorporar un backend de GPU.
+**Las fuentes posteriores a preview.6 usan GPU Direct3D 11 para 720p/1080p/4K.**
+Se requiere un adaptador con feature level 11.0; no se usa WARP/software como si
+fuera hardware. Si no está disponible, o falla el dispositivo, se informa en la
+consola y se vuelve al renderer HD por CPU, mucho más lento. Nativo sigue siendo
+el valor predeterminado. El juego y los eventos SP/DP conservan el renderer nativo;
+el trabajador HD usa memoria privada y nunca entrega esos eventos. Se eliminó el
+tope de captura de 100 ms de preview.6; sigue habiendo un trabajo pendiente máximo,
+que se sustituye por el más reciente. No se añaden cuadros a la simulación.
+
+En una RTX 3080 Ti, una misma lista tardó 326/726 ms por CPU y aproximadamente
+12 ms por GPU a 720p/1080p, incluidos upload y readback de esa reproducción.
+Son medidas de un cuadro, no FPS garantizados ni mediciones de todos los equipos.
+La presentación HD usa una swapchain DXGI: el resultado permanece en GPU,
+con conversión de color, filtro y barras 4:3 en un shader propio. Una vez activa,
+esa ventana también presenta el modo nativo por GPU. Antes de activarla, o si
+falla la presentación, se usa GDI. El ritmo nativo también limita la salida.
+La fidelidad gráfica sigue en desarrollo; hay pequeñas diferencias de redondeo
+entre CPU y GPU. La comparación de consola y otras escenas sigue pendiente.
+
+El shader propio se compila durante el build y su bytecode queda dentro del EXE;
+no se compila al cambiar F6 ni se empaqueta una DLL de compilación. Windows aporta
+`d3d11.dll` y `dxgi.dll`. El código fuente está en `src/gpu_raster_shader.inc`.
+Las comprobaciones de GPU requieren hardware y son independientes de la ROM:
+
+```powershell
+cmake --build build --target tgod_gpu_checks
+.\build\tgod_gpu_checks.exe
+```
+
+El código de salida 77 indica que no hay hardware compatible. Estas comprobaciones
+no se añaden como requisito a las regresiones de software en equipos sin GPU.
+
+Los recursos de GPU se reutilizan por dirección/dimensiones y capacidad. Cada
+instantánea importa de nuevo sus contenidos; la reutilización no conserva datos
+de un cuadro anterior sin comprobarlos. Las lecturas de framebuffer necesarias
+para texturas se mantienen. En presentación directa se omite la descarga final
+de color/profundidad; el diagnóstico headless normal conserva esa lectura.
+
+Para comprobar la ruta real de ventana con navegación automática en una ventana
+oculta propia, sin modificar `tgod.ini`:
+
+```powershell
+.\build\tgod_native.exe --headless --presentation-check --graphics-check --render-height 1080 --seconds 30 --rom 'D:\ROMs\mi-copia.z64'
+```
+
+Alterna nativo/720p/1080p/4K, tamaños, fullscreen y filtro. `--presentation-check`
+requiere headless y no admite `--resolution-check`. Las imágenes
+`framebuffer_dxgi_N.bmp` capturan puntualmente la textura GPU de salida; las otras
+capturas de ese modo reflejan la copia nativa. Con `--intro-check` recorre la intro
+sin los cambios automáticos de ventana/resolución.
+
+Los logs separan el tiempo CPU del replay, los intervalos GPU medidos mediante
+queries sin espera, la edad de instantánea al envío y los contadores DXGI. En
+modo residente, el tiempo CPU no incluye esperar a que termine la GPU. El
+intervalo GPU incluye transferencias y huecos de envío; no mide solo shaders.
+Termina antes de la descarga final de diagnóstico y de la presentación.
+La edad al envío tampoco es una medición completa de latencia de mando/pantalla.
 
 La geometría se vuelve a dibujar con más píxeles y el LOD usa la huella de cada
 píxel interno. Se conservan las texturas originales: aumentar resolución no crea
@@ -120,7 +168,9 @@ Para comparar exactamente la misma lista de dibujo de carrera en tres tamaños:
 ```
 
 Genera `framebuffer_compare_native.bmp`, `framebuffer_compare_720p.bmp` y
-`framebuffer_compare_1080p.bmp`, con tiempos de replay en la consola. Continúa
+`framebuffer_compare_1080p.bmp`, y sus variantes `framebuffer_compare_gpu_720p.bmp`
+y `framebuffer_compare_gpu_1080p.bmp` si hay hardware. La consola informa tiempos
+y diferencias por píxel entre CPU/GPU de la misma lista. Continúa
 la carrera en nativo; no cambia `tgod.ini`. El modo headless ignora la preferencia
 guardada salvo `--render-height`, que solicita la salida HD asíncrona.
 `--resolution-check` requiere headless/sin solicitud HD
@@ -130,5 +180,7 @@ y no puede combinarse con `--intro-check`. Las capturas permanecen fuera de Git.
 
 Enter: Start. X/Espacio: A. Z/Retroceso: B. C: gatillo Z. A/S: L/R.
 Flechas: dirección/stick. Escape: salir. F1–F4: ventana. F5: filtro de salida.
-F6: resolución interna nativa/720p/1080p.
+F6: resolución interna nativa/720p/1080p/4K.
 F11 o Alt+Enter: pantalla completa. También se detectan mandos XInput.
+
+4K conserva el formato 4:3: renderiza 2880×2160 y muestra barras laterales en una pantalla 3840×2160. Se selecciona con F6, RenderHeight=2160 o --render-height 4k. Requiere más trabajo de GPU que 1080p.

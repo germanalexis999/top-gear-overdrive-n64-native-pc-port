@@ -669,6 +669,12 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     if ((geometry_mode & G_CULL_BACK) && area < 0.0f) { ++triangles_culled; return; }
     if ((geometry_mode & G_CULL_FRONT) && area > 0.0f) { ++triangles_culled; return; }
 
+    if (raster_backend) {
+        raster_backend->triangle(*this,v0,v1,v2);
+        ++triangles_drawn;
+        return;
+    }
+
     float inv_area = 1.0f / area;
 
     uint8_t cur_tile = (texture_tile < 8) ? texture_tile : 0;
@@ -925,6 +931,10 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
     const float bottom = std::min({float(height),float(scissor_yl),std::max(a.screen_y,b.screen_y)+radius});
     if (left>=right || top>=bottom) return;
     ++lines_drawn;
+    if (raster_backend) {
+        raster_backend->line(*this,a,b,flat_color,thickness);
+        return;
+    }
     auto depth_target=(geometry_mode&1) && depth_image_addr ?
         render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
     const bool has_depth=depth_target.pixels && depth_target.scale==scale;
@@ -1265,6 +1275,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 if (dl_stack_depth > 0) {
                     pc = dl_stack[--dl_stack_depth];
                 } else {
+                    if (raster_backend) raster_backend->finish(*this);
                     render_surfaces.sync_all();
                     return; // Completed root DL
                 }
@@ -1287,6 +1298,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 uint32_t tmem_dest = tiles[tile_idx].tmem_addr;
                 tlut_tmem_addr = tmem_dest;
                 uint32_t bytes_to_copy = count * 2;
+                if (raster_backend) raster_backend->readback(*this,texture_image_addr,bytes_to_copy);
                 render_surfaces.sync_range(texture_image_addr,bytes_to_copy);
                 if (tmem_dest + bytes_to_copy <= sizeof(tmem) && texture_image_addr + bytes_to_copy <= 8 * 1024 * 1024) {
                     for (uint32_t i = 0; i < bytes_to_copy; i++) {
@@ -1327,6 +1339,11 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 xh = std::min({xh, scissor_xl,int(color_image_width)});
                 yh = std::min({yh, scissor_yl,int(framebuffer_height())});
 
+                if (raster_backend && color_image_size==2) {
+                    raster_backend->rectangle(*this,xl,yl,xh,yh,true,0,0,0,0,0,false);
+                    ++rects_drawn;
+                    break;
+                }
                 auto target=color_image_size==2 ? render_buffer(color_image_addr) : tgod::RenderSurfaces::Buffer{};
                 if (target.pixels) {
                     uint16_t col16 = (fill_color & 0xFFFF);
@@ -1393,6 +1410,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                     + ((static_cast<uint64_t>(uls) << texture_size) >> 1)
                     + static_cast<uint64_t>(bytes_per_source_row) * ult;
                 const uint32_t word_count = ((lrs - uls) >> (4 - tile.size)) + 1;
+                if (raster_backend) raster_backend->readback(*this,source_addr,uint64_t(word_count)*8);
                 render_surfaces.sync_range(source_addr,uint64_t(word_count)*8);
                 const bool rgba32 = tile.size == 3 && tile.format == 0;
                 const uint32_t tmem_mask = rgba32 ? 0x7FF : 0xFFF;
@@ -1483,6 +1501,12 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 const float step_s = dsdx / (copy_cycle ? 4096.0f : 1024.0f);
                 const float step_t = dtdy / 1024.0f;
                 const bool filtered = !copy_cycle && ((other_mode_h>>12)&3)>=2;
+                if (raster_backend && color_image_size==2) {
+                    raster_backend->rectangle(*this,xl,yl,xh,yh,false,tile_idx,
+                        s0/32.0f,t0/32.0f,step_s,step_t,op==0xE5);
+                    ++rects_drawn;
+                    break;
+                }
                 auto target=color_image_size==2 ? render_buffer(color_image_addr) : tgod::RenderSurfaces::Buffer{};
                 auto depth_target=!copy_cycle && depth_image_addr ?
                     render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
@@ -1528,6 +1552,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
             }
         }
     }
+    if (raster_backend) raster_backend->finish(*this);
     render_surfaces.sync_all();
     if (diagnostics_enabled && instructions_executed >= MAX_INSTRUCTIONS) {
         std::cout << "[F3DEX2 WARNING] Hit MAX_INSTRUCTIONS (" << MAX_INSTRUCTIONS << ") on DL 0x" << std::hex << dl_addr << std::dec << "!\n";

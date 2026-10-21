@@ -51,7 +51,7 @@ public:
     };
     uint32_t height() const { return render_height; }
     bool set_height(uint32_t height) {
-        if (height!=0 && height!=720 && height!=1080) return false;
+        if (height!=0 && height!=720 && height!=1080 && height!=2160) return false;
         if (height!=render_height) { sync_all(); surfaces.clear(); render_height=height; }
         return true;
     }
@@ -100,7 +100,7 @@ public:
         const uint32_t offset=(origin-s.address)/2;
         const uint32_t ox=uint32_t((offset%width)*s.scale),oy=uint32_t((offset/width)*s.scale);
         output_width=uint32_t(width*s.scale);output_height=uint32_t(height*s.scale);
-        if (!output_width || !output_height || uint64_t(output_width)*output_height>2048*2048) return false;
+        if (!output_width || !output_height || uint64_t(output_width)*output_height>4096ull*4096) return false;
         pixels.resize(size_t(output_width)*output_height);
         for (uint32_t y=0;y<output_height;++y) {
             const uint16_t* source=s.pixels.data()+size_t(std::min(oy+y,s.height-1))*s.width;

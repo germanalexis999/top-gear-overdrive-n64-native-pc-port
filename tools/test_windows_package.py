@@ -49,6 +49,8 @@ def main():
         run(["--render-height", "999"], 2)
         run(["--render-height"], 2)
         run(["--resolution-check"], 2)
+        run(["--presentation-check"], 2)
+        run(["--headless", "--presentation-check", "--resolution-check"], 2)
         run(["--headless", "--resolution-check", "--intro-check"], 2)
         run(["--headless", "--resolution-check", "--render-height", "1080"], 2)
         run(["--verify-rom", "--rom", rom])
@@ -82,6 +84,19 @@ def main():
             raise RuntimeError("Packaged asynchronous HD/native timing check failed:\n"+hd_log[-2500:])
         if not re.search(r"\[Native render\].*scale: 1(?:\.0+)?\.",hd_log):
             raise RuntimeError("HD changed the authoritative native rendering path")
+        if "[HD GPU] Direct3D 11 hardware:" in hd_log:
+            if not re.search(r"\[HD GPU\] Hardware frames: [1-9]\d*",hd_log) or "Replay failed:" in hd_log:
+                raise RuntimeError("Hardware GPU was detected but the packaged HD replay failed")
+            dxgi_log=run(["--headless","--presentation-check","--graphics-check",
+                          "--render-height","4k","--seconds","24","--rom",rom],timeout=60)
+            if (not all(marker in dxgi_log for marker in required)
+                or not re.search(r"\[DXGI\] Presents: [1-9]\d*",dxgi_log)
+                or not re.search(r"resizes: [1-9]\d*, resident HD frames: [1-9]\d*, final CPU readbacks: 0\.",dxgi_log)
+                or not re.search(r"\[Native render\].*scale: 1(?:\.0+)?\.",dxgi_log)
+                or "Presentation failed:" in dxgi_log or "Replay failed:" in dxgi_log):
+                raise RuntimeError("Packaged DXGI/native timing check failed:\n"+dxgi_log[-3000:])
+            (ROOT/"build/package-test-dxgi.log").write_text(dxgi_log,encoding="utf-8")
+            print("PASS: DXGI presentation, native/720p/1080p/4K switches, resize/fullscreen/filter, no final framebuffer readback")
         (ROOT / "build/package-test-hd.log").write_text(hd_log,encoding="utf-8")
         print("PASS: Windows-only PATH, included DLLs, Unicode paths, 3 ROM byte orders, invalid ROM rejection, race/audio/save")
         print("PASS: asynchronous 1080p output with native game timing, race, audio and save")

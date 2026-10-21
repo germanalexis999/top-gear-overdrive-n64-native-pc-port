@@ -24,12 +24,16 @@ Controles:
   F11 o Alt+Enter = pantalla completa
   Tambien se detectan mandos XInput.
 
-F6 alterna nativo/720p/1080p y guarda RenderHeight=0/720/1080 en la seccion
+F6 alterna nativo/720p/1080p/4K y guarda RenderHeight=0/720/1080/2160 en la seccion
 [Graphics] de tgod.ini junto al EXE. El formato sigue siendo 4:3: 1080p dibuja
 1440x1080, con barras laterales en un monitor 1920x1080.
-HD es experimental y lento con el renderer por CPU actual. Se dibuja en un
-hilo separado; el juego conserva el avance nativo. La imagen HD puede tener
-pocos FPS y retraso. Usa nativo para jugar con la menor latencia.
+HD usa la GPU mediante Direct3D 11 (hardware con feature level 11.0).
+Se dibuja en un hilo separado; el juego conserva el avance nativo. Si la GPU
+no esta disponible se informa en consola y se usa CPU, que es lenta en HD.
+No hace falta instalar un compilador de shaders. Nativo sigue como valor inicial.
+HD presenta directamente con DXGI y reutiliza recursos de GPU. Si falla la
+presentacion, vuelve a la ruta de lectura/GDI. Se mantienen los efectos que
+necesitan leer el framebuffer y la sincronizacion nativa del juego.
 HD sirve para comparar contornos y detalle. Las texturas son las
 originales. F1-F4/F5 solo cambian la ventana y el filtro de presentacion.
 
@@ -45,3 +49,5 @@ https://github.com/germanalexis999/top-gear-overdrive-n64-native-pc-port
 
 Consulta LICENSE, LICENSES/, THIRD_PARTY_NOTICES.md y SOURCE.md.
 PACKAGE-MANIFEST.json enumera los archivos, dependencias y sus hashes SHA-256.
+
+4K conserva el formato 4:3: renderiza 2880×2160 y muestra barras laterales en una pantalla 3840×2160. Se selecciona con F6, RenderHeight=2160 o --render-height 4k. Requiere más trabajo de GPU que 1080p.

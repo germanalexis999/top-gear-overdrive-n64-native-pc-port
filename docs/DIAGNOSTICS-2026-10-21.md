@@ -426,9 +426,281 @@ comparación completa de todas las colisiones/físicas contra consola. La prueba
 del ZIP incluye una carrera adicional de 20 s con salida 1080p asíncrona y
 comprueba que hay imágenes HD terminadas y que el renderer autoritativo sigue en 1x.
 
+### Investigación de lentitud visual en preview.6
+
+El usuario confirma música normal en nativo/720p/1080p y movimiento visual lento
+en HD. Una nueva ejecución de 30 s con `--headless --graphics-check
+--resolution-check` reprodujo la misma lista de carrera en las tres resoluciones:
+
+| Salida de carrera | Píxeles | Coste medido |
+| --- | ---: | --- |
+| 320x240 nativo | 76 800 | Media de listas nativas del recorrido: 30,143 ms |
+| 960x720 | 691 200 (9x) | Replay del cuadro capturado: 320 ms |
+| 1440x1080 | 1 555 200 (20,25x) | Replay del mismo cuadro: 719 ms |
+
+La media nativa no corresponde exclusivamente al cuadro capturado. Los dos
+tiempos HD sí corresponden a la misma lista; su razón 2,25 coincide aproximadamente
+con la razón de píxeles. Esto respalda un coste dominado por el trabajo por píxel,
+sin atribuir porcentajes a funciones individuales sin un perfilador. El log local
+es `build/hd_investigation_compare.log`: salida 0, carrera/catálogos 4/4, EEPROM
+verificada y audio con overruns/descartes/reemplazos 0/0/0. El replay diagnóstico
+es síncrono y no mide la frecuencia real de presentación interactiva.
+
+La revisión de fuentes confirma:
+
+- El rasterizador es software: bucles de CPU para triángulos, texturas,
+  combinador, profundidad y mezcla. GDI presenta el resultado; no hay un backend
+  GPU que rasterice la escena. El ejecutable ya se compila Release con `-O3`.
+- El trabajador HD reproduce cada lista en un único hilo. Mantiene un resultado
+  completado y sustituye la instantánea pendiente por la más reciente; cuando el
+  cálculo tarda cientos de ms, se repite una imagen antigua y se saltan estados
+  intermedios. Esto causa saltos y retraso visual, aunque avance la simulación.
+- Además, `AsyncHDRenderer::submit` captura como máximo una vez cada 100 ms:
+  aun acelerando el dibujo, ese límite impediría superar 10 imágenes HD/s.
+  Actualmente el coste del replay es todavía mayor que esos 100 ms.
+- El filtrado normal consulta cuatro texels aunque uno tenga peso cero en el
+  filtro triangular; LOD, selectores y operaciones del combinador se evalúan por
+  píxel. Son candidatos para perfilar/optimizar, no costes individuales medidos.
+- La separación del hilo HD explica que el audio siga bien; no demuestra por sí
+  sola equivalencia de todas las físicas. La prueba headless también reproduce
+  el coste HD sin ventana ni `StretchDIBits`, por lo que la presentación de Windows
+  no es necesaria para que aparezca este cuello de botella.
+
+Orden de trabajo: perfilar el rasterizador en una instantánea reproducible;
+acelerar el dibujo (evaluar backend GPU para HD) conservando RDRAM y eventos
+nativos; sustituir el tope fijo de captura por una cadencia adecuada; medir edad
+de imagen y tiempo de presentación en ventana; volver a comprobar HUD, humo,
+intro, profundidad, audio y controles. Reducir solo el intervalo de captura o
+subir la prioridad del hilo no elimina los 320/719 ms de cálculo observados.
+Esta investigación no cambia el renderizador ni constituye una corrección HD
+publicada. Nativo sigue siendo la opción recomendada para jugar.
+
 ## Distribución
 
 Las fuentes se mantienen en main, las descargas en Releases y los ZIP locales
 en la carpeta hermana release-packages. Cada paquete conserva su commit fuente
 y SHA-256. Las capturas, PCM, ROMs y guardados de estas comprobaciones permanecen
 locales y excluidos de Git y de los ZIP publicados.
+
+## Salida HD por GPU — revisión local posterior a preview.6
+
+Se incorporó `GPURaster`, un rasterizador compute propio de Direct3D 11. Reutiliza
+la transformación, recorte y lectura de comandos del intérprete existente. Las
+primitivas se agrupan en listas por bloques de 32x32 píxeles; cada hilo GPU evalúa
+un píxel siguiendo el orden original de dibujo, con color/profundidad locales.
+Así se conserva el orden de mezcla sin carreras de escritura entre primitivas.
+TMEM y estados de tiles/combinador se capturan por primitiva; snapshots TMEM
+consecutivos idénticos se comparten. Cambiar de target separa los lotes. Las
+lecturas de framebuffer para TMEM y el fin de lista fuerzan readback privado antes
+de sincronizar sus espejos nativos. El cache se limita a ocho superficies; ante
+un target no soportado o un error se descarta ese cuadro y se vuelve a software
+con una instantánea nueva. No se entregan eventos SP/DP desde este backend.
+
+La GPU solo se usa en el trabajador HD: el intérprete autoritativo fuerza
+`raster_backend=nullptr` y escala 1. La cola conserva un trabajo activo y uno
+pendiente, sin el límite fijo anterior de 100 ms. Cambiar F6 invalida generaciones
+anteriores. El shader se compila durante el build y se incrusta en el EXE; no se
+compila al iniciar HD. No se incorporaron dependencias ni assets de otros ports.
+Se usa un dispositivo hardware FL11.0 y no se disfraza WARP como aceleración GPU.
+
+En RTX 3080 Ti, una comparación de la misma lista de carrera dio:
+
+| Resolución 4:3 | Replay CPU | Replay GPU | Píxeles con diferencia |
+| --- | ---: | ---: | ---: |
+| 960x720 | 326 ms | 12,3 ms | 4790/691200 (0,69 %) |
+| 1440x1080 | 726 ms | 12,2 ms | 4980/1555200 (0,32 %) |
+
+El error máximo observado fue 2 niveles sobre 31 por canal; no es paridad bit a
+bit. Se inspeccionó la captura GPU con carretera, coche, carteles y HUD. Son
+medidas de un replay concreto, incluidos upload/readback, no FPS garantizados.
+La comparación es síncrona y diagnóstica; en juego el procesamiento HD es asíncrono.
+
+En dos recorridos HD separados de 30 s con aceleración/frenado/derrape:
+
+- 1080p: 691 imágenes HD entregadas, 703 replays hardware, 18 pendientes
+  sustituidos; media HD 14,4 ms, último replay 14 ms, última edad de imagen
+  presentada 42 ms. Media nativa 30,604 ms, escala 1.
+- 720p: 703 imágenes entregadas, 715 replays hardware, 18 sustituciones;
+  media HD 9,1 ms, último replay 9 ms, última edad presentada 48 ms.
+  Media nativa 30,746 ms, escala 1.
+- Ambos: carrera activa, catálogos 4/4, EEPROM verificada y audio con
+  overruns/descartes/reemplazos 0/0/0. Transiciones a dispositivo vacío: 4/3.
+  Los replays hardware pueden superar a los cuadros entregados porque una
+  transición de modo/resolución puede invalidar un resultado antes de publicarlo.
+
+Logs privados: `build/gpu_compare.log`, `gpu_live1080.log`, `gpu_live720.log`.
+La media HD incluye escenas distintas; la edad final es una muestra, no una
+medición completa de latencia del mando ni de pantalla. El refresco interactivo
+GDI y la sincronización nativa limitan la salida final; no se ha convertido el
+juego a 60 FPS. La suite de software sigue pasando. `tgod_gpu_checks` compara
+CPU/GPU a ambas resoluciones: triángulos, profundidad, orden de mezcla, COPY de
+intro con máscara 15, líneas, formatos RGBA/CI/IA/I y fallbacks de formato,
+filtrado, dos ciclos/LOD y target 640. Verifica que la RAM de referencia externa
+no cambie. Se acepta hasta un nivel por canal en esos casos sintéticos fuera de
+límites exactos de cobertura; no demuestra exactitud RDP completa.
+
+Quedan probar otros adaptadores, escenas y presentación interactiva, y medir
+cobertura/subpíxeles y latencia prolongada. El fallback por CPU sigue siendo lento.
+La documentación técnica consultada es la de Microsoft para
+[compute shaders de Direct3D 11](https://learn.microsoft.com/en-us/windows/win32/direct3d11/direct3d-11-advanced-stages-compute-create)
+y [D3DCompile](https://learn.microsoft.com/en-us/windows/win32/api/d3dcompiler/nf-d3dcompiler-d3dcompile).
+
+La intro GPU se comprobó durante 50 s hasta el menú (1777 imágenes entregadas,
+media replay 10,6 ms, escala nativa 1, catálogos 4/4 y EEPROM; audio 0/0/0,
+una transición a vacío). El ZIP local de prueba `v0.1.0-preview.7.local` pasó
+extracción temporal con PATH limitado a Windows, rutas Unicode, los tres órdenes
+de bytes, rechazo de ROM inválida, 16 s nativos y 20 s HD: 475 imágenes entregadas,
+488 replays hardware, media 11,9 ms, edad final 54 ms y escala nativa 1. Audio
+0/0/0 y EEPROM verificada. No requirió DLL de compilación de shaders. Este ZIP
+es un borrador local con fuentes sin commit; no es una release publicada.
+La auditoría de fuentes de trabajo incluye 56 archivos de texto permitidos;
+`--worktree` permite revisarlos antes de preparar el índice. La publicación sigue
+exigiendo el índice auditado y un commit limpio. No se subieron ROMs ni capturas.
+
+## Comparación con otros ports
+
+El análisis de adaptadores Mario Kart/Zelda, Wave Race y del editor de resolución
+de Shipwright está en [RENDERER-ARCHITECTURE.md](RENDERER-ARCHITECTURE.md).
+RT64 también documenta dos renderers (nativo/HD); conservar una salida nativa es
+compatible con esa arquitectura. El trabajo por reducir aquí incluye rasterizado
+nativo CPU, asignaciones por cuadro y readback/conversión para GDI. La copia de
+RT64 del ejemplo tiene LINE3D L3DEX2 sin implementar: una migración directa puede
+perder dibujo. La recomendación es reutilizar recursos y presentar en GPU,
+conservando el backend actual como referencia, y evaluar RT64 con un prototipo
+que complete ese soporte. Son conclusiones de fuentes y logs previos; no un
+benchmark ejecutado entre ports distintos ni una integración nueva.
+
+## Reutilización de recursos y presentación DXGI
+
+Revisión local posterior al primer backend GPU, manteniendo Direct3D 11 propio.
+Se aplicaron estas recomendaciones del análisis comparativo:
+
+- Cache de hasta ocho superficies por dirección/ancho y altura de render.
+  Se reutilizan buffer, UAV, SRV y staging cuando existe. Cada instantánea
+  vuelve a importar su contenido nativo antes del primer uso; la memoria GPU
+  reutilizada no conserva contenido viejo por suposición. Los cambios de altura
+  invalidan el cache y los targets antiguos se expulsan sin tocar los activos.
+- Los cuatro buffers/vistas de comandos, TMEM, índices y bloques conservan
+  capacidad y crecen cuando hace falta. También se reutilizan listas CPU y un
+  almacenamiento de instantánea libre; se mantiene un trabajo pendiente máximo.
+- `RasterBackend::finish` separa fin de tarea de readback. En salida de ventana,
+  el fin encola el trabajo y mantiene color/profundidad en GPU. Los readbacks
+  explícitos de textura/framebuffer se conservan; el headless normal sigue
+  descargando resultados para comparar/capturar imágenes.
+- La GPU convierte el buffer de píxeles a textura RGBA de salida y aplica recorte
+  VI, filtro point/lineal y barras 4:3. Se copia al backbuffer y se presenta por
+  swapchain DXGI flip. Se evita convertir/copiar toda la imagen HD por CPU.
+- El mismo trabajador posee dispositivo, contexto y swapchain. Recibe copias de
+  VI/escena y una imagen nativa de respaldo; no lee la RDRAM real al presentar.
+  Una vez activada la swapchain, también presenta por GPU la selección nativa,
+  evitando mezclar GDI y flip en el mismo HWND. GDI permanece disponible antes
+  de activación o tras un fallo de presentación, con descarga GPU para ese caso.
+- La presentación se valida por escena, resolución y generación; un resultado
+  viejo no se usa en otra escena. Se omiten envíos de contenido/vista sin cambios.
+  Las ventanas vacías/minimizadas se omiten y ResizeBuffers libera referencias
+  previas. `Present` usa DO_NOT_WAIT. Las llamadas GPU/Present quedan fuera del
+  hilo del runtime que procesa SP/DP. El cierre mantiene el message pump hasta
+  que el trabajador libera la swapchain, y destruye el HWND después.
+- Se incorporaron contadores de asignaciones, bytes leídos y presentación, más
+  queries de timestamp/disjoint con ocho slots y DONOTFLUSH, sin esperar en CPU.
+
+### Comprobaciones
+
+La suite sin ROM y las comparaciones CPU/GPU existentes siguen pasando. La suite
+hardware además verifica conversión RGB, resize, barras 4:3, ventana vacía y
+minimizada propia, nativo/720p/1080p, point/lineal, offsets/crop VI, recreación de
+swapchain, reutilización de recursos sin asignaciones adicionales en cuadros
+estables y actualización de contenidos entre instantáneas rojas/azules. El test
+explícito de feedback confirma que se sigue descargando un framebuffer al pedirlo.
+
+Una carrera de 30 s con ventana propia oculta (`--presentation-check`) alternó
+1080p/720p/nativo, tamaño, fullscreen y filtro: 685 replays GPU, 783 presents,
+cinco resizes, 18 asignaciones de superficies y 11 de entradas; cero bytes de
+readback de raster y cero descargas finales de pantalla. Carrera activa, 4/4
+catálogos, EEPROM y audio 0/0/0 (overruns/descartes/reemplazos), cuatro transiciones
+al dispositivo vacío. El renderer nativo promedió 30,160 ms y siguió en escala 1.
+Se inspeccionaron capturas reales de la textura GPU de salida con HUD, coche,
+carretera y partículas; no solo la copia nativa que permanece en RAM.
+
+El trabajo CPU del replay residente promedió 4,4 ms. El intervalo GPU de 685
+muestras promedió 2,7 ms y tuvo un máximo de 355,2 ms. Ese intervalo incluye
+transferencias y huecos de envío, no solo kernels. La edad de instantánea final
+al enviar la imagen fue 6 ms, sin medir cola de pantalla ni latencia física.
+Estas cifras no se comparan directamente con el replay anterior que esperaba
+un readback; no equivalen a FPS garantizados ni prueban ausencia de tirones.
+Se contabilizan intervalos largos para identificar inicialización y otros picos.
+
+Una comparación síncrona de la misma lista con exportación CPU conservada dio
+321/722 ms por software y 9,3/13,8 ms por GPU a 720p/1080p; 4211/691200 y
+3883/1555200 píxeles diferentes, máximo dos niveles de canal sobre 31.
+La intro se recorrió por DXGI durante 50 s hasta el menú: 1987 replays hardware,
+1985 presents, tres superficies asignadas, cero descargas finales y cero bytes
+de readback de raster. Audio 0/0/0, catálogos 4/4 y EEPROM; una transición a vacío.
+
+Logs locales: `build/dxgi_checks.log`, `dxgi_regression.log`,
+`dxgi_window_final.log`, `dxgi_compare.log`, `dxgi_intro.log`.
+`--presentation-check` requiere headless y una GPU compatible, no modifica
+preferencias y captura `framebuffer_dxgi_N.bmp` puntualmente. Las otras capturas
+con ventana de diagnóstico reflejan la imagen nativa. El headless sin ventana
+mantiene capturas HD para el análisis numérico previo.
+
+Las pruebas de ventana oculta ejercitan el backend y sus controles automáticos;
+queda comprobar experiencia interactiva prolongada, otros drivers/GPU, cambios
+de DPI/monitor y todas las escenas. Los errores de dispositivo tienen rutas de
+recuperación implementadas; la pérdida real de GPU no se forzó en estas pruebas.
+El rasterizado nativo por CPU sigue siendo trabajo significativo. No se aumentó
+la frecuencia de simulación ni se eliminó su sincronización para mejorar cifras.
+
+Referencias de API usadas:
+[modelo flip y su relación con GDI](https://devblogs.microsoft.com/directx/dxgi-flip-model/),
+[ResizeBuffers y referencias](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-overview),
+[Present sin espera](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-present).
+
+### ZIP local final con DXGI
+
+`build/gpu-package-dxgi-final/top-gear-overdrive-v0.1.0-preview.7.dxgi.local-windows-x64.zip`
+es el paquete local comprobado, sin publicar, de 2530085 bytes. SHA-256:
+`35f74b7c055a2ca5ab92d70c0b3bf1027c252dbb6f8b0920ee2fc23789a7987c`.
+Contiene 25 archivos permitidos con hashes; importaciones PE verificadas y sin
+ROM, assets, capturas, guardados ni compilador de shaders redistribuido.
+
+Pasó las regresiones de hardware/software y la extracción temporal con PATH
+limitado a Windows: formatos de ROM/rutas Unicode/rechazo de ROM inválida, carrera
+nativa de 16 s, HD headless de 20 s y DXGI de 24 s. En la prueba DXGI del paquete:
+537 replays residentes, 632 presents, cinco resizes, 18 asignaciones de superficie,
+10 de entrada, cero bytes de readback de raster y cero descargas finales. Carrera,
+catálogos y EEPROM correctos; audio 0/0/0 y una transición al dispositivo vacío.
+El renderer nativo permaneció en escala 1 (media 29,549 ms). CPU de replay 4,3 ms;
+intervalo GPU medio 3,3 ms con máximo 342,2 ms: dos intervalos mayores a 100 ms,
+el primero en el replay 2. No se atribuyeron esos picos exclusivamente al shader.
+La edad final de la instantánea al envío fue 5 ms, sin medir pantalla/mando.
+
+El intervalo de raster se cierra antes de la lectura final de diagnóstico para
+que el End de su query no quede retenido hasta otra tarea después de Map.
+En el headless empaquetado, que sí descarga imágenes, el intervalo GPU medio fue
+2,4 ms y el replay CPU con readback 9,7 ms. La presentación conserva sus propios
+contadores. Logs finales: `dxgi_package_test_final.log`, `package-test.log`,
+`package-test-hd.log`, `package-test-dxgi.log`; auditoría de 58 fuentes de texto.
+
+
+## Opción 4K posterior a 1080p
+
+- F6: nativo → 720p → 1080p → 4K → nativo. Se guarda RenderHeight=2160;
+  CLI acepta 2160, 4k y 4K. En carrera dibuja 2880×2160, sin alterar 4:3.
+- Se amplió el límite de copias HD a 4096² píxeles. Las capturas reciben el
+  tamaño real del buffer anfitrión; las capturas de RDRAM conservan su límite
+  de 8 MiB y se comprueban con aritmética de 64 bits.
+- Regresiones software y GPU: PASS, incluyendo geometría adicional a 2160p,
+  presentación residente sin readback final, reutilización y feedback explícito.
+  La comparación exhaustiva CPU/GPU de combinadores sigue a 720p/1080p;
+  la nueva prueba 4K se concentra en dimensiones, presentación y buffers.
+- Carrera headless 20 s: 4/4 catálogos, EEPROM verificada, captura 2880×2160,
+  472 cuadros GPU, escala nativa 1.0. Esta captura diagnóstica descarga a CPU;
+  no representa el coste de la presentación DXGI residente.
+- ZIP local: build/gpu-package-4k-final/top-gear-overdrive-v0.1.0-preview.7.4k.local-windows-x64.zip.
+  No publicado; paquete draft con fuentes locales modificadas.
+
+- Prueba del ZIP: PASS con PATH solo Windows, tres órdenes de ROM, audio/EEPROM,
+  carrera HD y presentación DXGI de 24 s iniciada en 4K y alternando todos los modos,
+  resize/fullscreen/filtro, sin readback final y escala nativa 1.0.
+  SHA256: 171533ed12a00ae0e3f6aaa1f6f405f906a4c84c626595d6efb7831068a25a89.

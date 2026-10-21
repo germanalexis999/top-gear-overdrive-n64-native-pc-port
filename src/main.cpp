@@ -46,12 +46,16 @@ static std::atomic<float> g_stick_x{0.0f};
 static std::atomic<float> g_stick_y{0.0f};
 static std::atomic<bool> g_running{true};
 static bool g_is_headless = false;
+static bool g_presentation_check = false;
 static std::atomic<uint32_t> g_render_height{0};
 static bool g_resolution_check = false;
 static std::atomic<bool> g_resolution_check_done{false};
 static std::atomic<uint64_t> g_native_render_us{0},g_native_render_count{0},g_native_render_max_us{0};
 static std::filesystem::path g_graphics_config;
 static HWND g_hwnd = nullptr;
+static std::atomic<bool> g_gpu_window_owned{false};
+static std::atomic<bool> g_filter_smooth{true};
+static std::mutex g_window_output_mutex;
 static std::atomic<uint64_t> g_rsp_task_types[5]{}; // 0..3 plus unclassified.
 
 // Dynamic XInput gamepad definitions (zero extra DLL link dependencies)
@@ -519,6 +523,8 @@ static uint32_t graphics_scene(const uint8_t* ram) {
         (mode==0 ? uint32_t(ram[0x53650^3])<<16 : 0);
 }
 
+static void save_fb_to_bmp(const char*,const uint8_t*,uint32_t,uint32_t,uint32_t,size_t = 8*1024*1024);
+
 // Native RDP work remains authoritative for RSP/DP completion and game timing.
 // HD replays run on private RDRAM; a slow frame never holds up those events.
 class AsyncHDRenderer {
@@ -528,99 +534,235 @@ class AsyncHDRenderer {
         uint32_t dl=0,data=0,data_size=0,height=0,scene=0,offset=0;
         uint32_t scanout_width=0,scanout_height=0;
         uint64_t generation=0;
+        std::chrono::steady_clock::time_point captured{};
     };
     struct Frame {
         std::vector<uint16_t> pixels;
         uint32_t width=0,height=0,scene=0,requested_height=0;
         uint64_t generation=0;
+        std::chrono::steady_clock::time_point captured{};
+    };
+    struct Screen {
+        HWND window=nullptr;
+        std::vector<uint16_t> native;
+        uint32_t width=1,height=1,scene=0,requested_height=0;
+        bool smooth=true,visible=false;
+    };
+    struct Resident {
+        bool valid=false;
+        uint32_t address=0,width=0,height=0,offset=0,scene=0,requested_height=0;
+        uint64_t generation=0;
+        std::chrono::steady_clock::time_point captured{};
     };
     std::mutex mutex;
     std::condition_variable wake;
-    std::unique_ptr<Job> pending;
+    std::unique_ptr<Job> pending,spare;
+    std::unique_ptr<Screen> screen_pending;
     Frame latest;
     std::thread worker;
     bool stopping=false;
     uint32_t requested_height=0;
     uint64_t generation=0;
-    std::chrono::steady_clock::time_point last_capture{};
-    std::atomic<uint64_t> completed{0},replaced{0},last_ms{0};
+    std::atomic<bool> worker_done{true};
+    std::atomic<uint64_t> completed{0},replaced{0},last_ms{0},gpu_frames{0};
+    std::atomic<uint64_t> replay_us{0},replays{0},display_age_ms{0},resident_frames{0};
+    GPURaster::Statistics final_stats{};
+    void start_locked() {
+        if(!worker.joinable()){worker_done=false;worker=std::thread([this]{run();});}
+        wake.notify_one();
+    }
+    void recycle(std::unique_ptr<Job> job) {
+        job->interpreter.render_surfaces.clear();
+        std::lock_guard lock(mutex);
+        if(!stopping && !spare)spare=std::move(job);
+    }
     void run() {
         SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+        std::unique_ptr<GPURaster> gpu;
+        bool gpu_failed=false,direct_failed=false;
+        Screen screen;
+        Resident resident;
         for (;;) {
             std::unique_ptr<Job> job;
             {
                 std::unique_lock lock(mutex);
-                wake.wait(lock,[&] {return stopping || pending!=nullptr;});
-                if (stopping) return;
+                wake.wait(lock,[&]{return stopping||pending||screen_pending;});
+                if(stopping)break;
                 job=std::move(pending);
+                if(screen_pending){screen=std::move(*screen_pending);screen_pending.reset();}
             }
-            const auto start=std::chrono::steady_clock::now();
-            auto& r=job->interpreter;
-            r.rdram=job->ram.data();r.diagnostics_enabled=false;
-            r.render_surfaces.clear();r.render_surfaces.set_height(job->height);
-            r.process_display_list(job->dl,job->data,job->data_size);
-            Frame frame;
-            frame.scene=job->scene;frame.requested_height=job->height;frame.generation=job->generation;
-            const bool matching_scanout=job->scanout_width==r.color_image_width && job->scanout_height;
-            const bool valid=r.render_surfaces.copy_scanout(r.color_image_addr+(matching_scanout ? job->offset : 0),
-                r.color_image_width,matching_scanout ? job->scanout_height : r.framebuffer_height(),
-                frame.pixels,frame.width,frame.height);
-            last_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count());
-            std::lock_guard lock(mutex);
-            if (valid && !stopping && job->generation==generation && job->height==requested_height) {
-                latest=std::move(frame);completed.fetch_add(1);
+            if(job) {
+                resident.valid=false;
+                const auto start=std::chrono::steady_clock::now();
+                auto& r=job->interpreter;
+                r.rdram=job->ram.data();r.diagnostics_enabled=false;
+                r.render_surfaces.clear();r.render_surfaces.set_height(job->height);
+                if(!gpu)gpu=std::make_unique<GPURaster>();
+                const bool hardware=gpu->available()&&!gpu_failed;
+                const bool direct=hardware&&g_hwnd&&!direct_failed;
+                if(hardware) {
+                    try {
+                        gpu->begin_frame(direct);r.raster_backend=gpu.get();
+                        r.process_display_list(job->dl,job->data,job->data_size);
+                        gpu_frames.fetch_add(1);
+                    } catch(const std::exception& error) {
+                        std::cerr<<"[HD GPU] Replay failed: "<<error.what()<<"; software fallback.\n";
+                        gpu_failed=true;r.raster_backend=nullptr;
+                        gpu->release_presentation();g_gpu_window_owned=false;
+                        if(g_hwnd)InvalidateRect(g_hwnd,nullptr,FALSE);
+                        recycle(std::move(job));continue;
+                    }
+                    r.raster_backend=nullptr;
+                } else r.process_display_list(job->dl,job->data,job->data_size);
+                const bool matching=job->scanout_width==r.color_image_width&&job->scanout_height;
+                Frame frame;
+                frame.captured=job->captured;frame.scene=job->scene;
+                frame.requested_height=job->height;frame.generation=job->generation;
+                bool valid=direct;
+                if(direct) {
+                    resident={true,r.color_image_addr,r.color_image_width,
+                        matching ? job->scanout_height:r.framebuffer_height(),matching ? job->offset:0,
+                        job->scene,job->height,job->generation,job->captured};
+                    resident_frames.fetch_add(1);
+                } else valid=r.render_surfaces.copy_scanout(r.color_image_addr+(matching ? job->offset:0),
+                    r.color_image_width,matching ? job->scanout_height:r.framebuffer_height(),
+                    frame.pixels,frame.width,frame.height);
+                const auto us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+                last_ms=us/1000;replay_us.fetch_add(us);replays.fetch_add(1);
+                {
+                    std::lock_guard lock(mutex);
+                    if(valid&&!stopping&&job->generation==generation&&job->height==requested_height){
+                        latest=std::move(frame);completed.fetch_add(1);
+                    } else resident.valid=false;
+                    // Use the latest VI/scene after a replay, not the screen
+                    // state from before it started computing.
+                    if(screen_pending){screen=std::move(*screen_pending);screen_pending.reset();}
+                }
+                recycle(std::move(job));
+            }
+            if(screen.window&&gpu&&gpu->available()&&!gpu_failed&&!direct_failed) {
+                try {
+                    // GDI and flip presentation never share the HWND after
+                    // ownership is acquired. Native mode is presented by this
+                    // same GPU worker once the swapchain has been activated.
+                    {std::lock_guard lock(g_window_output_mutex);g_gpu_window_owned=true;}
+                    bool compatible=false;
+                    {
+                        std::lock_guard lock(mutex);
+                        compatible=resident.valid&&screen.visible&&resident.scene==screen.scene&&
+                            resident.requested_height==screen.requested_height&&resident.generation==generation;
+                    }
+                    compatible=compatible&&gpu->has_target(resident.address,resident.width);
+                    const auto before_present=gpu->statistics().presents;
+                    if(compatible) {
+                        gpu->present_target(screen.window,resident.address,resident.width,resident.height,resident.offset,screen.smooth);
+                        display_age_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-resident.captured).count();
+                    } else gpu->present_native(screen.window,screen.native,screen.width,screen.height,screen.smooth);
+                    if(g_presentation_check&&gpu->statistics().presents>before_present&&gpu->statistics().presents%60==1) {
+                        std::vector<uint32_t> rgba;uint32_t w=0,h=0;
+                        if(gpu->capture_output(rgba,w,h)){
+                            std::vector<uint16_t> pixels(rgba.size());
+                            for(size_t i=0;i<rgba.size();++i){const auto p=rgba[i];
+                                pixels[i]=uint16_t(((p&255)>>3)<<11|(((p>>8)&255)>>3)<<6|(((p>>16)&255)>>3)<<1|1);
+                            }
+                            const auto name="framebuffer_dxgi_"+std::to_string(gpu->statistics().presents)+".bmp";
+                            save_fb_to_bmp(name.c_str(),reinterpret_cast<const uint8_t*>(pixels.data()),0,w,h,pixels.size()*sizeof(uint16_t));
+                        }
+                    }
+                } catch(const std::exception& error) {
+                    std::cerr<<"[DXGI] Presentation failed: "<<error.what()<<"; GPU replay with CPU readback/GDI fallback.\n";
+                    direct_failed=true;resident.valid=false;gpu->release_presentation();g_gpu_window_owned=false;
+                    if(g_hwnd)InvalidateRect(g_hwnd,nullptr,FALSE);
+                }
             }
         }
+        if(gpu){final_stats=gpu->statistics();gpu.reset();}
+        g_gpu_window_owned=false;worker_done=true;
     }
 public:
     void submit(const F3DEX2Interpreter& interpreter,const OSTask* task,uint32_t height) {
-        const auto now=std::chrono::steady_clock::now();
+        uint64_t captured_generation=0;
+        std::unique_ptr<Job> job;
         {
             std::lock_guard lock(mutex);
-            if (stopping) return;
-            if (height!=requested_height) {
-                requested_height=height;++generation;pending.reset();latest=Frame{};last_capture={};
-            }
-            if (!height || now-last_capture<std::chrono::milliseconds(100)) return;
-            last_capture=now;
+            if(stopping)return;
+            if(height!=requested_height){requested_height=height;++generation;pending.reset();latest=Frame{};}
+            if(!height)return;
+            captured_generation=generation;
+            job=std::move(spare);
+            if(!job&&pending){job=std::move(pending);replaced.fetch_add(1);}
         }
-        auto job=std::make_unique<Job>();
+        if(!job)job=std::make_unique<Job>();
+        job->captured=std::chrono::steady_clock::now();
         job->ram.assign(interpreter.rdram,interpreter.rdram+8*1024*1024);
         job->interpreter=interpreter;
         job->dl=task->t.data_ptr;job->data=task->t.ucode_data;job->data_size=task->t.ucode_data_size;
-        job->height=height;job->scene=graphics_scene(job->ram.data());
+        job->height=height;job->scene=graphics_scene(job->ram.data());job->offset=0;
+        job->scanout_width=job->scanout_height=0;
         auto vi=ultramodern::renderer::get_vi_regs();
-        if (vi) {
+        if(vi){
             const auto frame=tgod::vi_frame_layout(*vi);
-            if (frame.visible) {job->scanout_width=frame.width;job->scanout_height=frame.height;}
+            if(frame.visible){job->scanout_width=frame.width;job->scanout_height=frame.height;}
             const uint32_t origin=vi->VI_ORIGIN_REG&0x1FFFFFFF;
-            if (origin>=interpreter.color_image_addr &&
-                origin-interpreter.color_image_addr<interpreter.color_image_width*8)
+            if(origin>=interpreter.color_image_addr&&origin-interpreter.color_image_addr<interpreter.color_image_width*8)
                 job->offset=origin-interpreter.color_image_addr;
         }
         std::lock_guard lock(mutex);
-        if (stopping || height!=requested_height) return;
-        job->generation=generation;
-        if (pending) replaced.fetch_add(1);
-        pending=std::move(job);
-        if (!worker.joinable()) worker=std::thread([this] {run();});
-        wake.notify_one();
+        if(stopping||height!=requested_height||captured_generation!=generation)return;
+        job->generation=captured_generation;
+        if(pending)replaced.fetch_add(1);
+        pending=std::move(job);start_locked();
+    }
+    bool queue_screen(HWND window,const uint8_t* ram,uint32_t origin,uint32_t w,uint32_t h,bool visible) {
+        if(!g_render_height.load()&&!g_gpu_window_owned.load())return false;
+        auto next=std::make_unique<Screen>();next->window=window;
+        next->scene=graphics_scene(ram);next->requested_height=g_render_height.load();next->smooth=g_filter_smooth.load();
+        if(visible&&origin&&w&&h&&uint64_t(origin)+uint64_t(w)*h*2<=8*1024*1024){
+            next->width=w;next->height=h;next->native.resize(size_t(w)*h);
+            std::memcpy(next->native.data(),ram+origin,next->native.size()*2);
+            next->visible=true;
+        } else next->native.assign(1,0);
+        {std::lock_guard lock(mutex);if(stopping)return false;screen_pending=std::move(next);start_locked();}
+        return g_gpu_window_owned.load();
     }
     bool copy_frame(uint32_t scene,uint32_t height,std::vector<uint16_t>& pixels,uint32_t& w,uint32_t& h) {
         std::lock_guard lock(mutex);
-        if (!height || latest.pixels.empty() || latest.scene!=scene || latest.requested_height!=height ||
-            latest.generation!=generation) return false;
+        if(!height||latest.pixels.empty()||latest.scene!=scene||latest.requested_height!=height||latest.generation!=generation)return false;
         pixels=latest.pixels;w=latest.width;h=latest.height;
+        display_age_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-latest.captured).count();
         return true;
     }
     void shutdown() {
-        {std::lock_guard lock(mutex);stopping=true;pending.reset();}
+        {std::lock_guard lock(mutex);stopping=true;pending.reset();screen_pending.reset();spare.reset();}
         wake.notify_one();
-        if (worker.joinable()) worker.join();
+        if(worker.joinable()){
+            // DXGI can require the HWND message pump during teardown. Keep it
+            // alive while the GPU owner releases the swapchain, then join.
+            while(!worker_done.load()){
+                MSG msg;while(PeekMessage(&msg,nullptr,0,0,PM_REMOVE)){
+                    if(msg.message!=WM_QUIT){TranslateMessage(&msg);DispatchMessage(&msg);}
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            worker.join();
+        }
     }
+    bool presented()const{return final_stats.presents>0;}
     void diagnostics() const {
-        std::cout << "[HD worker] Completed: " << completed.load() << ", pending snapshots replaced: "
-                  << replaced.load() << ", last replay: " << last_ms.load() << " ms; native timing path retained.\n";
+        std::cout<<"[HD worker] Completed: "<<completed.load()<<", pending snapshots replaced: "<<replaced.load()
+            <<", last replay: "<<last_ms.load()<<" ms; native timing path retained.\n";
+        std::cout<<"[HD GPU] Hardware frames: "<<gpu_frames.load()<<".\n";
+        std::cout<<"[HD latency] Average replay: "<<(replays.load() ? replay_us.load()/replays.load()/1000.0:0.0)
+            <<" ms; last submitted snapshot age: "<<display_age_ms.load()<<" ms.\n";
+        std::cout<<"[GPU resources] Surface allocations: "<<final_stats.surface_allocations<<", input allocations: "<<final_stats.input_allocations
+            <<", raster dispatches: "<<final_stats.dispatches<<", readback bytes: "<<final_stats.readback_bytes<<".\n";
+        std::cout<<"[DXGI] Presents: "<<final_stats.presents<<", occluded: "<<final_stats.occluded<<", busy skipped: "<<final_stats.present_skipped
+            <<", resizes: "<<final_stats.resize_count<<", resident HD frames: "<<resident_frames.load()<<", final CPU readbacks: "<<final_stats.final_readbacks<<".\n";
+        std::cout<<"[GPU timeline] Samples: "<<final_stats.gpu_samples<<", average replay span: "
+            <<(final_stats.gpu_samples ? final_stats.gpu_elapsed_us/final_stats.gpu_samples/1000.0:0.0)
+            <<" ms, maximum: "<<final_stats.gpu_max_us/1000.0<<" ms; unavailable slots skipped: "<<final_stats.timing_skipped
+            <<", spans over 100 ms: "<<final_stats.gpu_long_spans<<", first long frame: "<<final_stats.gpu_first_long_frame
+            <<". Resident replay CPU time does not wait for GPU completion.\n";
     }
 };
 static AsyncHDRenderer g_hd_renderer;
@@ -631,8 +773,8 @@ extern "C" void func_8004A580(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
 
-static void save_fb_to_bmp(const char* filename, const uint8_t* rdram_ptr, uint32_t fb_origin, uint32_t w, uint32_t h) {
-    if (fb_origin + w * h * 2 > 8 * 1024 * 1024) return;
+static void save_fb_to_bmp(const char* filename, const uint8_t* rdram_ptr, uint32_t fb_origin, uint32_t w, uint32_t h, size_t buffer_bytes) {
+    if (!w || !h || w>4096 || h>4096 || uint64_t(fb_origin) + uint64_t(w)*h*2 > buffer_bytes) return;
     std::ofstream f(filename, std::ios::binary);
     if (!f.is_open()) return;
 
@@ -657,7 +799,7 @@ static void save_fb_to_bmp(const char* filename, const uint8_t* rdram_ptr, uint3
 
     const uint16_t* fb = reinterpret_cast<const uint16_t*>(rdram_ptr + fb_origin);
     for (int y = (int)h - 1; y >= 0; y--) {
-        int src_y = (y >= (int)h - 1) ? ((int)h - 2) : y;
+        int src_y = (y >= (int)h - 1) ? std::max(0, (int)h - 2) : y;
         for (uint32_t x = 0; x < w; x++) {
             uint16_t px = fb[src_y * w + x];
             uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
@@ -704,7 +846,7 @@ public:
     }
     void save(const char* path) {
         std::lock_guard lock(mutex);
-        if (!pixels.empty()) save_fb_to_bmp(path, pixels.data(), 0, width, height);
+        if (!pixels.empty()) save_fb_to_bmp(path, pixels.data(), 0, width, height, pixels.size());
     }
     void blank() {
         std::lock_guard lock(mutex);
@@ -715,6 +857,7 @@ static PresentedFrame g_presented_frame;
 
 static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* task) {
     if (!task || !task->t.data_ptr) return;
+    interpreter.raster_backend=nullptr;
     interpreter.render_surfaces.set_height(0);
     g_hd_renderer.submit(interpreter,task,g_render_height.load());
     auto render_native=[&] {
@@ -731,6 +874,7 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
         // at each height. This compares identical geometry rather than two moving races.
         const std::vector<uint8_t> initial_ram(interpreter.rdram,interpreter.rdram+8*1024*1024);
         const F3DEX2Interpreter initial_state=interpreter;
+        GPURaster gpu;
         render_native();
         save_fb_to_bmp("framebuffer_compare_native.bmp",interpreter.rdram,interpreter.color_image_addr,
             interpreter.color_image_width,interpreter.framebuffer_height());
@@ -746,10 +890,33 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
             if (replay.render_surfaces.copy_scanout(replay.color_image_addr,replay.color_image_width,
                 replay.framebuffer_height(),pixels,w,h)) {
                 const std::string name="framebuffer_compare_"+std::to_string(height)+"p.bmp";
-                save_fb_to_bmp(name.c_str(),reinterpret_cast<const uint8_t*>(pixels.data()),0,w,h);
+                save_fb_to_bmp(name.c_str(),reinterpret_cast<const uint8_t*>(pixels.data()),0,w,h,pixels.size()*sizeof(uint16_t));
                 std::cout << "[Resolution comparison] Same DL rendered at native and " << w << 'x' << h
                           << "; " << height << "p replay took " << ms << " ms.\n";
                 if (height==1080) g_resolution_check_done.store(true);
+                if (gpu.available()) {
+                    auto gpu_ram=initial_ram;
+                    auto gpu_replay=initial_state;gpu_replay.diagnostics_enabled=false;
+                    gpu_replay.rdram=gpu_ram.data();gpu_replay.render_surfaces.clear();
+                    gpu_replay.render_surfaces.set_height(height);gpu.begin_frame();gpu_replay.raster_backend=&gpu;
+                    const auto gpu_start=std::chrono::steady_clock::now();
+                    gpu_replay.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
+                    const auto gpu_ms=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-gpu_start).count()/1000.0;
+                    std::vector<uint16_t> gpu_pixels;uint32_t gw=0,gh=0;
+                    if (gpu_replay.render_surfaces.copy_scanout(gpu_replay.color_image_addr,gpu_replay.color_image_width,
+                        gpu_replay.framebuffer_height(),gpu_pixels,gw,gh)) {
+                        size_t different=0;uint32_t max_error=0;
+                        if (gw!=w || gh!=h || gpu_pixels.size()!=pixels.size()) throw std::runtime_error("GPU comparison dimensions differ");
+                        for (size_t i=0;i<pixels.size();++i) {
+                            different+=pixels[i]!=gpu_pixels[i];
+                            for (int shift : {1,6,11}) max_error=std::max(max_error,uint32_t(std::abs(int((pixels[i]>>shift)&31)-int((gpu_pixels[i]>>shift)&31))));
+                        }
+                        const auto gpu_name="framebuffer_compare_gpu_"+std::to_string(height)+"p.bmp";
+                        save_fb_to_bmp(gpu_name.c_str(),reinterpret_cast<const uint8_t*>(gpu_pixels.data()),0,gw,gh,gpu_pixels.size()*sizeof(uint16_t));
+                        std::cout << "[GPU comparison] " << height << "p: " << gpu_ms << " ms; different pixels "
+                            << different << '/' << pixels.size() << ", maximum 5-bit channel error " << max_error << ".\n";
+                    }
+                }
             }
         }
     } else render_native();
@@ -809,7 +976,6 @@ public:
     }
 };
 
-static std::atomic<bool> g_filter_smooth{true};
 static bool g_fullscreen = false;
 static WINDOWPLACEMENT g_prev_wp = { sizeof(WINDOWPLACEMENT) };
 
@@ -954,8 +1120,15 @@ public:
             std::cout << "[update_screen #" << count << "] VI origin=0x" << std::hex << origin
                       << " width=" << std::dec << (vi ? vi->VI_WIDTH_REG : 0) << "\n";
         }
-        if (origin == 0) return;
+        if (!vi) return;
         const auto frame = tgod::vi_frame_layout(*vi);
+        if(g_hd_renderer.queue_screen(hwnd,rdram,origin,frame.width,frame.height,frame.visible)){
+            if(frame.visible)g_presented_frame.update(interpreter,rdram,origin,frame.width,frame.height);
+            else g_presented_frame.blank();
+            return;
+        }
+        std::lock_guard output_lock(g_window_output_mutex);
+        if(g_gpu_window_owned.load())return;
         if (!frame.visible) {
             std::lock_guard lock(presentation_mutex);
             g_presented_frame.blank();
@@ -1074,7 +1247,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 1; // Prevent window background erasing flicker
         case WM_CLOSE:
             g_running = false;
-            DestroyWindow(hwnd);
+            PostQuitMessage(0); // HWND stays alive until the GPU worker shuts down.
             return 0;
         case WM_DESTROY:
             g_running = false;
@@ -1097,7 +1270,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_filter_smooth.store(!g_filter_smooth.load());
             } else if (wParam == VK_F6 && !(lParam&(1l<<30))) {
                 const auto current=g_render_height.load();
-                const uint32_t next=current==0 ? 720 : current==720 ? 1080 : 0;
+                const uint32_t next=current==0 ? 720 : current==720 ? 1080 : current==1080 ? 2160 : 0;
                 g_render_height.store(next);
                 const auto value=std::to_wstring(next);
                 if (!WritePrivateProfileStringW(L"Graphics",L"RenderHeight",value.c_str(),g_graphics_config.c_str()))
@@ -1119,7 +1292,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            if (g_renderer_win32) {
+            std::lock_guard output_lock(g_window_output_mutex);
+            if (g_renderer_win32 && !g_gpu_window_owned.load()) {
                 std::lock_guard lock(g_renderer_win32->presentation_mutex);
                 render_frame_to_dc(hdc, hwnd, g_renderer_win32->rgba_pixels.data(), &g_renderer_win32->bmi,
                     g_renderer_win32->bmi.bmiHeader.biWidth, -g_renderer_win32->bmi.bmiHeader.biHeight);
@@ -1164,6 +1338,8 @@ int main(int argc, char** argv) {
             graphics_check = true;
         } else if (arg == L"--intro-check") {
             intro_check = true;
+        } else if (arg == L"--presentation-check") {
+            g_presentation_check = true;
         } else if (arg == L"--resolution-check") {
             g_resolution_check = true;
         } else if (arg == L"--render-height" && i+1<arguments.size()) {
@@ -1171,7 +1347,8 @@ int main(int argc, char** argv) {
             if (value==L"0" || value==L"native") render_height_override=0;
             else if (value==L"720") render_height_override=720;
             else if (value==L"1080") render_height_override=1080;
-            else {std::cerr << "--render-height expects native, 720 or 1080.\n";return 2;}
+            else if (value==L"2160" || value==L"4k" || value==L"4K") render_height_override=2160;
+            else {std::cerr << "--render-height expects native, 720, 1080 or 2160 (4k).\n";return 2;}
         } else if (arg == L"--verify-rom") {
             verify_only = true;
         } else if (arg == L"--seconds" && i + 1 < arguments.size()) {
@@ -1180,7 +1357,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check]] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -1193,6 +1370,10 @@ int main(int argc, char** argv) {
 
     if (graphics_check && !headless) {
         std::cerr << "--graphics-check requires --headless.\n";
+        return 2;
+    }
+    if(g_presentation_check&&(!headless||g_resolution_check)){
+        std::cerr<<"--presentation-check requires --headless and no --resolution-check.\n";
         return 2;
     }
     if (intro_check && (!headless || graphics_check)) {
@@ -1223,13 +1404,13 @@ int main(int argc, char** argv) {
     const auto program_directory = tgod::executable_directory();
     g_graphics_config=program_directory/L"tgod.ini";
     uint32_t selected_height=headless ? 0 : GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,g_graphics_config.c_str());
-    if (selected_height!=720 && selected_height!=1080) selected_height=0;
+    if (selected_height!=720 && selected_height!=1080 && selected_height!=2160) selected_height=0;
     if (render_height_override>=0) selected_height=uint32_t(render_height_override);
     g_render_height.store(selected_height);
     if (!headless && !std::filesystem::exists(g_graphics_config))
         WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"0",g_graphics_config.c_str());
     std::cout << "[Graphics] Internal resolution: " << (selected_height ? std::to_string(selected_height)+"p (4:3)" : "native")
-              << "; F6 cycles native/720p/1080p. Software rendering.\n";
+              << "; F6 cycles native/720p/1080p/4K. Native timing plus hardware HD.\n";
     if (!program_directory.empty()) {
         std::filesystem::current_path(program_directory, path_error);
         if (path_error) {
@@ -1241,7 +1422,7 @@ int main(int argc, char** argv) {
     g_audio_backend.start();
 
     // 2. Setup Win32 Window if in interactive mode
-    if (!headless) {
+    if (!headless || g_presentation_check) {
         WNDCLASSEX wc{};
         wc.cbSize = sizeof(WNDCLASSEX);
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1258,13 +1439,12 @@ int main(int argc, char** argv) {
             0,
             "TGOD_PORT_WINDOW",
             "Top Gear Overdrive (N64 Native PC Port)",
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW | (g_presentation_check ? 0:WS_VISIBLE),
             CW_USEDEFAULT, CW_USEDEFAULT,
             wr.right - wr.left, wr.bottom - wr.top,
             nullptr, nullptr, GetModuleHandle(nullptr), nullptr
         );
-        ShowWindow(g_hwnd, SW_SHOW);
-        UpdateWindow(g_hwnd);
+        if(!g_presentation_check){ShowWindow(g_hwnd, SW_SHOW);UpdateWindow(g_hwnd);}
         std::cout << "[Host] Created native Win32 window (HWND: 0x" << std::hex << (uintptr_t)g_hwnd << std::dec << ", 640x480 client area)\n";
     } else {
         g_audio_backend.enabled = true;
@@ -1457,7 +1637,7 @@ int main(int argc, char** argv) {
                     "Top Gear Overdrive (PC) | %s | %.1f FPS | Tris: %u | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
                     mode_name, fps, tris, g_audio_backend.buffers_queued.load(),
                     g_filter_smooth.load() ? "Smooth" : "Crisp",
-                    g_render_height.load()==1080 ? "1080p" : g_render_height.load()==720 ? "720p" : "Native");
+                    g_render_height.load()==2160 ? "4K (2160p)" : g_render_height.load()==1080 ? "1080p" : g_render_height.load()==720 ? "720p" : "Native");
                 SetWindowTextA(g_hwnd, title_buf);
 
                 static auto last_console_log = std::chrono::steady_clock::now();
@@ -1484,6 +1664,22 @@ int main(int argc, char** argv) {
         std::cout << "[Host] Waiting " << (headless_seconds * 1000) << " ms for background game threads ("
                   << (intro_check ? "uninterrupted intro capture" : "automated navigation to Mode 2") << ")...\n";
         for (int s = 0; s < headless_seconds * 10; s++) {
+            if(g_presentation_check){
+                MSG msg;while(PeekMessage(&msg,nullptr,0,0,PM_REMOVE)){
+                    if(msg.message!=WM_QUIT){TranslateMessage(&msg);DispatchMessage(&msg);}
+                }
+                if(!intro_check){
+                    if(s==80)g_render_height=720;
+                    if(s==110)g_render_height=1080;
+                    if(s==130)g_render_height=2160;
+                    if(s==150)g_render_height=0;
+                    if(s==180)g_render_height=720;
+                    if(s==210)g_render_height=2160;
+                    if(s==100||s==140||s==200)resize_window_scale(g_hwnd,s==100 ? 3:s==140 ? 1:2);
+                    if(s==160||s==170)toggle_fullscreen(g_hwnd);
+                    if(s==120||s==190)g_filter_smooth=!g_filter_smooth.load();
+                }
+            }
             // Periodic button pulses to navigate menus:
             // 2.5s-2.8s: Start + A (Intro -> Mode 1)
             // 3.8s-4.1s: Start / A (Title screen -> Main Menu)
@@ -1595,9 +1791,9 @@ int main(int argc, char** argv) {
                 uint16_t deb_btns = read_rdram_u16(rdram, 0x800FF61C);
                 uint32_t intro_timer = read_rdram_u32(rdram, 0x80053654);
                 uint8_t intro_stage = read_rdram_u8(rdram, 0x80053650);
-                uint32_t dls = g_renderer_null ? g_renderer_null->dl_count.load() : 0;
-                uint32_t rects = g_renderer_null ? g_renderer_null->interpreter.rects_drawn : 0;
-                uint32_t tris = g_renderer_null ? g_renderer_null->interpreter.triangles_drawn : 0;
+                uint32_t dls = g_renderer_win32 ? g_renderer_win32->dl_count.load() : g_renderer_null ? g_renderer_null->dl_count.load() : 0;
+                uint32_t rects = g_renderer_win32 ? g_renderer_win32->interpreter.rects_drawn : g_renderer_null ? g_renderer_null->interpreter.rects_drawn : 0;
+                uint32_t tris = g_renderer_win32 ? g_renderer_win32->interpreter.triangles_drawn : g_renderer_null ? g_renderer_null->interpreter.triangles_drawn : 0;
                 std::cout << "[T+" << std::fixed << std::setprecision(1) << sec << "s] "
                           << "Mode: " << mode
                           << " | Submenu: " << (int)(int8_t)submenu
@@ -1790,6 +1986,7 @@ int main(int argc, char** argv) {
     ultramodern::quit();
     g_hd_renderer.shutdown();
     g_hd_renderer.diagnostics();
+    if(g_hwnd&&IsWindow(g_hwnd))DestroyWindow(g_hwnd);
     std::cout << "[Native render] Average: " << g_native_render_us.load()/std::max(uint64_t(1),g_native_render_count.load())
               << " us, maximum: " << g_native_render_max_us.load() << " us; scale: " << authoritative_scale << ".\n";
     g_audio_backend.shutdown();
@@ -1803,5 +2000,6 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_resolution_check && !g_resolution_check_done.load())
         std::cerr << "[Resolution comparison] Race frame was not captured; increase --seconds.\n";
-    std::quick_exit((loaded_count == 4 && (!g_resolution_check || g_resolution_check_done.load())) ? 0 : 2);
+    std::quick_exit((loaded_count == 4 && (!g_resolution_check || g_resolution_check_done.load()) &&
+        (!g_presentation_check || g_hd_renderer.presented())) ? 0 : 2);
 }

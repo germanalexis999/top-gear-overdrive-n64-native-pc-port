@@ -1,4 +1,6 @@
-## v0.1.0-preview.6 — Windows 10/11 x64
+## v0.1.0-preview.7 — Windows 10/11 x64
+
+Versión preliminar con renderizado HD por GPU y opción 4K.
 
 Descarga el ZIP de Windows de los archivos adjuntos, extráelo completo y abre
 `Jugar.cmd` o `tgod_native.exe`. Selecciona una **ROM propia de Top Gear Overdrive
@@ -11,10 +13,27 @@ capturas, música ni guardados.** La ROM se lee localmente y no se envía a serv
 
 Cambios principales:
 
+- F6 añade 4K después de 1080p: 2880×2160 en formato 4:3, persistencia
+  RenderHeight=2160 y arranque con --render-height 4k (o 2160).
+  Capturas y buffers admiten esa resolución; la lógica conserva su escala nativa.
+
+- Presentación HD directa por DXGI, conversión/filtro/barras 4:3 en GPU y
+  reutilización de buffers/vistas. Se omite la descarga final de pantalla a CPU;
+  se mantienen los readbacks necesarios para efectos y la recuperación a GDI.
+- Verificación de ventana con cambios de resolución, resize, fullscreen y filtro.
+  Contadores de recursos/readback y mediciones CPU/GPU separadas sin espera.
+- Salida HD acelerada con GPU Direct3D 11, reutilizando la interpretación y el
+  recorte del renderer existente. El shader propio queda incrustado en el EXE.
+- Se mantiene el procesamiento nativo y la entrega de eventos SP/DP; la GPU
+  trabaja sobre copias privadas. Se elimina el límite fijo de 10 imágenes HD/s.
+- En RTX 3080 Ti, el mismo cuadro pasó de 326/726 ms por CPU a unos 12 ms por GPU
+  a 720p/1080p. Son tiempos de un replay, no una promesa de FPS del juego completo.
+- Comprobaciones CPU/GPU sin ROM: formatos, filtrado, profundidad, mezcla,
+  líneas, máscaras de intro y cambios entre targets 320/640.
 - Reparada la intro: KEMCO, Snowblind y portada vuelven a dibujarse. Las máscaras
   de coordenadas ya no se confunden con las dimensiones de las texturas.
-- F6 selecciona resolución nativa, 720p o 1080p y guarda la preferencia en
-  `tgod.ini`. Se mantiene 4:3: 960x720 y 1440x1080, con barras laterales en 16:9.
+- F6 selecciona resolución nativa, 720p, 1080p o 4K y guarda la preferencia en
+  `tgod.ini`. Se mantiene 4:3: 960x720, 1440x1080 y 2880x2160, con barras laterales en 16:9.
 - El trabajo HD se realiza en un hilo separado sobre copias privadas. El juego
   conserva el render y los eventos nativos para evitar la alteración de físicas
   observada cuando el modo HD se ejecutaba de forma sincrónica.
@@ -35,8 +54,11 @@ Cambios principales:
 - MODIFYVTX conserva clip W/Z y respeta los modos de perspectiva/filtrado.
 - Recorrido de diagnóstico con frenado/derrape mediante --graphics-check.
 
-**720p/1080p son experimentales: la imagen HD todavía tiene pocos FPS y retraso
-con el renderer por CPU. Nativo es el valor predeterminado recomendado para jugar.**
+**HD requiere hardware Direct3D 11 con feature level 11.0.** Si no está disponible
+o falla el replay, se informa y se vuelve al renderer por CPU, que sigue siendo
+lento en HD. Nativo es el valor predeterminado. La presentación HD usa DXGI
+y conserva el ritmo nativo; no se convierte el juego a 60 FPS. Hay pequeñas diferencias de
+redondeo CPU/GPU; todavía falta comprobar otros adaptadores y más escenas.
 El hilo HD descarta cuadros pendientes para conservar el avance nativo del juego.
 Las texturas siguen siendo las originales; aumentar resolución mejora contornos
 pero no crea detalle en sus imágenes.
@@ -44,10 +66,14 @@ pero no crea detalle en sus imágenes.
 Las pruebas de fuentes incluyen máscaras de intro, resoluciones, readback,
 aislamiento de RDRAM, HUD, profundidad y líneas. Los recorridos de 30 s en
 720p/1080p mantuvieron carrera, 4/4 catálogos, EEPROM y cero descartes/reemplazos
-de audio. Se verificó la intro completa durante 38 s.
+de audio. La salida HD entregó 703/691 imágenes en recorridos separados de 30 s,
+con replays medios de 9,1/14,4 ms y escala nativa 1. Se verificó la intro hasta
+el menú durante 50 s con salida GPU 1080p y sin descartes de audio.
 El ZIP se comprueba por separado con PATH limitado a Windows, tres órdenes de
 bytes de ROM, una carrera de 16 s en nativo y otra de 20 s con salida 1080p
 asíncrona. La ROM de prueba no forma parte del paquete.
+Cuando se detecta GPU también se comprueba la ventana DXGI durante 24 s, con
+cambios de resolución, resize/fullscreen/filtro y cero readbacks finales de pantalla.
 
 El usuario confirmó que el HUD y el humo quedaron corregidos en sus pruebas.
 Persisten diferencias de coverage, profundidad comprimida, dither, mezcla y

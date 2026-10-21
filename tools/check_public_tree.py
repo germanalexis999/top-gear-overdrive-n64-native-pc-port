@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit the Git index against the public port source allowlist."""
 import re
+import argparse
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -18,10 +19,14 @@ EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
 EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "include/vi_scanout.hpp",
               "include/render_surface.hpp",
+              "include/gpu_raster.hpp", "src/gpu_raster.cpp", "src/gpu_raster_shader.inc",
+              "src/gpu_present_shader.inc",
+              "tools/gpu_regression_checks.cpp", "tools/compile_gpu_shader.cpp",
               "tools/package_windows.py", "tools/publish_release.py", "tools/test_windows_package.py",
               "tools/release_windows.ps1",
               "docs/RELEASES.md", "docs/RELEASE-NOTES.md",
               "docs/DIAGNOSTICS-2026-10-21.md",
+              "docs/RENDERER-ARCHITECTURE.md",
               "packaging/README-WINDOWS.txt", "packaging/Jugar.cmd"})
 EXACT.update("LICENSES/" + name + ".txt" for name in (
     "miniz", "o1heap", "xxHash", "fmt", "rabbitizer", "ELFIO", "tomlplusplus",
@@ -30,13 +35,18 @@ EXACT.update("LICENSES/" + name + ".txt" for name in (
 
 
 def main():
-    files = subprocess.check_output(["git", "ls-files", "--cached", "-z"], cwd=ROOT).decode().split("\0")
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worktree",action="store_true",help="Audit current tracked and untracked source before staging")
+    args=parser.parse_args()
+    command=["git","ls-files","--cached","-z"]
+    if args.worktree: command=["git","ls-files","--cached","--others","--exclude-standard","-z"]
+    files = subprocess.check_output(command, cwd=ROOT).decode().split("\0")
     errors = []
     for name in filter(None, files):
         if name not in EXACT or ".." in PurePosixPath(name).parts:
             errors.append(f"Unapproved file: {name}")
             continue
-        blob = subprocess.check_output(["git", "show", ":" + name], cwd=ROOT)
+        blob = (ROOT/name).read_bytes() if args.worktree else subprocess.check_output(["git", "show", ":" + name], cwd=ROOT)
         if b"\0" in blob or len(blob) > 512 * 1024:
             errors.append(f"Binary or oversized file: {name}")
         text = blob.decode("utf-8", errors="replace")
@@ -48,7 +58,8 @@ def main():
         raise SystemExit("\n".join(errors))
     if len(list(filter(None, files))) != len(EXACT):
         raise SystemExit("The public source manifest is incomplete.")
-    print(f"PASS: {len(EXACT)} indexed text files; allowlist, binary, credential and local-path checks.")
+    scope="working-tree" if args.worktree else "indexed"
+    print(f"PASS: {len(EXACT)} {scope} text files; allowlist, binary, credential and local-path checks.")
 
 
 if __name__ == "__main__":

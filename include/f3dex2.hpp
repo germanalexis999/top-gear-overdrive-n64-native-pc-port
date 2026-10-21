@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include "render_surface.hpp"
+#include "gpu_raster.hpp"
 
 struct Matrix4x4 {
     float m[4][4]{};
@@ -27,6 +28,7 @@ public:
     uint32_t segments[16]{};
     uint8_t tmem[4096]{};
     bool diagnostics_enabled = true;
+    RasterBackend* raster_backend = nullptr;
     tgod::RenderSurfaces render_surfaces;
     uint32_t framebuffer_height() const { return color_image_width==640 ? 480 : 240; }
     tgod::RenderSurfaces::Buffer render_buffer(uint32_t address,bool dirty=true) {

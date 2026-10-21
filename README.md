@@ -1,8 +1,9 @@
 # Top Gear Overdrive — N64 Native PC Port
 
 Port experimental para Windows x64 mediante recompilación estática. Incluye un
-host Win32, audio WaveOut, controles de teclado/XInput y un rasterizador de
-software para display lists F3DEX2. Requiere una ROM USA v0 aportada localmente.
+host Win32, audio WaveOut, controles de teclado/XInput, rasterizador nativo de
+software y salida HD por GPU Direct3D 11 para display lists F3DEX2.
+Requiere una ROM USA v0 aportada localmente.
 
 ## Descargar y jugar en Windows
 
@@ -21,10 +22,13 @@ Arranca, recorre los menús y entra a carrera. Se corrigieron la sobreproducció
 de audio, bloqueos del scheduler y la corrupción del viewport que ocultaba la
 escena 3D. La fidelidad visual y de audio todavía está en desarrollo.
 
-Las fuentes posteriores a preview.5 añaden resolución interna nativa/720p/1080p
-con F6 y configuración persistente en `tgod.ini`. Los modos HD son experimentales
-y lentos con el renderer por CPU; consulta los límites y la comparación de cuadros
+F6 selecciona resolución interna nativa/720p/1080p/4K y guarda la configuración
+en `tgod.ini`. Desde preview.7 se acelera HD con GPU y conservan
+la sincronización nativa. Si no hay hardware compatible se usa la salida por CPU,
+que es lenta en HD. Consulta los requisitos y la comparación de cuadros
 en [BUILDING.md](docs/BUILDING.md#resolución-interna-y-configuración-gráfica).
+La presentación HD se realiza directamente con DXGI, reutilizando recursos de GPU
+y conservando las lecturas de framebuffer que necesitan los efectos del juego.
 
 - [Compilación, ROM local, pruebas y controles](docs/BUILDING.md)
 - [Estado, evidencia y pendientes](docs/STATUS.md)
@@ -56,3 +60,5 @@ python tools/check_public_tree.py
 
 El auditor usa una lista explícita de archivos permitidos y examina los bytes
 del índice, de modo que también detecta contenido ya preparado para un commit.
+
+4K conserva el formato 4:3: renderiza 2880×2160 y muestra barras laterales en una pantalla 3840×2160. Se selecciona con F6, RenderHeight=2160 o --render-height 4k. Requiere más trabajo de GPU que 1080p.

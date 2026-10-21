@@ -16,7 +16,8 @@ REPO_URL = "https://github.com/germanalexis999/top-gear-overdrive-n64-native-pc-
 RUNTIME_DLLS = {"libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"}
 WINDOWS_DLLS = {"advapi32.dll", "bcrypt.dll", "comdlg32.dll", "gdi32.dll",
                "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "shell32.dll",
-               "user32.dll", "ucrtbase.dll", "winmm.dll", "ws2_32.dll"}
+               "user32.dll", "ucrtbase.dll", "winmm.dll", "ws2_32.dll",
+               "d3d11.dll", "dxgi.dll"}
 
 
 def sha256(path: Path) -> str:

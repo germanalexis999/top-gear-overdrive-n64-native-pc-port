@@ -4,11 +4,24 @@ El usuario confirma que el HUD quedó bien y el humo quedó arreglado en los cas
 probados con preview.4. También mantiene la mejora musical. Se cierra ese síntoma;
 esto no equivale a paridad completa con consola.
 
-Última revisión, preview.6: resolución interna nativa/720p/1080p
-con F6 y `tgod.ini`. HD vuelve a rasterizar la geometría en copias privadas, con
-profundidad y HUD. Un hilo separado evita bloquear el avance nativo del juego;
-la salida HD sigue siendo experimental, lenta y con latencia por CPU.
-La comparación de un mismo cuadro dio 318 ms a 720p y 714 ms a 1080p.
+Cambios de preview.7: salida HD por GPU Direct3D 11, con F6
+y `tgod.ini`. Mantiene el intérprete y los eventos SP/DP en nativo; la GPU dibuja
+solo sobre memoria privada. En una RTX 3080 Ti, una misma lista de carrera pasa
+de 326/726 ms por CPU a unos 12 ms por GPU a 720p/1080p. Se elimina el límite de
+captura de 100 ms. Si no hay hardware compatible se usa el fallback HD por CPU,
+que conserva las limitaciones de rendimiento anteriores. Las diferencias de
+redondeo y otras escenas siguen en revisión. Estos cambios forman parte de preview.7.
+
+La presentación de preview.7 reutiliza superficies/buffers y presenta HD por DXGI
+sin descarga final a CPU. Conserva el rasterizado y eventos nativos, los readbacks
+para efectos y una recuperación a GDI. Pasaron regresiones de presentación, una
+carrera con cambios nativo/720p/1080p, resize, fullscreen y filtro, sin descartes
+de audio. Las cifras CPU y GPU se miden por separado; no son FPS garantizados.
+
+La comparación de Mario Kart, Zelda, Wave Race y Ship of Harkinian está en
+[RENDERER-ARCHITECTURE.md](RENDERER-ARCHITECTURE.md). Se implementaron la reutilización
+de recursos y la presentación directa en el backend propio. Un futuro prototipo RT64 debe resolver primero
+las líneas L3DEX2 de la revisión elegida y comprobar sincronización/readback.
 
 También están corregidas las máscaras de textura
 que dejaban los logos de la intro negros y solo permitían ver puntos de nieve.
@@ -110,8 +123,9 @@ cerca de cámara, scissor, profundidad, índices inválidos y vuelta a F3DEX2.
 
 ## Pendientes
 
-- Rendimiento HD: el rasterizador por CPU no ofrece 720p/1080p fluidos. Nativo
-  sigue siendo el valor predeterminado. Evaluar aceleración o backend de GPU.
+- Rendimiento HD: comprobar GPU en otros adaptadores y presentación en ventana;
+  medir latencia prolongada y los intervalos largos iniciales observados. El
+  fallback por CPU sigue siendo lento; el dibujo nativo aún ocupa CPU.
 - Comparación de carteles/LOD/filtrado a distancia con referencia: la resolución
   interna mejora contornos pero no crea detalle en los assets originales.
 - Revisar transparencias, reflejos y geometría en otras escenas y circuitos.
@@ -124,3 +138,8 @@ cerca de cámara, scissor, profundidad, índices inválidos y vuelta a F3DEX2.
 
 Los contadores de cobertura de pantalla y de catálogos son diagnósticos parciales;
 no demuestran por sí solos exactitud gráfica ni integridad de todos los assets.
+
+Opción 4K de preview.7: F6 alterna nativo/720p/1080p/4K; mantiene 4:3 (2880×2160).
+Pasaron regresiones de CPU y GPU, presentación residente y feedback explícito
+a 2160p, además de una carrera de 20 s con capturas reales 2880×2160 y escala
+autoritativa 1.0. El usuario confirmó la mejora de la presentación DXGI previa.
