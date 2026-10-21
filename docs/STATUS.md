@@ -1,10 +1,10 @@
 # Estado del port — 2026-10-21
 
-Seguimiento posterior a la primera descarga: el worker de audio ya se despierta
-por WOM_DONE y las pruebas recientes redujeron los vaciados observados de 56 a
-0–4 por recorrido de 16 s. También se implementaron iluminación direccional/
-ambiente y texgen, con pruebas de normales, rotación y alfa. La fidelidad musical
-y los fallos gráficos restantes siguen abiertos. Evidencia y límites en
+Última revisión de fuentes: showroom recuperado al interpretar VI entrelazado
+(stride 1280, imagen 640), y coche con color/detalles tras corregir alfa I4/I8.
+También se añadieron TEXEL1 independiente, mipmaps/fracciones LOD y muestreo
+común para rectángulos. El usuario confirma mejora musical; el foco actual es
+gráficos. Quedan defectos en textos/HUD y fidelidad RDP/VI. Evidencia y límites en
 [DIAGNOSTICS-2026-10-21.md](DIAGNOSTICS-2026-10-21.md).
 
 ## Distribución Windows preliminar
@@ -14,6 +14,7 @@ Fuentes en `main`; binarios separados en GitHub Releases y localmente en
 instrucciones, GPLv3/avisos upstream, fuentes por revisión y manifiesto SHA-256.
 No contiene ROM ni datos extraídos. El selector carga una ROM local y verifica
 USA v0; `.z64`, `.v64` y `.n64` se normalizan solo en memoria.
+La última revisión gráfica de fuentes es posterior al binario preview.2.
 
 La extracción temporal del ZIP pasó con PATH limitado a Windows: inicio sin
 compilador instalado en PATH, rutas Unicode/con espacios, tres órdenes de bytes,
@@ -34,6 +35,10 @@ entra a carrera con una ROM USA v0 local. No se declara paridad completa con N64
 - Render: `G_MOVEMEM` lee el identificador en el byte bajo, evitando interpretar
   una carga de luces como viewport. Se corrigieron PUSH de F3DEX2, el avance DXT
   después de cada palabra y la lectura de las filas impares de TMEM.
+- Materiales: TEXEL1 separado, niveles LOD limitados por G_TEXTURE y alfa de
+  intensidad. Rectángulos 2D comparten el muestreador y respetan filas impares.
+- Presentación: modo VI entrelazado del showroom, tamaño RGB dinámico,
+  sincronización del repintado y capturas de cuadros presentados.
 - Generación: las esperas cooperativas se aplican desde un script versionado.
   EEPROM read/write se identifican mediante símbolos; no requieren editar el C
   generado ni cambiar la función de lectura de mandos del runtime.
@@ -58,9 +63,10 @@ eliminación de nodos intermedios/finales/ausentes en colas de hilos.
 
 ## Pendientes
 
-- Escucha y comparación de música/efectos durante sesiones largas.
-- Fidelidad de colores del coche, showroom, HUD, iluminación y transparencias.
-- TEXEL1 independiente, combiner/blender completos y cobertura de comandos RSP.
+- Textos superiores del showroom, HUD, transparencias y reflejos restantes.
+- Combiner/blender, profundidad/coverage, filtrado y campos VI con precisión N64.
+- Escucha/comparación prolongada de música/efectos; prioridad actual: gráficos.
+- Cobertura de comandos RSP y formatos fuera de las escenas comprobadas.
 - Circuitos, modalidades, guardados y estabilidad fuera de la ruta automatizada.
 
 Los contadores de cobertura de pantalla y de catálogos son diagnósticos parciales;

@@ -76,6 +76,7 @@ void F3DEX2Interpreter::reset() {
     fill_color = 0;
     env_color = 0xFFFFFFFF;
     prim_color = 0xFFFFFFFF;
+    primitive_lod_fraction = primitive_min_lod = 0;
     blend_color = 0;
     fog_color = 0;
     combine_mode_w0 = 0;
@@ -104,6 +105,7 @@ void F3DEX2Interpreter::reset() {
     lit_vertices = 0;
     light_commands = 0;
     texgen_vertices = 0;
+    second_texture_triangles = 0;
     light_count = 0;
     std::memset(lights, 0, sizeof(lights));
     std::memset(look_at, 0, sizeof(look_at));
@@ -121,6 +123,7 @@ void F3DEX2Interpreter::reset() {
     viewport_scale[0] = 640; viewport_scale[1] = 480; viewport_scale[2] = 511; viewport_scale[3] = 0;
     viewport_trans[0] = 640; viewport_trans[1] = 480; viewport_trans[2] = 511; viewport_trans[3] = 0;
     texture_tile = 0;
+    texture_max_level = 0;
     texture_enabled = true;
     texture_scale_s = 0x10000;
     texture_scale_t = 0x10000;
@@ -281,6 +284,209 @@ void F3DEX2Interpreter::rasterize_triangle(const Vertex3D& v0, const Vertex3D& v
     }
 }
 
+bool F3DEX2Interpreter::fetch_tile_texel(const Tile& tile, int32_t su, int32_t sv,
+    uint8_t& out_r, uint8_t& out_g, uint8_t& out_b, uint8_t& out_a) const {
+    const int32_t tw = tile.mask_s ? (1 << tile.mask_s) : int32_t(tile.lrs - tile.uls) + 1;
+    const int32_t th = tile.mask_t ? (1 << tile.mask_t) : int32_t(tile.lrt - tile.ult) + 1;
+    if (tw <= 0 || th <= 0 || tw > 1024 || th > 1024) return false;
+    const uint32_t pixel_size = tile.format == 0 && tile.size == 3 ? 2 : tile.size;
+    const uint32_t stride = tile.line ? tile.line * 8 : ((uint32_t(tw) << pixel_size) + 1) / 2;
+    // TMEM is a circular 4 KiB address space; a tile access
+    // crossing its end wraps instead of producing an invalid texel.
+    auto read_tmem8 = [&](uint32_t address) -> uint8_t { return tmem[address & 0xFFF]; };
+    if (tile.clamp_s) {
+        su = std::clamp(su, 0, tw - 1);
+    } else if (tile.mask_s > 0) {
+        int32_t m = 1 << tile.mask_s;
+        su = su % (m * 2);
+        if (su < 0) su += m * 2;
+        if (tile.mirror_s && su >= m) {
+            su = (m * 2 - 1) - su;
+        } else {
+            su = su % m;
+        }
+        if (su >= tw) su = tw - 1;
+    } else {
+        su = su % tw;
+        if (su < 0) su += tw;
+    }
+
+    if (tile.clamp_t) {
+        sv = std::clamp(sv, 0, th - 1);
+    } else if (tile.mask_t > 0) {
+        int32_t m = 1 << tile.mask_t;
+        sv = sv % (m * 2);
+        if (sv < 0) sv += m * 2;
+        if (tile.mirror_t && sv >= m) {
+            sv = (m * 2 - 1) - sv;
+        } else {
+            sv = sv % m;
+        }
+        if (sv >= th) sv = th - 1;
+    } else {
+        sv = sv % th;
+        if (sv < 0) sv += th;
+    }
+
+    if (tile.format == 0 && tile.size == 3) { // RGBA32: RG and BA occupy separate 2 KiB banks.
+        const uint32_t index = ((tile.tmem_addr + sv * stride + su * 2) ^ ((sv & 1) ? 4u : 0u)) & 0x7FF;
+        out_r = tmem[index]; out_g = tmem[(index + 1) & 0x7FF];
+        out_b = tmem[index | 0x800]; out_a = tmem[((index + 1) & 0x7FF) | 0x800];
+        return true;
+    } else if (tile.format == 3 && tile.size == 2) { // IA16
+        const uint32_t index = (tile.tmem_addr + sv * stride + su * 2) ^ ((sv & 1) ? 4u : 0u);
+        out_r = out_g = out_b = read_tmem8(index);
+        out_a = read_tmem8(index + 1);
+        return true;
+    } else if (tile.format == 0 && tile.size == 2) { // RGBA16
+        uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su * 2) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint16_t c16 = ((uint16_t)read_tmem8(tmem_idx) << 8) | read_tmem8(tmem_idx + 1);
+            out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
+            out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
+            out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
+            out_a = (c16 & 1) ? 255 : 0;
+            return true;
+        }
+    } else if (tile.format == 2 && tile.size == 1) { // CI8
+        uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t idx = read_tmem8(tmem_idx);
+            uint32_t pal_offset = tlut_tmem_addr + (idx * 2);
+            {
+                uint16_t c16 = ((uint16_t)read_tmem8(pal_offset) << 8) | read_tmem8(pal_offset + 1);
+                out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
+                out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
+                out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
+                out_a = (c16 & 1) ? 255 : 0;
+                return true;
+            }
+        }
+    } else if (tile.format == 2 && tile.size == 0) { // CI4
+        uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t b = read_tmem8(byte_idx);
+            uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            uint32_t pal_offset = tlut_tmem_addr + ((tile.palette * 16 + nib) * 2);
+            {
+                uint16_t c16 = ((uint16_t)read_tmem8(pal_offset) << 8) | read_tmem8(pal_offset + 1);
+                out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
+                out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
+                out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
+                out_a = (c16 & 1) ? 255 : 0;
+                return true;
+            }
+        }
+    } else if (tile.format == 3 && tile.size == 1) { // IA8
+        uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t byte = read_tmem8(tmem_idx);
+            uint8_t alpha = byte & 0x0F;
+            uint8_t intensity = (byte >> 4) & 0x0F;
+            out_r = out_g = out_b = intensity * 255 / 15;
+            out_a = alpha * 255 / 15;
+            return true;
+        }
+    } else if (tile.format == 3 && tile.size == 0) { // IA4
+        uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t b = read_tmem8(byte_idx);
+            uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            out_r = out_g = out_b = ((nib >> 1) & 0x07) * 255 / 7;
+            out_a = (nib & 1) ? 255 : 0;
+            return true;
+        }
+    } else if (tile.format == 4 && tile.size == 1) { // I8
+        uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t intensity = read_tmem8(tmem_idx);
+            out_r = out_g = out_b = intensity;
+            out_a = intensity;
+            return true;
+        }
+    } else if (tile.format == 4 && tile.size == 0) { // I4
+        uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint8_t b = read_tmem8(byte_idx);
+            uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            uint8_t intensity = nib * 255 / 15;
+            out_r = out_g = out_b = intensity;
+            out_a = intensity;
+            return true;
+        }
+    } else { // Generic 16-bit
+        uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su * 2) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
+        {
+            uint16_t c16 = ((uint16_t)read_tmem8(tmem_idx) << 8) | read_tmem8(tmem_idx + 1);
+            out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
+            out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
+            out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
+            out_a = 255;
+            return true;
+        }
+    }
+    return false;
+}
+
+F3DEX2Interpreter::TextureLOD F3DEX2Interpreter::select_texture_lod(float footprint) const {
+    TextureLOD lod;
+    if (!(other_mode_h & (1u << 16))) return lod;
+    const bool sharpen = (other_mode_h & (1u << 17)) != 0;
+    const bool detail = (other_mode_h & (1u << 18)) != 0;
+    if (sharpen || detail) footprint = std::max(footprint, primitive_min_lod / 32.0f);
+    footprint = std::max(footprint, 1e-8f);
+    int level = int(std::floor(std::log2(footprint)));
+    lod.fraction = footprint / std::ldexp(1.0f, std::max(level, 0)) - 1.0f;
+    if (sharpen && footprint < 1) lod.fraction = footprint - 1;
+    if (detail) {
+        if (lod.fraction < 0) lod.fraction = footprint;
+        ++level;
+    } else if (level >= texture_max_level) {
+        lod.fraction = 1;
+    }
+    if (detail || sharpen) level = std::max(level, 0);
+    else lod.fraction = std::max(lod.fraction, 0.0f);
+    lod.first = uint8_t(std::clamp(level, 0, int(texture_max_level)));
+    lod.second = uint8_t(std::clamp(level + 1, 0, int(texture_max_level)));
+    return lod;
+}
+
+bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool linear,
+    uint8_t (&color)[4]) const {
+    std::fill(color, color + 4, 0);
+    auto shift_coordinate = [](float coordinate, uint32_t shift) {
+        // RDP shifts 0..10 divide; 11..15 multiply by 2^(16-shift).
+        return std::ldexp(coordinate, shift <= 10 ? -int(shift) : 16 - int(shift));
+    };
+    s = shift_coordinate(s, tile.shift_s) - float(tile.uls);
+    t = shift_coordinate(t, tile.shift_t) - float(tile.ult);
+    if (!std::isfinite(s) || !std::isfinite(t) ||
+        std::abs(s) > 10000000.0f || std::abs(t) > 10000000.0f) return false;
+    if (!linear) {
+        return fetch_tile_texel(tile, int32_t(std::floor(s)), int32_t(std::floor(t)),
+            color[0], color[1], color[2], color[3]);
+    }
+
+    // Keep the existing four-tap approximation, now independently for each tile.
+    // RDP three-point filtering and its fixed-point rounding remain separate work.
+    s -= 0.5f;
+    t -= 0.5f;
+    const int32_t x = int32_t(std::floor(s)), y = int32_t(std::floor(t));
+    const float fs = s - float(x), ft = t - float(y);
+    uint8_t samples[4][4]{};
+    const float weights[4] = {(1-fs)*(1-ft), fs*(1-ft), (1-fs)*ft, fs*ft};
+    for (int i = 0; i < 4; ++i) {
+        if (!fetch_tile_texel(tile, x + (i & 1), y + (i >> 1),
+            samples[i][0], samples[i][1], samples[i][2], samples[i][3])) return false;
+    }
+    for (int channel = 0; channel < 4; ++channel) {
+        float value = 0;
+        for (int i = 0; i < 4; ++i) value += samples[i][channel] * weights[i];
+        color[channel] = uint8_t(std::clamp(value, 0.0f, 255.0f));
+    }
+    return true;
+}
+
 void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2) {
     if (color_image_size != 2 || !rdram) return;
     if (color_image_addr + color_image_width * 240 * 2 > 8 * 1024 * 1024) return;
@@ -318,6 +524,36 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     if (combine_mode_set) {
         ++combine_cycle_triangles[(other_mode_h >> 20) & 3];
     }
+    const bool two_cycles = ((other_mode_h >> 20) & 3) == 1;
+    bool uses_second_texture = false;
+    if (combine_mode_set && two_cycles && !v0.is_screen_space) {
+        for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+            const uint32_t color_selectors[4] = {
+                cycle ? ((combine_mode_w0 >> 5) & 15) : ((combine_mode_w0 >> 20) & 15),
+                cycle ? ((combine_mode_w1 >> 24) & 15) : ((combine_mode_w1 >> 28) & 15),
+                cycle ? (combine_mode_w0 & 31) : ((combine_mode_w0 >> 15) & 31),
+                cycle ? ((combine_mode_w1 >> 6) & 7) : ((combine_mode_w1 >> 15) & 7)
+            };
+            const uint32_t alpha_selectors[4] = {
+                cycle ? ((combine_mode_w1 >> 21) & 7) : ((combine_mode_w0 >> 12) & 7),
+                cycle ? ((combine_mode_w1 >> 3) & 7) : ((combine_mode_w1 >> 12) & 7),
+                cycle ? ((combine_mode_w1 >> 18) & 7) : ((combine_mode_w0 >> 9) & 7),
+                cycle ? (combine_mode_w1 & 7) : ((combine_mode_w1 >> 9) & 7)
+            };
+            const uint32_t texture_selector = cycle ? 1 : 2;
+            for (uint32_t operand = 0; operand < 4; ++operand) {
+                uses_second_texture |= color_selectors[operand] == texture_selector;
+                uses_second_texture |= operand == 2 && color_selectors[operand] == texture_selector + 7;
+                uses_second_texture |= alpha_selectors[operand] == texture_selector;
+            }
+        }
+    }
+    // With LOD enabled and no mip levels, both inputs read the base tile.
+    // Sampling the adjacent stale tile here corrupts single-texture HUD materials.
+    const uint8_t second_tile = (cur_tile + ((other_mode_h & (1u << 16)) ?
+        std::min<uint8_t>(texture_max_level, 1) : 1)) & 7;
+    uses_second_texture &= second_tile != cur_tile;
+    if (uses_second_texture) ++second_texture_triangles;
     Tile tile = tiles[cur_tile];
     int32_t tw = (tile.mask_s > 0) ? (1 << tile.mask_s) : ((int32_t)(tile.lrs - tile.uls) + 1);
     int32_t th = (tile.mask_t > 0) ? (1 << tile.mask_t) : ((int32_t)(tile.lrt - tile.ult) + 1);
@@ -337,16 +573,19 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     } else {
         untextured_triangles++;
     }
-    uint32_t stride = tile.line ? (tile.line * 8) : (uint32_t)(tw * 2);
-    if (tile.size == 1 && !tile.line) stride = tw;
-    if (tile.size == 0 && !tile.line) stride = (tw + 1) / 2;
-
-    int32_t mask_w = tile.mask_s ? (1 << tile.mask_s) : tw;
-    int32_t mask_h = tile.mask_t ? (1 << tile.mask_t) : th;
-
     float inv_w0 = 1.0f / (std::abs(v0.clip_w) > 0.0001f ? std::abs(v0.clip_w) : 1.0f);
     float inv_w1 = 1.0f / (std::abs(v1.clip_w) > 0.0001f ? std::abs(v1.clip_w) : 1.0f);
     float inv_w2 = 1.0f / (std::abs(v2.clip_w) > 0.0001f ? std::abs(v2.clip_w) : 1.0f);
+    // Derivatives of the perspective numerator/denominator in screen pixels.
+    const float dx[3] = {(v2.screen_y-v1.screen_y)*inv_w0,
+        (v0.screen_y-v2.screen_y)*inv_w1, (v1.screen_y-v0.screen_y)*inv_w2};
+    const float dy[3] = {(v1.screen_x-v2.screen_x)*inv_w0,
+        (v2.screen_x-v0.screen_x)*inv_w1, (v0.screen_x-v1.screen_x)*inv_w2};
+    const float wx = dx[0]+dx[1]+dx[2], wy = dy[0]+dy[1]+dy[2];
+    const float ux = dx[0]*v0.u+dx[1]*v1.u+dx[2]*v2.u;
+    const float uy = dy[0]*v0.u+dy[1]*v1.u+dy[2]*v2.u;
+    const float vx = dx[0]*v0.v+dx[1]*v1.v+dx[2]*v2.v;
+    const float vy = dy[0]*v0.v+dy[1]*v1.v+dy[2]*v2.v;
 
     bool has_depth = (geometry_mode & G_ZBUFFER) && depth_image_addr != 0 &&
         depth_image_addr + color_image_width * 240 * 2 <= 8 * 1024 * 1024;
@@ -389,8 +628,9 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                 bool texel_valid = false;
                 uint8_t tr = 255, tg = 255, tb = 255;
                 uint8_t ta = 255;
+                uint8_t second_texel[4] = {255, 255, 255, 255};
+                int32_t lod_fraction = 255;
                 float tu = 0.0f, tv = 0.0f;
-                int32_t iu = 0, iv = 0;
 
                 if (has_texture) {
                     // Perspective-correct texture coordinate interpolation
@@ -402,170 +642,23 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     tu = (w0_p * v0.u + w1_p * v1.u + w2_p * v2.u) * inv_sum;
                     tv = (w0_p * v0.v + w1_p * v1.v + w2_p * v2.v) * inv_sum;
 
-                    auto fetch_texel = [&](int32_t su, int32_t sv, uint8_t& out_r, uint8_t& out_g, uint8_t& out_b, uint8_t& out_a) -> bool {
-                        // TMEM is a circular 4 KiB address space; a tile access
-                        // crossing its end wraps instead of producing an invalid texel.
-                        auto read_tmem8 = [&](uint32_t address) -> uint8_t { return tmem[address & 0xFFF]; };
-                        if (tile.clamp_s) {
-                            su = std::clamp(su, 0, tw - 1);
-                        } else if (tile.mask_s > 0) {
-                            int32_t m = 1 << tile.mask_s;
-                            su = su % (m * 2);
-                            if (su < 0) su += m * 2;
-                            if (tile.mirror_s && su >= m) {
-                                su = (m * 2 - 1) - su;
-                            } else {
-                                su = su % m;
-                            }
-                            if (su >= tw) su = tw - 1;
-                        } else {
-                            su = su % tw;
-                            if (su < 0) su += tw;
-                        }
-
-                        if (tile.clamp_t) {
-                            sv = std::clamp(sv, 0, th - 1);
-                        } else if (tile.mask_t > 0) {
-                            int32_t m = 1 << tile.mask_t;
-                            sv = sv % (m * 2);
-                            if (sv < 0) sv += m * 2;
-                            if (tile.mirror_t && sv >= m) {
-                                sv = (m * 2 - 1) - sv;
-                            } else {
-                                sv = sv % m;
-                            }
-                            if (sv >= th) sv = th - 1;
-                        } else {
-                            sv = sv % th;
-                            if (sv < 0) sv += th;
-                        }
-
-                        if (tile.format == 0 && tile.size == 2) { // RGBA16
-                            uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su * 2) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint16_t c16 = ((uint16_t)read_tmem8(tmem_idx) << 8) | read_tmem8(tmem_idx + 1);
-                                out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
-                                out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
-                                out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
-                                out_a = (c16 & 1) ? 255 : 0;
-                                return true;
-                            }
-                        } else if (tile.format == 2 && tile.size == 1) { // CI8
-                            uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t idx = read_tmem8(tmem_idx);
-                                uint32_t pal_offset = tlut_tmem_addr + (idx * 2);
-                                {
-                                    uint16_t c16 = ((uint16_t)read_tmem8(pal_offset) << 8) | read_tmem8(pal_offset + 1);
-                                    out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
-                                    out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
-                                    out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
-                                    out_a = (c16 & 1) ? 255 : 0;
-                                    return true;
-                                }
-                            }
-                        } else if (tile.format == 2 && tile.size == 0) { // CI4
-                            uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t b = read_tmem8(byte_idx);
-                                uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
-                                uint32_t pal_offset = tlut_tmem_addr + ((tile.palette * 16 + nib) * 2);
-                                {
-                                    uint16_t c16 = ((uint16_t)read_tmem8(pal_offset) << 8) | read_tmem8(pal_offset + 1);
-                                    out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
-                                    out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
-                                    out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
-                                    out_a = (c16 & 1) ? 255 : 0;
-                                    return true;
-                                }
-                            }
-                        } else if (tile.format == 3 && tile.size == 1) { // IA8
-                            uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t byte = read_tmem8(tmem_idx);
-                                uint8_t alpha = byte & 0x0F;
-                                uint8_t intensity = (byte >> 4) & 0x0F;
-                                out_r = out_g = out_b = intensity * 255 / 15;
-                                out_a = alpha * 255 / 15;
-                                return true;
-                            }
-                        } else if (tile.format == 3 && tile.size == 0) { // IA4
-                            uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t b = read_tmem8(byte_idx);
-                                uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
-                                out_r = out_g = out_b = ((nib >> 1) & 0x07) * 255 / 7;
-                                out_a = (nib & 1) ? 255 : 0;
-                                return true;
-                            }
-                        } else if (tile.format == 4 && tile.size == 1) { // I8
-                            uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t intensity = read_tmem8(tmem_idx);
-                                out_r = out_g = out_b = intensity;
-                                out_a = 255;
-                                return true;
-                            }
-                        } else if (tile.format == 4 && tile.size == 0) { // I4
-                            uint32_t byte_idx = ((tile.tmem_addr + (sv * stride) + (su / 2)) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint8_t b = read_tmem8(byte_idx);
-                                uint8_t nib = (su & 1) ? (b & 0x0F) : ((b >> 4) & 0x0F);
-                                uint8_t intensity = nib * 255 / 15;
-                                out_r = out_g = out_b = intensity;
-                                out_a = 255;
-                                return true;
-                            }
-                        } else { // Generic 16-bit
-                            uint32_t tmem_idx = ((tile.tmem_addr + (sv * stride) + su * 2) ^ ((sv & 1) ? 4u : 0u)) & 0xFFF;
-                            {
-                                uint16_t c16 = ((uint16_t)read_tmem8(tmem_idx) << 8) | read_tmem8(tmem_idx + 1);
-                                out_r = ((c16 >> 11) & 0x1F) * 255 / 31;
-                                out_g = ((c16 >> 6) & 0x1F) * 255 / 31;
-                                out_b = ((c16 >> 1) & 0x1F) * 255 / 31;
-                                out_a = 255;
-                                return true;
-                            }
-                        }
-                        return false;
-                    };
-
-                    if (v0.is_screen_space) {
-                        // Screen-space HUD & glyphs: pixel-exact point sampling
-                        iu = (int32_t)std::floor(tu);
-                        iv = (int32_t)std::floor(tv);
-                        texel_valid = fetch_texel(iu, iv, tr, tg, tb, ta);
+                    uint8_t sampled[4]{};
+                    const bool linear = !v0.is_screen_space && ((other_mode_h >> 12) & 3) >= 2;
+                    TextureLOD lod;
+                    if (!v0.is_screen_space) {
+                        const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum),
+                            std::abs((uy-tu*wy)*inv_sum), std::abs((vx-tv*wx)*inv_sum),
+                            std::abs((vy-tv*wy)*inv_sum)});
+                        lod = select_texture_lod(footprint);
+                    }
+                    lod_fraction = int32_t(lod.fraction * 255.0f);
+                    const Tile& first = lod.first ? tiles[(cur_tile + lod.first) & 7] : tile;
+                    texel_valid = sample_tile(first, tu, tv, linear, sampled);
+                    tr = sampled[0]; tg = sampled[1]; tb = sampled[2]; ta = sampled[3];
+                    if (uses_second_texture) {
+                        sample_tile(tiles[(cur_tile + lod.second) & 7], tu, tv, linear, second_texel);
                     } else {
-                        // 3D Geometry: N64 RDP Bilinear Texture Filtering (BILERP)
-                        float u_center = tu - 0.5f;
-                        float v_center = tv - 0.5f;
-                        int32_t u0 = (int32_t)std::floor(u_center);
-                        int32_t v0_t = (int32_t)std::floor(v_center);
-                        float s_frac = u_center - (float)u0;
-                        float t_frac = v_center - (float)v0_t;
-
-                        uint8_t r00 = 0, g00 = 0, b00 = 0, a00 = 0;
-                        uint8_t r10 = 0, g10 = 0, b10 = 0, a10 = 0;
-                        uint8_t r01 = 0, g01 = 0, b01 = 0, a01 = 0;
-                        uint8_t r11 = 0, g11 = 0, b11 = 0, a11 = 0;
-
-                        bool ok00 = fetch_texel(u0, v0_t, r00, g00, b00, a00);
-                        bool ok10 = fetch_texel(u0 + 1, v0_t, r10, g10, b10, a10);
-                        bool ok01 = fetch_texel(u0, v0_t + 1, r01, g01, b01, a01);
-                        bool ok11 = fetch_texel(u0 + 1, v0_t + 1, r11, g11, b11, a11);
-
-                        if (ok00 || ok10 || ok01 || ok11) {
-                            texel_valid = true;
-                            float w00 = (1.0f - s_frac) * (1.0f - t_frac);
-                            float w10 = s_frac * (1.0f - t_frac);
-                            float w01 = (1.0f - s_frac) * t_frac;
-                            float w11 = s_frac * t_frac;
-
-                            tr = (uint8_t)(r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11);
-                            tg = (uint8_t)(g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11);
-                            tb = (uint8_t)(b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11);
-                            ta = (uint8_t)(a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11);
-                        }
+                        std::copy(sampled, sampled + 4, second_texel);
                     }
                 }
 
@@ -586,11 +679,13 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                 if (combine_mode_set && !v0.is_screen_space) {
                     // Evaluate the common N64 color-combiner equation:
                     // (A - B) * C + D. Selector decoding follows RT64's
-                    // ColorCombiner mux layout; unsupported key/LOD/noise
+                    // ColorCombiner mux layout; unsupported key/noise
                     // sources resolve to zero until separately implemented.
                     uint8_t combined[4] = {0, 0, 0, 0};
                     const uint8_t texel0[4] = {tr, tg, tb, ta};
-                    const uint8_t texel1[4] = {tr, tg, tb, ta};
+                    const uint8_t* texel1 = second_texel;
+                    const uint8_t* mux_texel0 = texel0;
+                    const uint8_t* mux_texel1 = texel1;
                     const uint8_t shade[4] = {vr, vg, vb, va};
                     const uint8_t primitive[4] = {
                         (uint8_t)(prim_color >> 24), (uint8_t)(prim_color >> 16),
@@ -605,8 +700,8 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                         if (channel == 3) {
                             switch (mux) {
                             case 0: return combined[3];
-                            case 1: return texel0[3];
-                            case 2: return texel1[3];
+                            case 1: return mux_texel0[3];
+                            case 2: return mux_texel1[3];
                             case 3: return primitive[3];
                             case 4: return shade[3];
                             case 5: return environment[3];
@@ -616,30 +711,32 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                         }
                         switch (mux) {
                         case 0: return combined[channel];
-                        case 1: return texel0[channel];
-                        case 2: return texel1[channel];
+                        case 1: return mux_texel0[channel];
+                        case 2: return mux_texel1[channel];
                         case 3: return primitive[channel];
                         case 4: return shade[channel];
                         case 5: return environment[channel];
                         case 6: return (operand == 0 || operand == 3) ? 255 : 0; // ONE for A/D; key inputs unsupported
                         case 7: return operand == 2 ? combined[3] : 0;
-                        case 8: return operand == 2 ? texel0[3] : 0;
-                        case 9: return operand == 2 ? texel1[3] : 0;
+                        case 8: return operand == 2 ? mux_texel0[3] : 0;
+                        case 9: return operand == 2 ? mux_texel1[3] : 0;
                         case 10: return operand == 2 ? primitive[3] : 0;
                         case 11: return operand == 2 ? shade[3] : 0;
                         case 12: return operand == 2 ? environment[3] : 0;
+                        case 13: return operand == 2 ? lod_fraction : 0;
+                        case 14: return operand == 2 ? primitive_lod_fraction : 0;
                         default: return 0;
                         }
                     };
                     auto channel_from_alpha_mux = [&](uint32_t mux, uint32_t operand) -> int32_t {
                         switch (mux) {
-                        case 0: return operand == 2 ? 0 : combined[3]; // LOD fraction for C
-                        case 1: return texel0[3];
-                        case 2: return texel1[3];
+                        case 0: return operand == 2 ? lod_fraction : combined[3];
+                        case 1: return mux_texel0[3];
+                        case 2: return mux_texel1[3];
                         case 3: return primitive[3];
                         case 4: return shade[3];
                         case 5: return environment[3];
-                        case 6: return operand == 2 ? 0 : 255; // primitive LOD fraction for C
+                        case 6: return operand == 2 ? primitive_lod_fraction : 255;
                         default: return 0;
                         }
                     };
@@ -647,6 +744,9 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     const uint32_t cycle_count = cycle_type == 1 ? 2 : 1;
                     for (uint32_t cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset) {
                         const uint32_t cycle = first_cycle + cycle_offset;
+                        const bool swap_textures = cycle_type == 1 && cycle == 1;
+                        mux_texel0 = swap_textures ? texel1 : texel0;
+                        mux_texel1 = swap_textures ? texel0 : texel1;
                         const uint32_t mux_a = cycle ? ((combine_mode_w0 >> 5) & 0xF) : ((combine_mode_w0 >> 20) & 0xF);
                         const uint32_t mux_b = cycle ? ((combine_mode_w1 >> 24) & 0xF) : ((combine_mode_w1 >> 28) & 0xF);
                         const uint32_t mux_c = cycle ? (combine_mode_w0 & 0x1F) : ((combine_mode_w0 >> 15) & 0x1F);
@@ -949,7 +1049,8 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
             }
             case 0xD7: { // G_TEXTURE
                 texture_tile = (w0 >> 8) & 0x7;
-                texture_enabled = ((w0 & 0xFF) != 0);
+                texture_max_level = (w0 >> 11) & 0x7;
+                texture_enabled = ((w0 >> 1) & 0x7F) != 0;
                 texture_scale_s = (w1 >> 16) & 0xFFFF;
                 texture_scale_t = w1 & 0xFFFF;
                 break;
@@ -1032,6 +1133,8 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
             }
             case 0xFA: { // G_SETPRIMCOLOR
                 prim_color = w1;
+                primitive_lod_fraction = uint8_t(w0);
+                primitive_min_lod = uint8_t((w0 >> 8) & 31);
                 break;
             }
             case 0xF6: { // G_FILLRECT
@@ -1184,203 +1287,38 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 if (xl > xh) std::swap(xl, xh);
                 if (yl > yh) std::swap(yl, yh);
 
-                Tile& tile = tiles[tile_idx];
-                uint32_t tmem_base = tile.tmem_addr;
-                uint32_t line_stride = (tile.line > 0) ? (tile.line * 8) : 640;
-                uint32_t t_width = (tile.lrs > tile.uls) ? (tile.lrs - tile.uls + 1) : 32;
-
-                int32_t clip_xl = std::max(xl, scissor_xh);
-                int32_t clip_yl = std::max(yl, scissor_yh);
-                int32_t clip_xh = std::min(xh, scissor_xl - 1);
-                int32_t clip_yh = std::min(yh, scissor_yl - 1);
-
-                int32_t s_fixed = (s0 << 5);
-                int32_t t_fixed = (t0 << 5);
-                int32_t dsdx_step = (dsdx >= 2048) ? (dsdx / 4) : dsdx;
-
-                if (clip_xl <= clip_xh && clip_yl <= clip_yh && color_image_size == 2 &&
-                    color_image_addr + color_image_width * 240 * 2 <= 8 * 1024 * 1024) {
-
-                    uint32_t fmt_size = (tile.format << 4) | (tile.size & 0x0F);
-                    switch (fmt_size) {
-                        case 0x02: { // RGBA16 (format 0, size 2)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + cur_s * 2;
-                                    if (tex_offset + 1 < sizeof(tmem)) {
-                                        uint16_t texel = ((uint16_t)tmem[tex_offset] << 8) | tmem[tex_offset + 1];
-                                        if (texel & 1) fb_row[x] = texel;
-                                    }
-                                }
+                const Tile& tile = tiles[tile_idx];
+                const bool copy_cycle = ((other_mode_h >> 20) & 3) == 2;
+                // Copy rectangles include the last pixel; one/two-cycle bounds
+                // are exclusive. COPY alone divides the S derivative by four.
+                const int32_t right = xh + (copy_cycle ? 1 : 0);
+                const int32_t bottom = yh + (copy_cycle ? 1 : 0);
+                const int32_t left = std::max(xl, scissor_xh);
+                const int32_t top = std::max(yl, scissor_yh);
+                const int32_t end_x = std::min(right, scissor_xl);
+                const int32_t end_y = std::min(bottom, scissor_yl);
+                const float step_s = dsdx / (copy_cycle ? 4096.0f : 1024.0f);
+                const float step_t = dtdy / 1024.0f;
+                if (color_image_size == 2 && color_image_addr + uint64_t(color_image_width)*240*2 <= 8*1024*1024) {
+                    for (int32_t y = top; y < end_y; ++y) {
+                        auto* row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + y*color_image_width*2);
+                        for (int32_t x = left; x < end_x; ++x) {
+                            const float u = s0 / 32.0f + (op == 0xE5 ? y-yl : x-xl)*step_s;
+                            const float v = t0 / 32.0f + (op == 0xE5 ? x-xl : y-yl)*step_t;
+                            uint8_t color[4]{};
+                            if (!sample_tile(tile, u, v, false, color) || color[3] == 0) continue;
+                            if (color[3] != 255) {
+                                const uint16_t dst = row[x];
+                                const uint8_t background[3] = {uint8_t(((dst>>11)&31)*255/31),
+                                    uint8_t(((dst>>6)&31)*255/31), uint8_t(((dst>>1)&31)*255/31)};
+                                for (int channel=0; channel<3; ++channel)
+                                    color[channel] = uint8_t((color[channel]*color[3] + background[channel]*(255-color[3]))/255);
                             }
-                            break;
+                            row[x] = uint16_t(((color[0]>>3)<<11) | ((color[1]>>3)<<6) | ((color[2]>>3)<<1) | 1);
                         }
-                        case 0x21: { // CI8 (format 2, size 1)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + cur_s;
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t index = tmem[tex_offset];
-                                        uint32_t pal_offset = tlut_tmem_addr + (index * 2);
-                                        if (pal_offset + 1 < sizeof(tmem)) {
-                                            uint16_t texel = ((uint16_t)tmem[pal_offset] << 8) | tmem[pal_offset + 1];
-                                            if (texel & 1) fb_row[x] = texel;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x20: { // CI4 (format 2, size 0)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + (cur_s / 2);
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t byte = tmem[tex_offset];
-                                        uint8_t index = (cur_s & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-                                        uint32_t pal_offset = tlut_tmem_addr + ((tile.palette * 16 + index) * 2);
-                                        if (pal_offset + 1 < sizeof(tmem)) {
-                                            uint16_t texel = ((uint16_t)tmem[pal_offset] << 8) | tmem[pal_offset + 1];
-                                            if (texel & 1) fb_row[x] = texel;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x31: { // IA8 (format 3, size 1)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + cur_s;
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t byte = tmem[tex_offset];
-                                        uint8_t intensity = (byte >> 4) & 0x0F;
-                                        uint8_t alpha = byte & 0x0F;
-                                        if (alpha > 0) {
-                                            uint8_t a = alpha * 255 / 15;
-                                            uint8_t src_val = intensity * 255 / 15;
-                                            if (a == 255) {
-                                                uint16_t c5 = src_val >> 3;
-                                                fb_row[x] = (c5 << 11) | (c5 << 6) | (c5 << 1) | 1;
-                                            } else {
-                                                uint16_t dst = fb_row[x];
-                                                uint8_t dr = ((dst >> 11) & 0x1F) * 255 / 31;
-                                                uint8_t dg = ((dst >> 6) & 0x1F) * 255 / 31;
-                                                uint8_t db = ((dst >> 1) & 0x1F) * 255 / 31;
-                                                uint8_t fr = (src_val * a + dr * (255 - a)) / 255;
-                                                uint8_t fg = (src_val * a + dg * (255 - a)) / 255;
-                                                uint8_t fb = (src_val * a + db * (255 - a)) / 255;
-                                                fb_row[x] = ((fr >> 3) << 11) | ((fg >> 3) << 6) | ((fb >> 3) << 1) | 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x30: { // IA4 (format 3, size 0)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + (cur_s / 2);
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t byte = tmem[tex_offset];
-                                        uint8_t nib = (cur_s & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-                                        if (nib & 1) {
-                                            uint8_t intensity = ((nib >> 1) & 0x07) * 255 / 7;
-                                            uint16_t c5 = intensity >> 3;
-                                            fb_row[x] = (c5 << 11) | (c5 << 6) | (c5 << 1) | 1;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x41: { // I8 (format 4, size 1)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + cur_s;
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t intensity = tmem[tex_offset];
-                                        if (intensity > 16) {
-                                            uint16_t c5 = intensity >> 3;
-                                            fb_row[x] = (c5 << 11) | (c5 << 6) | (c5 << 1) | 1;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x40: { // I4 (format 4, size 0)
-                            for (int32_t y = clip_yl; y <= clip_yh; ++y) {
-                                int32_t cur_t = (t_fixed + (y - yl) * dtdy) >> 10;
-                                if (cur_t < 0) cur_t = 0;
-                                uint32_t t_off = tmem_base + cur_t * line_stride;
-                                uint16_t* fb_row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + (y * color_image_width) * 2);
-
-                                for (int32_t x = clip_xl; x <= clip_xh; ++x) {
-                                    int32_t cur_s = (s_fixed + (x - xl) * dsdx_step) >> 10;
-                                    if (cur_s < 0) cur_s = 0;
-                                    uint32_t tex_offset = t_off + (cur_s / 2);
-                                    if (tex_offset < sizeof(tmem)) {
-                                        uint8_t byte = tmem[tex_offset];
-                                        uint8_t nib = (cur_s & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-                                        if (nib > 1) {
-                                            uint8_t intensity = nib * 255 / 15;
-                                            uint16_t c5 = intensity >> 3;
-                                            fb_row[x] = (c5 << 11) | (c5 << 6) | (c5 << 1) | 1;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        default:
-                            break;
                     }
-                    rects_drawn++;
                 }
+                rects_drawn++;
                 break;
             }
             default: {

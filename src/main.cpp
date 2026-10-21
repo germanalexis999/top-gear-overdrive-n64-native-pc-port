@@ -27,6 +27,7 @@
 #include "ultramodern/input.hpp"
 #include "f3dex2.hpp"
 #include "rom_loader.hpp"
+#include "vi_scanout.hpp"
 
 // Recompiled function headers and overlay definitions
 #include "funcs.h"
@@ -45,6 +46,7 @@ static std::atomic<float> g_stick_y{0.0f};
 static std::atomic<bool> g_running{true};
 static bool g_is_headless = false;
 static HWND g_hwnd = nullptr;
+static std::atomic<uint64_t> g_rsp_task_types[5]{}; // 0..3 plus unclassified.
 
 // Dynamic XInput gamepad definitions (zero extra DLL link dependencies)
 typedef struct {
@@ -250,26 +252,6 @@ public:
             if (samples[s] != 0) { has_nonzero = true; break; }
         }
 
-        if (g_is_headless) {
-            static FILE* f_dump = nullptr;
-            static int dumped_non_zero = 0;
-            static int total_buffers_seen = 0;
-            total_buffers_seen++;
-            if (has_nonzero && dumped_non_zero == 0) {
-                std::cout << "[Audio Forensics] First NON-ZERO audio buffer found at buffer #" << total_buffers_seen << "!\n";
-                f_dump = fopen("raw_audio_test.raw", "wb");
-            }
-            if (f_dump && dumped_non_zero < 60) {
-                fwrite(samples, sizeof(int16_t), sample_count, f_dump);
-                dumped_non_zero++;
-                if (dumped_non_zero == 60) {
-                    fclose(f_dump);
-                    f_dump = nullptr;
-                    std::cout << "[Audio Forensics] Successfully saved 60 non-zero audio buffers to raw_audio_test.raw\n";
-                }
-            }
-        }
-
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             // Match the non-blocking audio queues used by the reference ports.
@@ -339,6 +321,50 @@ public:
         uint32_t active_freq = 0;
         Block blocks[NUM_BUFFERS]{};
         size_t block_idx = 0;
+
+        // Headless diagnostics capture the exact host-channel PCM submitted to
+        // WaveOut, including silence. Bound disk use to 60 seconds; this records
+        // content and ordering, not gaps at the physical playback device.
+        std::ofstream capture;
+        uint32_t capture_rate = 0, capture_bytes = 0;
+        bool capture_finished = false;
+        uint32_t capture_segment = 0;
+        double captured_seconds = 0;
+        std::string capture_path;
+        auto finish_capture = [&]() {
+            if (!capture.is_open()) return;
+            capture.seekp(0);
+            auto u16 = [&](uint16_t v) { const char b[] = {char(v), char(v >> 8)}; capture.write(b, 2); };
+            auto u32 = [&](uint32_t v) { const char b[] = {char(v), char(v >> 8), char(v >> 16), char(v >> 24)}; capture.write(b, 4); };
+            capture.write("RIFF", 4); u32(36 + capture_bytes); capture.write("WAVEfmt ", 8);
+            u32(16); u16(1); u16(2); u32(capture_rate); u32(capture_rate * 4);
+            u16(4); u16(16); capture.write("data", 4); u32(capture_bytes);
+            capture.close();
+            std::cout << "[Audio Forensics] Device PCM capture: " << capture_path << " ("
+                << capture_bytes / 4 << " stereo frames at " << capture_rate << " Hz)\n";
+        };
+        auto capture_block = [&](const int16_t* pcm, size_t sample_count) {
+            if (!g_is_headless || capture_finished) return;
+            if (capture_rate != active_freq && capture.is_open()) finish_capture();
+            if (!capture.is_open()) {
+                if (capture_segment == 8) { capture_finished = true; return; }
+                capture_rate = active_freq;
+                capture_bytes = 0;
+                capture_path = "audio_device_capture_" + std::to_string(capture_segment++) + "_" +
+                    std::to_string(capture_rate) + "Hz.wav";
+                capture.open(capture_path, std::ios::binary | std::ios::trunc);
+                char header[44]{};
+                capture.write(header, sizeof(header));
+                if (!capture) { capture_finished = true; return; }
+            }
+            const size_t remaining_frames = size_t(std::max(0.0, 60.0 - captured_seconds) * capture_rate);
+            const uint32_t bytes = uint32_t(std::min(sample_count / 2, remaining_frames) * 4);
+            capture.write(reinterpret_cast<const char*>(pcm), bytes);
+            if (!capture) { capture_finished = true; return; }
+            capture_bytes += bytes;
+            captured_seconds += double(bytes / 4) / capture_rate;
+            if (bytes < sample_count * sizeof(int16_t)) capture_finished = true;
+        };
 
         auto close_device = [&]() {
             if (hwo) {
@@ -452,6 +478,7 @@ public:
                         in_flight_blocks.fetch_add(1, std::memory_order_relaxed);
                         device_blocks_submitted.fetch_add(1, std::memory_order_relaxed);
                         if (b.non_silent) non_silent_device_blocks_submitted.fetch_add(1, std::memory_order_relaxed);
+                        capture_block(b.pcm, BUFFER_CHUNK_SAMPLES);
                         submitted = true;
                     } else {
                         waveOutUnprepareHeader(hwo, &b.hdr, sizeof(WAVEHDR));
@@ -474,6 +501,7 @@ public:
         }
 
         close_device();
+        finish_capture();
     }
 };
 
@@ -484,6 +512,72 @@ static Win32AudioBackend g_audio_backend;
 extern "C" void func_8004A580(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
+
+static void save_fb_to_bmp(const char* filename, const uint8_t* rdram_ptr, uint32_t fb_origin, uint32_t w, uint32_t h) {
+    if (fb_origin + w * h * 2 > 8 * 1024 * 1024) return;
+    std::ofstream f(filename, std::ios::binary);
+    if (!f.is_open()) return;
+
+    uint32_t row_size = ((w * 3 + 3) / 4) * 4;
+    uint32_t image_size = row_size * h;
+    uint32_t file_size = 54 + image_size;
+    uint8_t hdr[54] = {
+        'B', 'M',
+        (uint8_t)(file_size), (uint8_t)(file_size >> 8), (uint8_t)(file_size >> 16), (uint8_t)(file_size >> 24),
+        0, 0, 0, 0,
+        54, 0, 0, 0,
+        40, 0, 0, 0,
+        (uint8_t)(w), (uint8_t)(w >> 8), (uint8_t)(w >> 16), (uint8_t)(w >> 24),
+        (uint8_t)(h), (uint8_t)(h >> 8), (uint8_t)(h >> 16), (uint8_t)(h >> 24),
+        1, 0, 24, 0,
+        0, 0, 0, 0,
+        (uint8_t)(image_size), (uint8_t)(image_size >> 8), (uint8_t)(image_size >> 16), (uint8_t)(image_size >> 24),
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    f.write(reinterpret_cast<const char*>(hdr), 54);
+    std::vector<uint8_t> row_buf(row_size, 0);
+
+    const uint16_t* fb = reinterpret_cast<const uint16_t*>(rdram_ptr + fb_origin);
+    for (int y = (int)h - 1; y >= 0; y--) {
+        int src_y = (y >= (int)h - 1) ? ((int)h - 2) : y;
+        for (uint32_t x = 0; x < w; x++) {
+            uint16_t px = fb[src_y * w + x];
+            uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
+            uint8_t g = ((px >> 6) & 0x1F) * 255 / 31;
+            uint8_t b = ((px >> 1) & 0x1F) * 255 / 31;
+            row_buf[x * 3 + 0] = b;
+            row_buf[x * 3 + 1] = g;
+            row_buf[x * 3 + 2] = r;
+        }
+        f.write(reinterpret_cast<const char*>(row_buf.data()), row_size);
+    }
+    std::cout << "  [Screenshot] Saved " << filename << " from origin=0x" << std::hex << fb_origin
+              << std::dec << " (" << w << "x" << h << ")\n";
+}
+
+// Snapshots are copied on the renderer thread after presentation, rather than
+// reading a live target from the main thread while a display list clears it.
+class PresentedFrame {
+    std::mutex mutex;
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0;
+public:
+    void update(const uint8_t* ram, uint32_t origin, uint32_t w, uint32_t h) {
+        if (!origin || origin + uint64_t(w)*h*2 > 8*1024*1024) return;
+        std::lock_guard lock(mutex);
+        width = w; height = h;
+        pixels.assign(ram + origin, ram + origin + size_t(w)*h*2);
+    }
+    void save(const char* path) {
+        std::lock_guard lock(mutex);
+        if (!pixels.empty()) save_fb_to_bmp(path, pixels.data(), 0, width, height);
+    }
+    void blank() {
+        std::lock_guard lock(mutex);
+        std::fill(pixels.begin(), pixels.end(), 0);
+    }
+};
+static PresentedFrame g_presented_frame;
 
 // Minimal Null Renderer Context for headless execution & verification
 class NullRendererContext : public ultramodern::renderer::RendererContext {
@@ -517,8 +611,13 @@ public:
     void send_dummy_workload(uint32_t) override {}
     void update_screen() override {
         uint32_t count = screen_update_count++;
+        auto vi = ultramodern::renderer::get_vi_regs();
+        if (vi) {
+            const auto frame = tgod::vi_frame_layout(*vi);
+            if (frame.visible) g_presented_frame.update(rdram, frame.origin, frame.width, frame.height);
+            else g_presented_frame.blank();
+        }
         if (count < 3) {
-            auto vi = ultramodern::renderer::get_vi_regs();
             if (vi) {
                 std::cout << "[Screen Update #" << count << "] FB Origin: 0x" << std::hex << vi->VI_ORIGIN_REG
                           << ", Width: " << std::dec << vi->VI_WIDTH_REG
@@ -628,6 +727,7 @@ public:
     std::atomic<uint32_t> dl_count{0};
     std::atomic<uint32_t> screen_update_count{0};
     std::vector<uint32_t> rgba_pixels;
+    std::mutex presentation_mutex;
     BITMAPINFO bmi{};
     F3DEX2Interpreter interpreter;
 
@@ -676,10 +776,27 @@ public:
                       << " width=" << std::dec << (vi ? vi->VI_WIDTH_REG : 0) << "\n";
         }
         if (origin == 0) return;
-        uint32_t width = (vi->VI_WIDTH_REG != 0 && vi->VI_WIDTH_REG <= 640) ? vi->VI_WIDTH_REG : 320;
-        uint32_t height = 240;
+        const auto frame = tgod::vi_frame_layout(*vi);
+        if (!frame.visible) {
+            std::lock_guard lock(presentation_mutex);
+            g_presented_frame.blank();
+            std::fill(rgba_pixels.begin(), rgba_pixels.end(), 0);
+            HDC hdc = GetDC(hwnd);
+            if (hdc) {
+                render_frame_to_dc(hdc, hwnd, rgba_pixels.data(), &bmi,
+                    bmi.bmiHeader.biWidth, -bmi.bmiHeader.biHeight);
+                ReleaseDC(hwnd, hdc);
+            }
+            return;
+        }
+        const uint32_t width = frame.width, height = frame.height;
 
         if (origin + width * height * 2 <= 8 * 1024 * 1024) {
+            std::lock_guard lock(presentation_mutex);
+            g_presented_frame.update(rdram, origin, width, height);
+            rgba_pixels.resize(size_t(width) * height);
+            bmi.bmiHeader.biWidth = width;
+            bmi.bmiHeader.biHeight = -int32_t(height);
             const uint16_t* src = reinterpret_cast<const uint16_t*>(rdram + origin);
             for (size_t y = 0; y < height; y++) {
                 size_t src_y = (y >= height - 1) ? (height - 2) : y;
@@ -823,8 +940,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            if (g_renderer_win32 && !g_renderer_win32->rgba_pixels.empty()) {
-                render_frame_to_dc(hdc, hwnd, g_renderer_win32->rgba_pixels.data(), &g_renderer_win32->bmi, 320, 240);
+            if (g_renderer_win32) {
+                std::lock_guard lock(g_renderer_win32->presentation_mutex);
+                render_frame_to_dc(hdc, hwnd, g_renderer_win32->rgba_pixels.data(), &g_renderer_win32->bmi,
+                    g_renderer_win32->bmi.bmiHeader.biWidth, -g_renderer_win32->bmi.bmiHeader.biHeight);
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -981,7 +1100,11 @@ int main(int argc, char** argv) {
 
     ultramodern::rsp::callbacks_t rsp_cbs{};
     rsp_cbs.init = []() {};
-    rsp_cbs.run_task = [](uint8_t*, const OSTask*) -> bool { return true; };
+    rsp_cbs.run_task = [](uint8_t*, const OSTask* task) -> bool {
+        const uint32_t type = task ? task->t.type : 4;
+        g_rsp_task_types[std::min(type, 4u)].fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
     ultramodern::rsp::set_callbacks(rsp_cbs);
 
     // 5. Register audio callbacks
@@ -1078,67 +1201,7 @@ int main(int argc, char** argv) {
     ).count();
     std::cout << "[Host] Entrypoint execution time: " << elapsed << " ms\n";
 
-    static auto save_fb_to_bmp = [](const char* filename, const uint8_t* rdram_ptr, uint32_t fb_origin, uint32_t w, uint32_t h) {
-        if (fb_origin + w * h * 2 > 8 * 1024 * 1024) return;
-        std::ofstream f(filename, std::ios::binary);
-        if (!f.is_open()) return;
 
-        uint32_t row_size = ((w * 3 + 3) / 4) * 4;
-        uint32_t image_size = row_size * h;
-        uint32_t file_size = 54 + image_size;
-        uint8_t hdr[54] = {
-            'B', 'M',
-            (uint8_t)(file_size), (uint8_t)(file_size >> 8), (uint8_t)(file_size >> 16), (uint8_t)(file_size >> 24),
-            0, 0, 0, 0,
-            54, 0, 0, 0,
-            40, 0, 0, 0,
-            (uint8_t)(w), (uint8_t)(w >> 8), (uint8_t)(w >> 16), (uint8_t)(w >> 24),
-            (uint8_t)(h), (uint8_t)(h >> 8), (uint8_t)(h >> 16), (uint8_t)(h >> 24),
-            1, 0, 24, 0,
-            0, 0, 0, 0,
-            (uint8_t)(image_size), (uint8_t)(image_size >> 8), (uint8_t)(image_size >> 16), (uint8_t)(image_size >> 24),
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-        };
-        f.write(reinterpret_cast<const char*>(hdr), 54);
-        std::vector<uint8_t> row_buf(row_size, 0);
-
-        // Check if fb_origin has content; if empty, test standard double-buffer addresses
-        uint32_t chosen_origin = fb_origin;
-        auto count_nonzero = [&](uint32_t org) -> size_t {
-            if (org + w * h * 2 > 8 * 1024 * 1024) return 0;
-            const uint16_t* ptr = reinterpret_cast<const uint16_t*>(rdram_ptr + org);
-            size_t c = 0;
-            for (size_t i = 0; i < w * h; i++) if (ptr[i] != 0) c++;
-            return c;
-        };
-
-        size_t nz = count_nonzero(chosen_origin);
-        if (nz == 0) {
-            size_t nz_a = count_nonzero(0x1d6380);
-            size_t nz_b = count_nonzero(0x1fbb80);
-            if (nz_a > 0 || nz_b > 0) {
-                chosen_origin = (nz_a >= nz_b) ? 0x1d6380 : 0x1fbb80;
-                nz = std::max(nz_a, nz_b);
-            }
-        }
-
-        const uint16_t* fb = reinterpret_cast<const uint16_t*>(rdram_ptr + chosen_origin);
-        for (int y = (int)h - 1; y >= 0; y--) {
-            int src_y = (y >= (int)h - 1) ? ((int)h - 2) : y;
-            for (uint32_t x = 0; x < w; x++) {
-                uint16_t px = fb[src_y * w + x];
-                uint8_t r = ((px >> 11) & 0x1F) * 255 / 31;
-                uint8_t g = ((px >> 6) & 0x1F) * 255 / 31;
-                uint8_t b = ((px >> 1) & 0x1F) * 255 / 31;
-                row_buf[x * 3 + 0] = b;
-                row_buf[x * 3 + 1] = g;
-                row_buf[x * 3 + 2] = r;
-            }
-            f.write(reinterpret_cast<const char*>(row_buf.data()), row_size);
-        }
-        std::cout << "  [Screenshot] Saved " << filename << " from origin=0x" << std::hex << chosen_origin
-                  << std::dec << " (" << nz << " / " << (w * h) << " non-zero pixels)\n";
-    };
 
     if (!headless && g_hwnd) {
         std::cout << "\n====================================================\n";
@@ -1235,7 +1298,7 @@ int main(int argc, char** argv) {
                 uint32_t origin = cur_vi ? (cur_vi->VI_ORIGIN_REG & 0x1FFFFFFF) : 0;
 
                 if (race_ticks == 10 && origin != 0) {
-                    save_fb_to_bmp("framebuffer_race_start.bmp", rdram, origin, 320, 240);
+                    g_presented_frame.save("framebuffer_race_start.bmp");
                     const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
                     save_fb_to_bmp("framebuffer_rdp_target.bmp", rdram, interp.color_image_addr, 320, 240);
                     std::cout << "[Framebuffer Pair] VI origin=0x" << std::hex << origin
@@ -1249,7 +1312,7 @@ int main(int argc, char** argv) {
                 g_buttons.store(0x8000); // Accelerate
 
                 if (race_ticks == 55 && origin != 0) {
-                    save_fb_to_bmp("framebuffer_race_stable.bmp", rdram, origin, 320, 240);
+                    g_presented_frame.save("framebuffer_race_stable.bmp");
                 }
             } else if (cur_mode == 1 && sub == 8) {
                 // In Car Showroom (sub == 8): let mosaic transition complete and 3D car turntable render!
@@ -1259,7 +1322,7 @@ int main(int argc, char** argv) {
                 uint32_t origin = cur_vi ? (cur_vi->VI_ORIGIN_REG & 0x1FFFFFFF) : 0;
 
                 if (showroom_ticks == 15 && origin != 0) {
-                    save_fb_to_bmp("framebuffer_car_showroom.bmp", rdram, origin, 320, 240);
+                    g_presented_frame.save("framebuffer_car_showroom.bmp");
                     const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
                     save_fb_to_bmp("framebuffer_rdp_target.bmp", rdram, interp.color_image_addr, 320, 240);
                 }
@@ -1367,6 +1430,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "[Host] 3D Triangles - Untextured: " << interp.untextured_triangles << "\n";
     std::cout << "[Host] Lighting diagnostics - vertices/light commands/texgen: " << interp.lit_vertices << "/" << interp.light_commands << "/" << interp.texgen_vertices << "\n";
+    std::cout << "[Host] Triangles using independent second texture: " << interp.second_texture_triangles << "\n";
     std::cout << "[Host] Raster diagnostics - culled triangles: " << interp.triangles_culled
               << ", depth-rejected pixels: " << interp.pixels_depth_rejected
               << ", invalid-texel pixels: " << interp.pixels_texel_invalid
@@ -1403,6 +1467,9 @@ int main(int argc, char** argv) {
               << g_audio_backend.non_silent_device_blocks_submitted.load() << "\n";
     std::cout << "[Host] Audio current frequency: " << g_audio_backend.current_freq.load() << " Hz\n";
     std::cout << "[Host] Audio device empty transitions: " << g_audio_backend.device_starvation_transitions.load() << "\n";
+    std::cout << "[Host] Unimplemented RSP callbacks by task type (0/GFX/AUDIO/3/other): ";
+    for (int i = 0; i < 5; ++i) std::cout << (i ? "/" : "") << g_rsp_task_types[i].load();
+    std::cout << "\n";
 
     // Engine & Thread Diagnostics
     uint32_t val_8006ac24 = read_rdram_u32(rdram, 0x8006AC24);
@@ -1461,11 +1528,11 @@ int main(int argc, char** argv) {
     auto vi = ultramodern::renderer::get_vi_regs();
     if (vi && vi->VI_ORIGIN_REG != 0) {
         uint32_t origin = vi->VI_ORIGIN_REG & 0x1FFFFFFF;
-        uint32_t width = (vi->VI_WIDTH_REG != 0 && vi->VI_WIDTH_REG <= 640) ? vi->VI_WIDTH_REG : 320;
-        uint32_t height = 240;
+        const auto frame = tgod::vi_frame_layout(*vi);
+        uint32_t width = frame.width, height = frame.height;
         std::cout << "\n[Active Framebuffer at RDRAM 0x" << std::hex << origin << " (" << std::dec << width << "x" << height << ")]:\n";
         size_t non_zero = 0;
-        if (origin + width * height * 2 <= 8 * 1024 * 1024) {
+        if (frame.visible) {
             const uint16_t* fb = reinterpret_cast<const uint16_t*>(rdram + origin);
             for (size_t i = 0; i < width * height; i++) {
                 if (fb[i] != 0) non_zero++;
@@ -1481,6 +1548,7 @@ int main(int argc, char** argv) {
     std::cout << "\n[Host] Top Gear Overdrive runner completed.\n";
 
     ultramodern::quit();
+    g_audio_backend.shutdown();
     ultramodern::join_saving_thread();
     if (std::filesystem::exists("saves/tgod_usa.bin")) {
         std::cout << "  [Save Status] NVRAM EEPROM save verified at saves/tgod_usa.bin ("

@@ -38,6 +38,7 @@ public:
     uint32_t fill_color = 0;
     uint32_t env_color = 0xFFFFFFFF;
     uint32_t prim_color = 0xFFFFFFFF;
+    uint8_t primitive_lod_fraction = 0, primitive_min_lod = 0;
     uint32_t blend_color = 0;
     uint32_t fog_color = 0;
     uint32_t combine_mode_w0 = 0;
@@ -53,6 +54,7 @@ public:
     uint32_t texture_size = 2;
     uint32_t texture_width = 0;
     uint8_t texture_tile = 0;
+    uint8_t texture_max_level = 0;
     bool texture_enabled = true;
     uint32_t texture_scale_s = 0x10000;
     uint32_t texture_scale_t = 0x10000;
@@ -94,6 +96,7 @@ public:
     uint64_t lit_vertices = 0;
     uint64_t light_commands = 0;
     uint64_t texgen_vertices = 0;
+    uint64_t second_texture_triangles = 0;
     struct DirectionalLight {
         uint8_t color[3]{};
         float direction[3]{};
@@ -123,6 +126,11 @@ public:
     void update_mvp();
     void transform_vertex(Vertex3D& v);
     void light_and_texgen_vertex(Vertex3D& v, int8_t nx, int8_t ny, int8_t nz);
+    bool fetch_tile_texel(const Tile& tile, int32_t s, int32_t t,
+        uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) const;
+    bool sample_tile(const Tile& tile, float s, float t, bool linear, uint8_t (&color)[4]) const;
+    struct TextureLOD { uint8_t first = 0, second = 1; float fraction = 1; };
+    TextureLOD select_texture_lod(float footprint) const;
     void rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
     void rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
 
