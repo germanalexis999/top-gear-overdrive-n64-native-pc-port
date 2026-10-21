@@ -13,6 +13,9 @@ compilar. El paquete contiene el EXE, sus DLL y licencias; la ROM no se incluye.
 
 El código continúa en `main`; los binarios se publican por separado como adjuntos.
 El código propio del port está bajo GPL-3.0-only; ver [LICENSE](LICENSE).
+Para crear tu propio ZIP y publicarlo, consulta el
+[script de release y sus instrucciones](docs/RELEASES.md). Un push de fuentes
+no publica automáticamente una nueva descarga.
 
 Arranca, recorre los menús y entra a carrera. Se corrigieron la sobreproducción
 de audio, bloqueos del scheduler y la corrupción del viewport que ocultaba la

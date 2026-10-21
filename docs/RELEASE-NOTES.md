@@ -1,4 +1,4 @@
-Versión experimental para **Windows 10/11 x64**.
+## v0.1.0-preview.3 — Windows 10/11 x64
 
 Descarga el ZIP de Windows de los archivos adjuntos, extráelo completo y abre
 `Jugar.cmd` o `tgod_native.exe`. Selecciona una **ROM propia de Top Gear Overdrive
@@ -11,19 +11,23 @@ capturas, música ni guardados.** La ROM se lee localmente y no se envía a serv
 
 Cambios principales:
 
-- El backend de audio se despierta por WOM_DONE en vez de esperar sondeos de
-  hasta 20 ms. Los últimos recorridos redujeron los vaciados observados de 56
-  a 0–3, sin descartar audio; la escucha completa continúa pendiente.
-- Luces ambiente/direccionales y coordenadas de reflexión desde normales.
-  Pruebas de luz frontal/trasera, rotación del modelview, alfa y texgen.
+- Recuperado el showroom: presentación del modo VI entrelazado de 640 píxeles,
+  cuyo stride entre líneas del campo era 1280 y se interpretaba como 320x240.
+- Coche con color y detalles al corregir el alfa de texturas I4/I8.
+- TEXEL1 independiente, niveles/fracciones LOD y coordenadas por tile.
+- Rectángulos 2D: filas impares de TMEM, TEXRECTFLIP y paso correcto en COPY.
+- Formatos IA16 y RGBA32 con bancos separados; repintado Win32 sincronizado.
+- Capturas desde el último cuadro presentado para evitar imágenes a medio dibujar.
+- Script único de compilación, pruebas, empaquetado y publicación opcional.
 
-- Corregida la sobreproducción de audio y la espera del scheduler por eventos AI.
-- Corregida la interpretación del viewport, matrices y filas impares de texturas.
-- Selector de ROM, soporte de los tres órdenes de bytes y verificación de revisión.
-- Generación y empaquetado reproducibles; fuentes separadas de los binarios.
+Las pruebas de fuentes incluyen casos de materiales, LOD, formatos y VI. Un
+recorrido de 20 s mantuvo carrera, 4/4 catálogos, EEPROM y cero descartes de audio.
+El ZIP se comprueba por separado con PATH limitado a Windows, tres órdenes de
+bytes de ROM y una carrera de 16 s. La ROM de prueba no forma parte del paquete.
 
-Quedan problemas de fidelidad en colores, showroom, HUD, iluminación y
-transparencias, además de validación prolongada de audio y modos de juego.
+Persisten textos recortados del showroom, detalles del HUD y diferencias en
+blender, transparencias, profundidad y filtros RDP/VI. La música conserva las
+mejoras anteriores; queda validación prolongada de pistas y modos de juego.
 El ejecutable y las DLL no tienen firma Authenticode.
 
 El código propio del port se publica bajo GPLv3; cada dependencia conserva su

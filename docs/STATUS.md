@@ -14,7 +14,9 @@ Fuentes en `main`; binarios separados en GitHub Releases y localmente en
 instrucciones, GPLv3/avisos upstream, fuentes por revisión y manifiesto SHA-256.
 No contiene ROM ni datos extraídos. El selector carga una ROM local y verifica
 USA v0; `.z64`, `.v64` y `.n64` se normalizan solo en memoria.
-La última revisión gráfica de fuentes es posterior al binario preview.2.
+El paquete preview.3 incorpora estas correcciones gráficas; preview.2 es anterior.
+`tools/release_windows.ps1` permite repetir compilación, pruebas y empaquetado,
+y publicar opcionalmente con `-Publish`. No hay publicación automática por push.
 
 La extracción temporal del ZIP pasó con PATH limitado a Windows: inicio sin
 compilador instalado en PATH, rutas Unicode/con espacios, tres órdenes de bytes,
