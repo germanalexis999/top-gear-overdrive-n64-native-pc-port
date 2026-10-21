@@ -70,6 +70,7 @@ public:
         uint32_t clamp_s = 0, mirror_s = 0, mask_s = 0, shift_s = 0;
         uint32_t clamp_t = 0, mirror_t = 0, mask_t = 0, shift_t = 0;
         uint32_t uls = 0, ult = 0, lrs = 0, lrt = 0;
+        uint8_t uls_fraction = 0, ult_fraction = 0;
     } tiles[8];
 
     // Scissor bounds
@@ -131,6 +132,10 @@ public:
     bool sample_tile(const Tile& tile, float s, float t, bool linear, uint8_t (&color)[4]) const;
     struct TextureLOD { uint8_t first = 0, second = 1; float fraction = 1; };
     TextureLOD select_texture_lod(float footprint) const;
+    uint8_t combine_colors(const uint8_t (&texel0)[4], const uint8_t (&texel1)[4],
+        const uint8_t (&shade)[4], int32_t lod_fraction, uint8_t (&color)[4]) const;
+    bool blend_colors(const uint8_t (&color)[4], uint8_t shade_alpha, uint8_t compare_alpha,
+        uint16_t destination, int32_t x, int32_t y, uint16_t& pixel) const;
     void rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
     void rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
 

@@ -23,9 +23,9 @@ Controles:
   F1-F4 = escala; F5 = filtro; F11 o Alt+Enter = pantalla completa
   Tambien se detectan mandos XInput.
 
-Esta version recupera el showroom y mejora los materiales del coche, TEXEL1,
-mipmaps y rectangulos 2D. Estado experimental: quedan textos recortados, detalles
-del HUD, transparencias y fidelidad RDP/VI. No es una version final.
+Esta version recupera numeros del HUD y el titulo del showroom, y corrige
+mezcla, profundidad y filtrado de particulas. Estado experimental: continua la
+comparacion del humo y la fidelidad RDP/VI. No es una version final.
 
 Codigo, instrucciones y versiones:
 https://github.com/germanalexis999/top-gear-overdrive-n64-native-pc-port

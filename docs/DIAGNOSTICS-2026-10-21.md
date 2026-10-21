@@ -131,6 +131,82 @@ dependencia del port y no se incluye en fuentes ni paquetes. Los PCM siguen
 excluidos de Git. Fuente de la API de comparación: implementación oficial de
 [pyminiaudio](https://github.com/irmen/pyminiaudio/blob/master/miniaudio.py).
 
+## HUD y partículas: profundidad, combinador y filtrado
+
+### Reproducción y resultado visible
+
+Se conservó una captura anterior y se repitió una secuencia de 30 s con
+aceleración, A+B durante los ticks 65–84 de carrera y A+Z/dirección durante
+90–109. La navegación avanza por tiempo real; no es una comparación exacta del
+mismo frame N64, porque el renderer software puede tardar distinto entre builds.
+
+La imagen anterior ocultaba velocidad, marcha, posición de carrera y gran parte
+del título del showroom. Con las correcciones aparecen esos elementos y el
+título «Car Select / Press Z for color selection». En la prueba de frenado el
+renderer anterior dibujaba destellos blancos; el nuevo conserva el tinte rojo
+del material. La estela del derrape deja de ser una cadena de puffs blancos
+opacos y se mezcla con el fondo. El usuario identificó color/tamaño/posición
+como el síntoma del humo; no se declara paridad visual con consola.
+
+### Causas verificadas en el código
+
+- Se comparaba Z en todos los triángulos con G_ZBUFFER, incluso si el render
+  mode desactivaba Z_CMP. Así se descartaban letras y números del HUD detrás
+  del Z que había dejado la escena. Ahora se respeta Z_CMP (0x10).
+- La escritura Z dependía de alfa >=192, en vez de Z_UPD (0x20). Los materiales
+  de partículas pueden comparar profundidad sin escribirla. Ahora ambos
+  controles son independientes y G_ZS_PRIM selecciona SETPRIMDEPTH.
+- Los rectángulos de partículas ignoraban por completo Z. Ahora comparan y
+  actualizan el Z primitivo cuando corresponde; COPY omite ese procesamiento.
+- El blender siempre hacía mezcla source-alpha. Ahora decodifica P/M/A/B,
+  FORCE_BL y los ciclos, con fuentes combiner/framebuffer/blend/fog y alfa
+  combiner/fog/shade. Se implementaron umbral de alfa con el resultado del
+  primer ciclo y una aproximación de dithering ordenado.
+- Triángulos modificados a coordenadas de pantalla y rectángulos omitían el
+  combinador de color. Ahora comparten su evaluación, incluidos color/alfa
+  primitivo y de entorno. MODIFYVTX XY/Z conserva clip W/Z; el modo de
+  perspectiva sigue el bit RDP, no el indicador de posición de pantalla.
+
+### Material y filtrado de las partículas
+
+La traza durante el derrape identificó G_TEXRECT con textura I8 de 8x8 ampliada,
+combiner `ff9bff/fffefe38`, OtherMode `112ca0/0c1849dc` y colores de entorno
+como `922800ad`, `7b1500b0` y `982d00b9`. El shader recibe, por tanto, un tinte
+rojizo/marrón y un alfa variable desde el propio juego. No se sustituyeron por
+un color gris arbitrario ni se cambió el tamaño de los emisores del juego.
+
+El rectángulo pedía filtrado pero se muestreaba por puntos. Ahora usa filtrado
+RDP de tres muestras y fracciones de 5 bits. También se sustituyó la aproximación
+de cuatro taps de los triángulos, se eliminó su desplazamiento incorrecto de
+medio texel y se conservó el caso central de G_TF_AVERAGE. SETTILESIZE mantiene
+las fracciones de cuarto de texel del origen. Referencias locales contrastadas:
+RT64 `TextureSampler.hlsli`, `rt64_blender.h`, `rt64_color_combiner.h`,
+`rt64_rdp.cpp` y `rt64_rsp.cpp`; los avisos upstream permanecen en LICENSES/.
+
+### Comprobaciones y límites
+
+Las pruebas sin ROM cubren mezcla opaca/translúcida, alfa de shade/fog, ambos
+ciclos, cobertura interior aproximada, umbral/dither, alfa del primer ciclo,
+combinador de HUD/rectángulos, Z_CMP/Z_UPD, profundidad primitiva de partículas,
+MODIFYVTX, las dos mitades del filtro de tres muestras, AVERAGE y origen
+fraccionario. El chequeo del paquete rechaza --graphics-check sin --headless.
+
+La ejecución final de 30 s con frenado/derrape terminó en Modo 2, verificó
+4/4 catálogos y EEPROM de 2048 bytes, sin overruns ni descartes/reemplazos de
+audio; hubo 3 transiciones observadas a cola de dispositivo vacía. No se cambió
+el backend de audio en esta iteración.
+
+`--headless --graphics-check --seconds 30` permite repetir la secuencia y crea
+capturas de frenado, derrape y continuación en el directorio del EXE. No cambia
+la conducción normal ni la navegación headless sin ese parámetro.
+
+Quedan la comparación visual precisa del color/escala/posición del humo,
+coverage subpíxel, Z comprimido/delta/decal, el desbordamiento del blender,
+noise/dither de hardware y los detalles de posicionamiento subpíxel de rectángulos.
+Las trazas temporales detectaron también cambio de microcódigo a L3DEX y opcode
+0x08 sin implementar; su efecto concreto no se atribuyó al humo y sigue abierto.
+Las trazas privadas y capturas no se publican con el código ni el ZIP.
+
 ## Distribución
 
 Las fuentes se mantienen en main, las descargas en Releases y los ZIP locales

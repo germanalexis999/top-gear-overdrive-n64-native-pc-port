@@ -458,8 +458,8 @@ bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool lin
         // RDP shifts 0..10 divide; 11..15 multiply by 2^(16-shift).
         return std::ldexp(coordinate, shift <= 10 ? -int(shift) : 16 - int(shift));
     };
-    s = shift_coordinate(s, tile.shift_s) - float(tile.uls);
-    t = shift_coordinate(t, tile.shift_t) - float(tile.ult);
+    s = shift_coordinate(s, tile.shift_s) - float(tile.uls) - tile.uls_fraction / 4.0f;
+    t = shift_coordinate(t, tile.shift_t) - float(tile.ult) - tile.ult_fraction / 4.0f;
     if (!std::isfinite(s) || !std::isfinite(t) ||
         std::abs(s) > 10000000.0f || std::abs(t) > 10000000.0f) return false;
     if (!linear) {
@@ -467,14 +467,20 @@ bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool lin
             color[0], color[1], color[2], color[3]);
     }
 
-    // Keep the existing four-tap approximation, now independently for each tile.
-    // RDP three-point filtering and its fixed-point rounding remain separate work.
-    s -= 0.5f;
-    t -= 0.5f;
+    // Native RDP filtering uses three samples from a 2x2 neighborhood, selected
+    // by the diagonal. Coordinates already use texel units, not GPU UV centers.
     const int32_t x = int32_t(std::floor(s)), y = int32_t(std::floor(t));
-    const float fs = s - float(x), ft = t - float(y);
+    const float fs = std::floor((s - float(x))*32.0f)/32.0f;
+    const float ft = std::floor((t - float(y))*32.0f)/32.0f;
     uint8_t samples[4][4]{};
-    const float weights[4] = {(1-fs)*(1-ft), fs*(1-ft), (1-fs)*ft, fs*ft};
+    float weights[4]{};
+    if (((other_mode_h>>12)&3)==3 && fs==0.5f && ft==0.5f) {
+        std::fill(weights,weights+4,0.25f); // G_TF_AVERAGE center special case.
+    } else if (fs+ft < 1.0f) {
+        weights[0]=1-fs-ft; weights[1]=fs; weights[2]=ft;
+    } else {
+        weights[1]=1-ft; weights[2]=1-fs; weights[3]=fs+ft-1;
+    }
     for (int i = 0; i < 4; ++i) {
         if (!fetch_tile_texel(tile, x + (i & 1), y + (i >> 1),
             samples[i][0], samples[i][1], samples[i][2], samples[i][3])) return false;
@@ -484,6 +490,163 @@ bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool lin
         for (int i = 0; i < 4; ++i) value += samples[i][channel] * weights[i];
         color[channel] = uint8_t(std::clamp(value, 0.0f, 255.0f));
     }
+    return true;
+}
+
+uint8_t F3DEX2Interpreter::combine_colors(const uint8_t (&texel0)[4], const uint8_t (&texel1)[4],
+    const uint8_t (&shade)[4], int32_t lod_fraction, uint8_t (&color)[4]) const {
+    if (((other_mode_h >> 20) & 3) == 2) {
+        std::copy(texel0, texel0 + 4, color);
+        return color[3];
+    }
+    if (!combine_mode_set) {
+        for (int i = 0; i < 4; ++i) color[i] = uint8_t(uint32_t(texel0[i]) * shade[i] / 255);
+        return color[3];
+    }
+    // Evaluate the common N64 color-combiner equation:
+    // (A - B) * C + D. Selector decoding follows RT64's
+    // ColorCombiner mux layout; unsupported key/noise
+    // sources resolve to zero until separately implemented.
+    uint8_t combined[4] = {0, 0, 0, 0};
+    const uint8_t* mux_texel0 = texel0;
+    const uint8_t* mux_texel1 = texel1;
+    const uint8_t primitive[4] = {
+        (uint8_t)(prim_color >> 24), (uint8_t)(prim_color >> 16),
+        (uint8_t)(prim_color >> 8), (uint8_t)prim_color
+    };
+    const uint8_t environment[4] = {
+        (uint8_t)(env_color >> 24), (uint8_t)(env_color >> 16),
+        (uint8_t)(env_color >> 8), (uint8_t)env_color
+    };
+    const uint32_t cycle_type = (other_mode_h >> 20) & 3;
+    auto channel_from_color_mux = [&](uint32_t mux, uint32_t channel, uint32_t operand) -> int32_t {
+        if (channel == 3) {
+            switch (mux) {
+            case 0: return combined[3];
+            case 1: return mux_texel0[3];
+            case 2: return mux_texel1[3];
+            case 3: return primitive[3];
+            case 4: return shade[3];
+            case 5: return environment[3];
+            case 6: return 255;
+            default: return 0;
+            }
+        }
+        switch (mux) {
+        case 0: return combined[channel];
+        case 1: return mux_texel0[channel];
+        case 2: return mux_texel1[channel];
+        case 3: return primitive[channel];
+        case 4: return shade[channel];
+        case 5: return environment[channel];
+        case 6: return (operand == 0 || operand == 3) ? 255 : 0; // ONE for A/D; key inputs unsupported
+        case 7: return operand == 2 ? combined[3] : 0;
+        case 8: return operand == 2 ? mux_texel0[3] : 0;
+        case 9: return operand == 2 ? mux_texel1[3] : 0;
+        case 10: return operand == 2 ? primitive[3] : 0;
+        case 11: return operand == 2 ? shade[3] : 0;
+        case 12: return operand == 2 ? environment[3] : 0;
+        case 13: return operand == 2 ? lod_fraction : 0;
+        case 14: return operand == 2 ? primitive_lod_fraction : 0;
+        default: return 0;
+        }
+    };
+    auto channel_from_alpha_mux = [&](uint32_t mux, uint32_t operand) -> int32_t {
+        switch (mux) {
+        case 0: return operand == 2 ? lod_fraction : combined[3];
+        case 1: return mux_texel0[3];
+        case 2: return mux_texel1[3];
+        case 3: return primitive[3];
+        case 4: return shade[3];
+        case 5: return environment[3];
+        case 6: return operand == 2 ? primitive_lod_fraction : 255;
+        default: return 0;
+        }
+    };
+    uint8_t compare_alpha = 0;
+    const uint32_t first_cycle = cycle_type == 1 ? 0 : 1;
+    const uint32_t cycle_count = cycle_type == 1 ? 2 : 1;
+    for (uint32_t cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset) {
+        const uint32_t cycle = first_cycle + cycle_offset;
+        const bool swap_textures = cycle_type == 1 && cycle == 1;
+        mux_texel0 = swap_textures ? texel1 : texel0;
+        mux_texel1 = swap_textures ? texel0 : texel1;
+        const uint32_t mux_a = cycle ? ((combine_mode_w0 >> 5) & 0xF) : ((combine_mode_w0 >> 20) & 0xF);
+        const uint32_t mux_b = cycle ? ((combine_mode_w1 >> 24) & 0xF) : ((combine_mode_w1 >> 28) & 0xF);
+        const uint32_t mux_c = cycle ? (combine_mode_w0 & 0x1F) : ((combine_mode_w0 >> 15) & 0x1F);
+        const uint32_t mux_d = cycle ? ((combine_mode_w1 >> 6) & 0x7) : ((combine_mode_w1 >> 15) & 0x7);
+        const uint32_t alpha_a = cycle ? ((combine_mode_w1 >> 21) & 0x7) : ((combine_mode_w0 >> 12) & 0x7);
+        const uint32_t alpha_b = cycle ? ((combine_mode_w1 >> 3) & 0x7) : ((combine_mode_w1 >> 12) & 0x7);
+        const uint32_t alpha_c = cycle ? ((combine_mode_w1 >> 18) & 0x7) : ((combine_mode_w0 >> 9) & 0x7);
+        const uint32_t alpha_d = cycle ? (combine_mode_w1 & 0x7) : ((combine_mode_w1 >> 9) & 0x7);
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+            const int32_t a = channel_from_color_mux(mux_a, channel, 0);
+            const int32_t b = channel_from_color_mux(mux_b, channel, 1);
+            const int32_t c = channel_from_color_mux(mux_c, channel, 2);
+            const int32_t d = channel_from_color_mux(mux_d, channel, 3);
+            combined[channel] = (uint8_t)std::clamp(((a - b) * c + 127) / 255 + d, 0, 255);
+        }
+        const int32_t aa = channel_from_alpha_mux(alpha_a, 0);
+        const int32_t ab = channel_from_alpha_mux(alpha_b, 1);
+        const int32_t ac = channel_from_alpha_mux(alpha_c, 2);
+        const int32_t ad = channel_from_alpha_mux(alpha_d, 3);
+        combined[3] = (uint8_t)std::clamp(((aa - ab) * ac + 127) / 255 + ad, 0, 255);
+        if (cycle_offset == 0) compare_alpha = combined[3];
+    }
+    std::copy(combined, combined + 4, color);
+    return compare_alpha;
+}
+
+bool F3DEX2Interpreter::blend_colors(const uint8_t (&color)[4], uint8_t shade_alpha,
+    uint8_t compare_alpha, uint16_t destination, int32_t x, int32_t y, uint16_t& pixel) const {
+    const uint32_t alpha_compare = other_mode_l & 3;
+    if (alpha_compare == 1 && compare_alpha < uint8_t(blend_color)) return false;
+    if (alpha_compare == 3) {
+        // Stable ordered approximation of alpha dithering; not the RDP noise generator.
+        static constexpr uint8_t bayer[16] = {0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5};
+        if (compare_alpha < 1 + bayer[((y & 3)<<2)|(x & 3)]*16) return false;
+    }
+    const bool coverage_times_alpha = (other_mode_l & 0x1000) != 0;
+    if (coverage_times_alpha && color[3] == 0) return false;
+    // Without a subpixel coverage buffer, approximate full interior coverage.
+    // ALPHA_CVG_SEL must not turn an opaque surface into source-alpha blending.
+    const int alpha = (other_mode_l & 0x2000) && !coverage_times_alpha ? 255 : color[3];
+    const uint8_t background[3] = {uint8_t(((destination>>11)&31)*255/31),
+        uint8_t(((destination>>6)&31)*255/31), uint8_t(((destination>>1)&31)*255/31)};
+    uint8_t result[3] = {color[0],color[1],color[2]};
+    const uint32_t cycle_type = (other_mode_h >> 20) & 3;
+    if (cycle_type < 2) {
+        const uint32_t count = cycle_type == 1 ? 2 : 1;
+        for (uint32_t cycle = 0; cycle < count; ++cycle) {
+            const uint32_t p = (other_mode_l >> (cycle ? 28 : 30)) & 3;
+            const uint32_t m = (other_mode_l >> (cycle ? 20 : 22)) & 3;
+            const uint32_t a = (other_mode_l >> (cycle ? 24 : 26)) & 3;
+            const uint32_t b = (other_mode_l >> (cycle ? 16 : 18)) & 3;
+            auto input = [&](uint32_t source, int channel) -> int {
+                switch (source) {
+                case 0: return result[channel];
+                case 1: return background[channel];
+                case 2: return uint8_t(blend_color >> (24-channel*8));
+                default: return uint8_t(fog_color >> (24-channel*8));
+                }
+            };
+            const int weight_a = a == 0 ? alpha : a == 1 ? uint8_t(fog_color) : a == 2 ? shade_alpha : 0;
+            const int weight_b = b == 0 ? 255-weight_a : b == 3 ? 0 : 255;
+            for (int channel=0; channel<3; ++channel) {
+                const int source_p = input(p,channel), source_m = input(m,channel);
+                int value;
+                if (cycle == count-1 && !(other_mode_l & 0x4000)) value = source_p;
+                else if (a == 3) value = source_m;
+                else if (b == 3) value = source_p;
+                else {
+                    const int denominator = std::max(1,weight_a+weight_b);
+                    value = (source_p*weight_a + source_m*weight_b + denominator/2)/denominator;
+                }
+                result[channel] = uint8_t(std::clamp(value,0,255));
+            }
+        }
+    }
+    pixel = uint16_t(((result[0]>>3)<<11)|((result[1]>>3)<<6)|((result[2]>>3)<<1)|1);
     return true;
 }
 
@@ -526,7 +689,7 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     }
     const bool two_cycles = ((other_mode_h >> 20) & 3) == 1;
     bool uses_second_texture = false;
-    if (combine_mode_set && two_cycles && !v0.is_screen_space) {
+    if (combine_mode_set && two_cycles) {
         for (uint32_t cycle = 0; cycle < 2; ++cycle) {
             const uint32_t color_selectors[4] = {
                 cycle ? ((combine_mode_w0 >> 5) & 15) : ((combine_mode_w0 >> 20) & 15),
@@ -573,9 +736,10 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     } else {
         untextured_triangles++;
     }
-    float inv_w0 = 1.0f / (std::abs(v0.clip_w) > 0.0001f ? std::abs(v0.clip_w) : 1.0f);
-    float inv_w1 = 1.0f / (std::abs(v1.clip_w) > 0.0001f ? std::abs(v1.clip_w) : 1.0f);
-    float inv_w2 = 1.0f / (std::abs(v2.clip_w) > 0.0001f ? std::abs(v2.clip_w) : 1.0f);
+    const bool perspective = (other_mode_h & (1u << 19)) != 0;
+    float inv_w0 = perspective ? 1.0f / (std::abs(v0.clip_w) > 0.0001f ? std::abs(v0.clip_w) : 1.0f) : 1.0f;
+    float inv_w1 = perspective ? 1.0f / (std::abs(v1.clip_w) > 0.0001f ? std::abs(v1.clip_w) : 1.0f) : 1.0f;
+    float inv_w2 = perspective ? 1.0f / (std::abs(v2.clip_w) > 0.0001f ? std::abs(v2.clip_w) : 1.0f) : 1.0f;
     // Derivatives of the perspective numerator/denominator in screen pixels.
     const float dx[3] = {(v2.screen_y-v1.screen_y)*inv_w0,
         (v0.screen_y-v2.screen_y)*inv_w1, (v1.screen_y-v0.screen_y)*inv_w2};
@@ -612,8 +776,9 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                 uint16_t z_val = 0;
                 if (has_depth) {
                     float cur_z_f = l0 * v0.screen_z + l1 * v1.screen_z + l2 * v2.screen_z;
-                    z_val = (uint16_t)std::clamp((int)(cur_z_f * 32.0f), 0, 0xFFFC);
-                    if (z_val > depth_row[px] && depth_row[px] != 0) {
+                    z_val = (other_mode_l & 4) ? (primitive_depth & 0x7FFF) :
+                        (uint16_t)std::clamp((int)(cur_z_f * 32.0f), 0, 0xFFFC);
+                    if ((other_mode_l & 0x10) && z_val > depth_row[px]) {
                         ++pixels_depth_rejected;
                         continue; // Occluded by closer geometry
                     }
@@ -643,14 +808,12 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     tv = (w0_p * v0.v + w1_p * v1.v + w2_p * v2.v) * inv_sum;
 
                     uint8_t sampled[4]{};
-                    const bool linear = !v0.is_screen_space && ((other_mode_h >> 12) & 3) >= 2;
+                    const bool linear = ((other_mode_h >> 12) & 3) >= 2 && ((other_mode_h >> 20) & 3) != 2;
                     TextureLOD lod;
-                    if (!v0.is_screen_space) {
-                        const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum),
-                            std::abs((uy-tu*wy)*inv_sum), std::abs((vx-tv*wx)*inv_sum),
-                            std::abs((vy-tv*wy)*inv_sum)});
-                        lod = select_texture_lod(footprint);
-                    }
+                    const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum),
+                        std::abs((uy-tu*wy)*inv_sum), std::abs((vx-tv*wx)*inv_sum),
+                        std::abs((vy-tv*wy)*inv_sum)});
+                    lod = select_texture_lod(footprint);
                     lod_fraction = int32_t(lod.fraction * 255.0f);
                     const Tile& first = lod.first ? tiles[(cur_tile + lod.first) & 7] : tile;
                     texel_valid = sample_tile(first, tu, tv, linear, sampled);
@@ -662,144 +825,17 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     }
                 }
 
-                uint8_t final_r = vr;
-                uint8_t final_g = vg;
-                uint8_t final_b = vb;
-                uint8_t src_a = 255;
-
-                if (has_texture) {
-                    if (!texel_valid) {
-                        ++pixels_texel_invalid;
-                        continue; // Transparent texel in textured triangle: discard!
-                    }
-                    src_a = v0.is_screen_space ?
-                        ((va > 0) ? (uint8_t)(((uint32_t)ta * va) / 255) : ta) : ta;
-                }
-
-                if (combine_mode_set && !v0.is_screen_space) {
-                    // Evaluate the common N64 color-combiner equation:
-                    // (A - B) * C + D. Selector decoding follows RT64's
-                    // ColorCombiner mux layout; unsupported key/noise
-                    // sources resolve to zero until separately implemented.
-                    uint8_t combined[4] = {0, 0, 0, 0};
-                    const uint8_t texel0[4] = {tr, tg, tb, ta};
-                    const uint8_t* texel1 = second_texel;
-                    const uint8_t* mux_texel0 = texel0;
-                    const uint8_t* mux_texel1 = texel1;
-                    const uint8_t shade[4] = {vr, vg, vb, va};
-                    const uint8_t primitive[4] = {
-                        (uint8_t)(prim_color >> 24), (uint8_t)(prim_color >> 16),
-                        (uint8_t)(prim_color >> 8), (uint8_t)prim_color
-                    };
-                    const uint8_t environment[4] = {
-                        (uint8_t)(env_color >> 24), (uint8_t)(env_color >> 16),
-                        (uint8_t)(env_color >> 8), (uint8_t)env_color
-                    };
-                    const uint32_t cycle_type = (other_mode_h >> 20) & 3;
-                    auto channel_from_color_mux = [&](uint32_t mux, uint32_t channel, uint32_t operand) -> int32_t {
-                        if (channel == 3) {
-                            switch (mux) {
-                            case 0: return combined[3];
-                            case 1: return mux_texel0[3];
-                            case 2: return mux_texel1[3];
-                            case 3: return primitive[3];
-                            case 4: return shade[3];
-                            case 5: return environment[3];
-                            case 6: return 255;
-                            default: return 0;
-                            }
-                        }
-                        switch (mux) {
-                        case 0: return combined[channel];
-                        case 1: return mux_texel0[channel];
-                        case 2: return mux_texel1[channel];
-                        case 3: return primitive[channel];
-                        case 4: return shade[channel];
-                        case 5: return environment[channel];
-                        case 6: return (operand == 0 || operand == 3) ? 255 : 0; // ONE for A/D; key inputs unsupported
-                        case 7: return operand == 2 ? combined[3] : 0;
-                        case 8: return operand == 2 ? mux_texel0[3] : 0;
-                        case 9: return operand == 2 ? mux_texel1[3] : 0;
-                        case 10: return operand == 2 ? primitive[3] : 0;
-                        case 11: return operand == 2 ? shade[3] : 0;
-                        case 12: return operand == 2 ? environment[3] : 0;
-                        case 13: return operand == 2 ? lod_fraction : 0;
-                        case 14: return operand == 2 ? primitive_lod_fraction : 0;
-                        default: return 0;
-                        }
-                    };
-                    auto channel_from_alpha_mux = [&](uint32_t mux, uint32_t operand) -> int32_t {
-                        switch (mux) {
-                        case 0: return operand == 2 ? lod_fraction : combined[3];
-                        case 1: return mux_texel0[3];
-                        case 2: return mux_texel1[3];
-                        case 3: return primitive[3];
-                        case 4: return shade[3];
-                        case 5: return environment[3];
-                        case 6: return operand == 2 ? primitive_lod_fraction : 255;
-                        default: return 0;
-                        }
-                    };
-                    const uint32_t first_cycle = cycle_type == 1 ? 0 : 1;
-                    const uint32_t cycle_count = cycle_type == 1 ? 2 : 1;
-                    for (uint32_t cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset) {
-                        const uint32_t cycle = first_cycle + cycle_offset;
-                        const bool swap_textures = cycle_type == 1 && cycle == 1;
-                        mux_texel0 = swap_textures ? texel1 : texel0;
-                        mux_texel1 = swap_textures ? texel0 : texel1;
-                        const uint32_t mux_a = cycle ? ((combine_mode_w0 >> 5) & 0xF) : ((combine_mode_w0 >> 20) & 0xF);
-                        const uint32_t mux_b = cycle ? ((combine_mode_w1 >> 24) & 0xF) : ((combine_mode_w1 >> 28) & 0xF);
-                        const uint32_t mux_c = cycle ? (combine_mode_w0 & 0x1F) : ((combine_mode_w0 >> 15) & 0x1F);
-                        const uint32_t mux_d = cycle ? ((combine_mode_w1 >> 6) & 0x7) : ((combine_mode_w1 >> 15) & 0x7);
-                        const uint32_t alpha_a = cycle ? ((combine_mode_w1 >> 21) & 0x7) : ((combine_mode_w0 >> 12) & 0x7);
-                        const uint32_t alpha_b = cycle ? ((combine_mode_w1 >> 3) & 0x7) : ((combine_mode_w1 >> 12) & 0x7);
-                        const uint32_t alpha_c = cycle ? ((combine_mode_w1 >> 18) & 0x7) : ((combine_mode_w0 >> 9) & 0x7);
-                        const uint32_t alpha_d = cycle ? (combine_mode_w1 & 0x7) : ((combine_mode_w1 >> 9) & 0x7);
-                        for (uint32_t channel = 0; channel < 3; ++channel) {
-                            const int32_t a = channel_from_color_mux(mux_a, channel, 0);
-                            const int32_t b = channel_from_color_mux(mux_b, channel, 1);
-                            const int32_t c = channel_from_color_mux(mux_c, channel, 2);
-                            const int32_t d = channel_from_color_mux(mux_d, channel, 3);
-                            combined[channel] = (uint8_t)std::clamp(((a - b) * c + 127) / 255 + d, 0, 255);
-                        }
-                        const int32_t aa = channel_from_alpha_mux(alpha_a, 0);
-                        const int32_t ab = channel_from_alpha_mux(alpha_b, 1);
-                        const int32_t ac = channel_from_alpha_mux(alpha_c, 2);
-                        const int32_t ad = channel_from_alpha_mux(alpha_d, 3);
-                        combined[3] = (uint8_t)std::clamp(((aa - ab) * ac + 127) / 255 + ad, 0, 255);
-                    }
-                    final_r = combined[0];
-                    final_g = combined[1];
-                    final_b = combined[2];
-                    src_a = combined[3];
-                } else if (has_texture) {
-                    // Conservative fallback before the game sets a combiner.
-                    final_r = (uint8_t)(((uint32_t)tr * vr) / 255);
-                    final_g = (uint8_t)(((uint32_t)tg * vg) / 255);
-                    final_b = (uint8_t)(((uint32_t)tb * vb) / 255);
-                }
-
-                if (src_a == 0) {
+                if (has_texture && !texel_valid) {
+                    ++pixels_texel_invalid;
                     continue;
                 }
-
-                // Alpha blending against current framebuffer pixel
-                if (src_a < 255) {
-                    uint16_t cur_dst = row[px];
-                    uint8_t dst_r = ((cur_dst >> 11) & 0x1F) * 255 / 31;
-                    uint8_t dst_g = ((cur_dst >> 6) & 0x1F) * 255 / 31;
-                    uint8_t dst_b = ((cur_dst >> 1) & 0x1F) * 255 / 31;
-
-                    final_r = (uint8_t)(((uint32_t)final_r * src_a + (uint32_t)dst_r * (255 - src_a)) / 255);
-                    final_g = (uint8_t)(((uint32_t)final_g * src_a + (uint32_t)dst_g * (255 - src_a)) / 255);
-                    final_b = (uint8_t)(((uint32_t)final_b * src_a + (uint32_t)dst_b * (255 - src_a)) / 255);
-                }
-
-                if (has_depth && !v0.is_screen_space && src_a >= 192) {
-                    depth_row[px] = z_val;
-                }
-
-                uint16_t pixel_col = (uint16_t)(((final_r >> 3) << 11) | ((final_g >> 3) << 6) | ((final_b >> 3) << 1) | 1);
+                const uint8_t texel0[4] = {tr, tg, tb, ta};
+                const uint8_t shade[4] = {vr, vg, vb, va};
+                uint8_t color[4]{};
+                const uint8_t compare_alpha = combine_colors(texel0, second_texel, shade, lod_fraction, color);
+                uint16_t pixel_col = 0;
+                if (!blend_colors(color, va, compare_alpha, row[px], px, py, pixel_col)) continue;
+                if (has_depth && (other_mode_l & 0x20)) depth_row[px] = z_val;
                 row[px] = pixel_col;
                 ++pixels_written;
             }
@@ -884,6 +920,9 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
             }
             case 0xF9: // G_SETBLENDCOLOR
                 blend_color = w1;
+                break;
+            case 0xF8: // G_SETFOGCOLOR
+                fog_color = w1;
                 break;
             case 0xDA: { // G_MTX
                 uint8_t params = (w0) & 0xFF;
@@ -1009,11 +1048,9 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                     } else if (where == 0x18) { // XYSCREEN
                         v.screen_x = (float)(int16_t)(w1 >> 16) / 4.0f;
                         v.screen_y = (float)(int16_t)(w1 & 0xFFFF) / 4.0f;
-                        v.clip_w = 1.0f;
                         v.is_screen_space = true;
                         v.clipped = false;
                     } else if (where == 0x1C) { // ZSCREEN
-                        v.clip_z = (float)(int16_t)(w1 >> 16);
                         v.screen_z = (float)(uint32_t)w1 / 65536.0f;
                     }
                 }
@@ -1190,6 +1227,8 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 Tile& t = tiles[tile_idx];
                 t.uls = ((w0 >> 12) & 0xFFF) / 4;
                 t.ult = (w0 & 0xFFF) / 4;
+                t.uls_fraction = (w0 >> 12) & 3;
+                t.ult_fraction = w0 & 3;
                 t.lrs = ((w1 >> 12) & 0xFFF) / 4;
                 t.lrt = (w1 & 0xFFF) / 4;
                 break;
@@ -1299,22 +1338,32 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 const int32_t end_y = std::min(bottom, scissor_yl);
                 const float step_s = dsdx / (copy_cycle ? 4096.0f : 1024.0f);
                 const float step_t = dtdy / 1024.0f;
+                const bool filtered = !copy_cycle && ((other_mode_h>>12)&3)>=2;
+                const bool rect_depth = !copy_cycle && depth_image_addr &&
+                    depth_image_addr + uint64_t(color_image_width)*std::max(0,end_y)*2 <= 8*1024*1024;
+                const uint16_t rect_z = (other_mode_l & 4) ? primitive_depth & 0x7FFF : 0;
                 if (color_image_size == 2 && color_image_addr + uint64_t(color_image_width)*240*2 <= 8*1024*1024) {
                     for (int32_t y = top; y < end_y; ++y) {
                         auto* row = reinterpret_cast<uint16_t*>(rdram + color_image_addr + y*color_image_width*2);
+                        auto* depth = rect_depth ? reinterpret_cast<uint16_t*>(rdram + depth_image_addr + y*color_image_width*2) : nullptr;
                         for (int32_t x = left; x < end_x; ++x) {
+                            if (depth && (other_mode_l & 0x10) && rect_z > depth[x]) continue;
                             const float u = s0 / 32.0f + (op == 0xE5 ? y-yl : x-xl)*step_s;
                             const float v = t0 / 32.0f + (op == 0xE5 ? x-xl : y-yl)*step_t;
                             uint8_t color[4]{};
-                            if (!sample_tile(tile, u, v, false, color) || color[3] == 0) continue;
-                            if (color[3] != 255) {
-                                const uint16_t dst = row[x];
-                                const uint8_t background[3] = {uint8_t(((dst>>11)&31)*255/31),
-                                    uint8_t(((dst>>6)&31)*255/31), uint8_t(((dst>>1)&31)*255/31)};
-                                for (int channel=0; channel<3; ++channel)
-                                    color[channel] = uint8_t((color[channel]*color[3] + background[channel]*(255-color[3]))/255);
+                            uint8_t texel[4]{}, next_texel[4]{};
+                            if (!sample_tile(tile, u, v, filtered, texel)) continue;
+                            std::copy(texel, texel+4, next_texel);
+                            if (((other_mode_h>>20)&3)==1 && !(other_mode_h&(1u<<16)))
+                                sample_tile(tiles[(tile_idx+1)&7], u, v, filtered, next_texel);
+                            const uint8_t shade_value = combine_mode_set ? 0 : 255;
+                            const uint8_t shade[4] = {shade_value,shade_value,shade_value,shade_value};
+                            const uint8_t compare_alpha = combine_colors(texel, next_texel, shade, 255, color);
+                            uint16_t pixel = 0;
+                            if (blend_colors(color, shade[3], compare_alpha, row[x], x, y, pixel)) {
+                                row[x] = pixel;
+                                if (depth && (other_mode_l & 0x20)) depth[x] = rect_z;
                             }
-                            row[x] = uint16_t(((color[0]>>3)<<11) | ((color[1]>>3)<<6) | ((color[2]>>3)<<1) | 1);
                         }
                     }
                 }

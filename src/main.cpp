@@ -961,6 +961,7 @@ int main(int argc, char** argv) {
     std::cout << "====================================================\n\n";
 
     bool headless = false;
+    bool graphics_check = false;
     bool verify_only = false;
     bool explicit_rom = false;
     int headless_seconds = 4;
@@ -978,6 +979,8 @@ int main(int argc, char** argv) {
         if (arg == L"--headless") {
             headless = true;
             g_is_headless = true;
+        } else if (arg == L"--graphics-check") {
+            graphics_check = true;
         } else if (arg == L"--verify-rom") {
             verify_only = true;
         } else if (arg == L"--seconds" && i + 1 < arguments.size()) {
@@ -986,7 +989,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--headless --seconds N] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--headless --seconds N [--graphics-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -997,6 +1000,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (graphics_check && !headless) {
+        std::cerr << "--graphics-check requires --headless.\n";
+        return 2;
+    }
     std::error_code path_error;
     if (!std::filesystem::exists(rom_path, path_error) && !explicit_rom && !headless && !verify_only) {
         rom_path = tgod::choose_rom_file();
@@ -1310,6 +1317,17 @@ int main(int argc, char** argv) {
                 // Preserve the game's default third-person camera. C-Down
                 // switches away from it and hides the car in diagnostic shots.
                 g_buttons.store(0x8000); // Accelerate
+
+                if (graphics_check) {
+                    // Exercise translucent effects without changing normal navigation.
+                    if (race_ticks >= 65 && race_ticks < 85) g_buttons.store(0xC000); // A+B
+                    const bool drift = race_ticks >= 90 && race_ticks < 110;
+                    if (drift) g_buttons.store(0xA000); // A+Z
+                    g_stick_x.store(drift ? 0.75f : 0.0f);
+                    if (race_ticks == 75) g_presented_frame.save("framebuffer_graphics_brake.bmp");
+                    if (race_ticks == 105) g_presented_frame.save("framebuffer_graphics_drift.bmp");
+                    if (race_ticks == 150) g_presented_frame.save("framebuffer_graphics_late.bmp");
+                }
 
                 if (race_ticks == 55 && origin != 0) {
                     g_presented_frame.save("framebuffer_race_stable.bmp");

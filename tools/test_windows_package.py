@@ -42,6 +42,7 @@ def main():
         run(["--help"])
         run(["--headless", "--seconds", "1"], 2)
         run(["--unknown"], 2)
+        run(["--graphics-check"], 2)
         run(["--verify-rom", "--rom", rom])
         cases = temporary / "ROM con espacios y acentos á"
         cases.mkdir()

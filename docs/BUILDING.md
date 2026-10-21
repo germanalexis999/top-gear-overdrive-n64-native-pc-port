@@ -60,6 +60,16 @@ cmake --build build-checks --target tgod_regression_checks --parallel 4
 La ejecución headless activa navegación automática y capturas locales; esas
 capturas contienen material del juego y permanecen excluidas de Git.
 
+Para repetir el recorrido de gráficos con frenado y derrape:
+
+```powershell
+.\build\tgod_native.exe --headless --graphics-check --seconds 30 --rom 'D:\ROMs\mi-copia.z64'
+```
+
+Además de la captura de carrera, genera `framebuffer_graphics_brake.bmp`,
+`framebuffer_graphics_drift.bmp` y `framebuffer_graphics_late.bmp` en `build/`.
+`--graphics-check` requiere `--headless`; no afecta a los controles normales.
+
 ## Controles
 
 Enter: Start. X/Espacio: A. Z/Retroceso: B. C: gatillo Z. A/S: L/R.

@@ -1,10 +1,11 @@
 # Estado del port — 2026-10-21
 
-Última revisión de fuentes: showroom recuperado al interpretar VI entrelazado
-(stride 1280, imagen 640), y coche con color/detalles tras corregir alfa I4/I8.
-También se añadieron TEXEL1 independiente, mipmaps/fracciones LOD y muestreo
-común para rectángulos. El usuario confirma mejora musical; el foco actual es
-gráficos. Quedan defectos en textos/HUD y fidelidad RDP/VI. Evidencia y límites en
+Última revisión: recuperados velocidad, marcha, posición de carrera y título del
+showroom al respetar los controles de profundidad. Rectángulos y triángulos
+comparten combinador/blender, las partículas respetan Z primitivo y se filtran
+con tres muestras. Continúa la comprobación visual del humo (color/escala/posición)
+y de la fidelidad RDP/VI. El usuario confirma mejora musical; el foco es gráficos.
+Evidencia y límites en
 [DIAGNOSTICS-2026-10-21.md](DIAGNOSTICS-2026-10-21.md).
 
 ## Distribución Windows preliminar
@@ -14,7 +15,8 @@ Fuentes en `main`; binarios separados en GitHub Releases y localmente en
 instrucciones, GPLv3/avisos upstream, fuentes por revisión y manifiesto SHA-256.
 No contiene ROM ni datos extraídos. El selector carga una ROM local y verifica
 USA v0; `.z64`, `.v64` y `.n64` se normalizan solo en memoria.
-El paquete preview.3 incorpora estas correcciones gráficas; preview.2 es anterior.
+El paquete preview.4 incorpora esta revisión de HUD y partículas; preview.3
+contiene la recuperación inicial del showroom y los materiales del coche.
 `tools/release_windows.ps1` permite repetir compilación, pruebas y empaquetado,
 y publicar opcionalmente con `-Publish`. No hay publicación automática por push.
 
@@ -65,8 +67,9 @@ eliminación de nodos intermedios/finales/ausentes en colas de hilos.
 
 ## Pendientes
 
-- Textos superiores del showroom, HUD, transparencias y reflejos restantes.
-- Combiner/blender, profundidad/coverage, filtrado y campos VI con precisión N64.
+- Comparación precisa del color, escala y posición del humo con una referencia.
+- Defectos restantes de HUD, transparencias, reflejos y microcódigo L3DEX/0x08.
+- Combiner/blender, Z/coverage, subpíxeles, dither y campos VI con precisión N64.
 - Escucha/comparación prolongada de música/efectos; prioridad actual: gráficos.
 - Cobertura de comandos RSP y formatos fuera de las escenas comprobadas.
 - Circuitos, modalidades, guardados y estabilidad fuera de la ruta automatizada.
