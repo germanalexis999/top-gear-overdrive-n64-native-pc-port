@@ -597,7 +597,7 @@ public:
     void send_dl(const OSTask* task) override {
         uint32_t count = dl_count++;
         if (task && task->t.data_ptr) {
-            interpreter.process_display_list(task->t.data_ptr);
+            interpreter.process_display_list(task->t.data_ptr, task->t.ucode_data, task->t.ucode_data_size);
         }
         if (count < 3 && task) {
             std::cout << "[GFX DL #" << count << "] Type: " << task->t.type
@@ -751,7 +751,7 @@ public:
     void send_dl(const OSTask* task) override {
         uint32_t count = dl_count++;
         if (task && task->t.data_ptr) {
-            interpreter.process_display_list(task->t.data_ptr);
+            interpreter.process_display_list(task->t.data_ptr, task->t.ucode_data, task->t.ucode_data_size);
         }
         if (count < 3 && task) {
             std::cout << "[GFX DL #" << count << "] Type: " << task->t.type
@@ -1449,6 +1449,9 @@ int main(int argc, char** argv) {
     std::cout << "[Host] 3D Triangles - Untextured: " << interp.untextured_triangles << "\n";
     std::cout << "[Host] Lighting diagnostics - vertices/light commands/texgen: " << interp.lit_vertices << "/" << interp.light_commands << "/" << interp.texgen_vertices << "\n";
     std::cout << "[Host] Triangles using independent second texture: " << interp.second_texture_triangles << "\n";
+    std::cout << "[Host] L3DEX2 lines/pixels and microcode loads: " << interp.lines_drawn << "/"
+              << interp.line_pixels_written << "/" << interp.microcode_loads << "\n";
+    std::cout << "[Host] Unsupported microcode loads: " << interp.microcode_load_failures << "\n";
     std::cout << "[Host] Raster diagnostics - culled triangles: " << interp.triangles_culled
               << ", depth-rejected pixels: " << interp.pixels_depth_rejected
               << ", invalid-texel pixels: " << interp.pixels_texel_invalid

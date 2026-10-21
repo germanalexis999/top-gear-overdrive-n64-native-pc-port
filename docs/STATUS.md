@@ -1,10 +1,13 @@
 # Estado del port — 2026-10-21
 
-Última revisión: recuperados velocidad, marcha, posición de carrera y título del
-showroom al respetar los controles de profundidad. Rectángulos y triángulos
-comparten combinador/blender, las partículas respetan Z primitivo y se filtran
-con tres muestras. Continúa la comprobación visual del humo (color/escala/posición)
-y de la fidelidad RDP/VI. El usuario confirma mejora musical; el foco es gráficos.
+El usuario confirma que el HUD quedó bien y el humo quedó arreglado en los casos
+probados con preview.4. También mantiene la mejora musical. Se cierra ese síntoma;
+esto no equivale a paridad completa con consola.
+
+Última revisión: selección de F3DEX2/L3DEX2 desde cada tarea y LOAD_UCODE,
+dibujado de LINE3D con color, ancho, recorte, mezcla y profundidad. Antes se
+descartaban miles de comandos de líneas durante la carrera. Continúa la revisión
+de fidelidad RDP/VI y escenas fuera del recorrido comprobado.
 Evidencia y límites en
 [DIAGNOSTICS-2026-10-21.md](DIAGNOSTICS-2026-10-21.md).
 
@@ -17,6 +20,7 @@ No contiene ROM ni datos extraídos. El selector carga una ROM local y verifica
 USA v0; `.z64`, `.v64` y `.n64` se normalizan solo en memoria.
 El paquete preview.4 incorpora esta revisión de HUD y partículas; preview.3
 contiene la recuperación inicial del showroom y los materiales del coche.
+Preview.5 añade el manejo de líneas L3DEX2 y los cambios de microcódigo.
 `tools/release_windows.ps1` permite repetir compilación, pruebas y empaquetado,
 y publicar opcionalmente con `-Publish`. No hay publicación automática por push.
 
@@ -43,11 +47,21 @@ entra a carrera con una ROM USA v0 local. No se declara paridad completa con N64
   intensidad. Rectángulos 2D comparten el muestreador y respetan filas impares.
 - Presentación: modo VI entrelazado del showroom, tamaño RGB dinámico,
   sincronización del repintado y capturas de cuadros presentados.
+- HUD/humo: controles Z_CMP/Z_UPD, profundidad primitiva, combinador compartido,
+  blender y filtro de tres muestras. Confirmación visual del usuario.
+- Líneas: cambio de microcódigo F3DEX2/L3DEX2 2.05, LINE3D y bordes de TRI1/TRI2
+  bajo L3DEX2. Cada nueva tarea vuelve a seleccionar su microcódigo.
 - Generación: las esperas cooperativas se aplican desde un script versionado.
   EEPROM read/write se identifican mediante símbolos; no requieren editar el C
   generado ni cambiar la función de lectura de mandos del runtime.
 
 ## Evidencia local
+
+La revisión L3DEX2 pasó la batería sin ROM y un recorrido de gráficos de 60 s:
+786 cambios de microcódigo, 5278 segmentos aceptados, 4554 píxeles de línea,
+cero comandos desconocidos y cero cargas de microcódigo sin reconocer. La carrera
+siguió activa, 4/4 catálogos y EEPROM verificados, sin descartes/reemplazos de
+audio; 6 transiciones observadas a dispositivo vacío. Es un recorrido parcial.
 
 Después de regenerar desde la ROM y compilar: prueba automatizada de 16 segundos,
 Modo 2 activo hasta el final, 4/4 catálogos verificados, EEPROM de 2048 bytes.
@@ -61,14 +75,16 @@ de 16 s de ese binario terminó con código 0, carrera activa, 4/4 catálogos y
 EEPROM verificada: 549 bloques de audio, 547 completados, 2 en vuelo, 470 con
 señal y cero descartes/reemplazos.
 
-`tgod_regression_checks` verifica, sin ROM, el dibujo de dos filas de textura,
-PUSH/POP de matrices, aislamiento del viewport respecto a cargas de luces y
-eliminación de nodos intermedios/finales/ausentes en colas de hilos.
+`tgod_regression_checks` verifica sin ROM texturas/filtrado/LOD, HUD/combinador,
+blender/alfa, controles Z, matrices/viewport, luces/reflejos, VI y colas de hilos.
+Incluye selección y cambios de microcódigo, anchos y colores de líneas, recorte
+cerca de cámara, scissor, profundidad, índices inválidos y vuelta a F3DEX2.
 
 ## Pendientes
 
-- Comparación precisa del color, escala y posición del humo con una referencia.
-- Defectos restantes de HUD, transparencias, reflejos y microcódigo L3DEX/0x08.
+- Revisar transparencias, reflejos y geometría en otras escenas y circuitos.
+- Antialias/coverage y extremos de líneas con fidelidad al RDP; el trazado actual
+  evalúa el centro del píxel y aproxima el ancho en pantalla.
 - Combiner/blender, Z/coverage, subpíxeles, dither y campos VI con precisión N64.
 - Escucha/comparación prolongada de música/efectos; prioridad actual: gráficos.
 - Cobertura de comandos RSP y formatos fuera de las escenas comprobadas.

@@ -88,6 +88,12 @@ public:
 
     uint32_t rects_drawn = 0;
     uint32_t triangles_drawn = 0;
+    uint64_t lines_drawn = 0;
+    uint64_t line_pixels_written = 0;
+    uint64_t microcode_loads = 0;
+    uint64_t microcode_load_failures = 0;
+    enum class Microcode { F3DEX2, L3DEX2, Unknown };
+    Microcode microcode = Microcode::F3DEX2;
     uint64_t triangles_culled = 0;
     uint64_t pixels_depth_rejected = 0;
     uint64_t pixels_texel_invalid = 0;
@@ -138,9 +144,12 @@ public:
         uint16_t destination, int32_t x, int32_t y, uint16_t& pixel) const;
     void rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
     void rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
+    void rasterize_line(const Vertex3D& v0, const Vertex3D& v1, int8_t width,
+        const Vertex3D& flat_color);
+    bool load_microcode(uint32_t data_address, uint32_t data_size);
 
     F3DEX2Interpreter(uint8_t* rdram_in = nullptr);
     void reset();
     uint32_t resolve_segmented_address(uint32_t addr) const;
-    void process_display_list(uint32_t dl_addr);
+    void process_display_list(uint32_t dl_addr, uint32_t ucode_data = 0, uint32_t ucode_size = 0);
 };

@@ -24,8 +24,11 @@ Controles:
   Tambien se detectan mandos XInput.
 
 Esta version recupera numeros del HUD y el titulo del showroom, y corrige
-mezcla, profundidad y filtrado de particulas. Estado experimental: continua la
-comparacion del humo y la fidelidad RDP/VI. No es una version final.
+mezcla, profundidad y filtrado de particulas. HUD y humo confirmados como
+corregidos en las pruebas del usuario. Sigue la revision de fidelidad RDP/VI
+y de otros circuitos y modos. No es una version final.
+Incluye dibujo de lineas L3DEX2 y cambios de microcodigo. El antialias y los
+extremos de esas lineas todavia son aproximados.
 
 Codigo, instrucciones y versiones:
 https://github.com/germanalexis999/top-gear-overdrive-n64-native-pc-port

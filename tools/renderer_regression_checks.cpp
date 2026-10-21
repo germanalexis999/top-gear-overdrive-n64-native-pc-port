@@ -443,6 +443,98 @@ static void check_hud_combiner_and_depth(uint8_t* ram) {
         "Alpha threshold uses final alpha instead of first-cycle alpha");
 }
 
+static void check_line_microcode(uint8_t* ram) {
+    F3DEX2Interpreter r(ram);
+    auto signature = [&](uint32_t address,const char* text) {
+        for (size_t i=0; i<=std::strlen(text); ++i) ram[(address+0x138+i)^3]=uint8_t(text[i]);
+    };
+    signature(0x6000,"RSP Gfx ucode L3DEX       fifo 2.05 test");
+    signature(0x6800,"RSP Gfx ucode F3DEX       fifo 2.05 test");
+    require(r.load_microcode(0x80006000,0x800) && r.microcode==F3DEX2Interpreter::Microcode::L3DEX2,
+        "L3DEX2 2.05 identifier is not read in N64 byte order");
+    require(!r.load_microcode(0x7FFFF8,0x800) && r.microcode==F3DEX2Interpreter::Microcode::Unknown,
+        "Out-of-range microcode data accepted");
+    require(!r.load_microcode(0x6000,8),"Truncated microcode identifier accepted");
+    signature(0x7000,"RSP Gfx ucode L3DEX       fifo 1.23 test");
+    require(!r.load_microcode(0x7000,0x800),"Unsupported microcode ABI accepted as L3DEX2");
+    commands(r,{{0xE1000000,0x6000},{0xDD0007FF,0x1000}});
+    require(r.microcode==F3DEX2Interpreter::Microcode::L3DEX2 && r.microcode_loads==1,
+        "LOAD_UCODE ignores the RDPHALF_1 data address");
+    r.color_image_addr=0x20000; r.depth_image_addr=0x50000;
+    auto clear = [&] {std::memset(ram+r.color_image_addr,0,320*240*2);};
+    auto pixel = [&](int x,int y) {
+        uint16_t p;std::memcpy(&p,ram+r.color_image_addr+(y*320+x)*2,2);return p;
+    };
+    auto depth = [&](uint16_t value) {
+        for (int i=0;i<320*240;++i) std::memcpy(ram+r.depth_image_addr+i*2,&value,2);
+    };
+    auto& a=r.vertex_buffer[0];auto& b=r.vertex_buffer[1];
+    a.is_screen_space=b.is_screen_space=true;
+    a.screen_x=4;a.screen_y=10;a.screen_z=100;a.r=255;a.g=a.b=0;a.a=128;
+    b=a;b.screen_x=16;b.r=0;b.g=255;
+    r.geometry_mode=0x604; // Culling flags must not hide lines.
+    clear();commands(r,{{0x08000201,0}});
+    require(pixel(8,10)==0xF801 && r.lines_drawn==1 && r.line_pixels_written==24,
+        "LINE3D indices, width, flat color, culling or stale texture handling is wrong");
+    clear();commands(r,{{0x08000205,0}});
+    require(pixel(8,8)==0xF801 && pixel(8,11)==0xF801 && pixel(8,12)==0,
+        "Line width is not 1.5 + width/2 pixels");
+    clear();r.other_mode_l=0x00404000;
+    commands(r,{{0x08000201,0}});
+    require(pixel(8,10)==0x8001,"Line blending repeats pixels or ignores shade alpha");
+    r.other_mode_l=0;r.geometry_mode=0x200004;
+    clear();commands(r,{{0x08000201,0}});
+    require((pixel(14,10)&0x7C0)>(pixel(5,10)&0x7C0),"Smooth line colors are not interpolated");
+    r.geometry_mode=5;r.other_mode_l=0x10;depth(3000);clear();
+    commands(r,{{0x08000201,0}});
+    require(pixel(8,10)==0,"Occluded line ignores Z_CMP");
+    r.other_mode_l=0x20;clear();commands(r,{{0x08000201,0}});
+    uint16_t z;std::memcpy(&z,ram+r.depth_image_addr+(10*320+8)*2,2);
+    require(z==3200,"Line ignores Z_UPD");
+    r.other_mode_l=0x14;r.primitive_depth=2000;depth(3000);clear();
+    commands(r,{{0x08000201,0}});
+    std::memcpy(&z,ram+r.depth_image_addr+(10*320+8)*2,2);
+    require(pixel(8,10)==0xF801 && z==3000,"Line primitive Z or read-only depth is wrong");
+    r.other_mode_l=0;r.geometry_mode=4;r.scissor_xh=8;r.scissor_xl=12;clear();
+    commands(r,{{0x08000201,0}});
+    require(pixel(7,10)==0 && pixel(8,10)==0xF801 && pixel(12,10)==0,"Line escapes the scissor");
+    r.scissor_xh=0;r.scissor_xl=320;
+    const auto count=r.lines_drawn;
+    commands(r,{{0x08800201,0},{0x080002FD,0}});
+    require(r.lines_drawn==count,"Invalid line index or nonpositive signed width draws pixels");
+    a.is_screen_space=b.is_screen_space=false;
+    a.clip_x=-0.5f;b.clip_x=0.5f;a.clip_y=b.clip_y=0;
+    a.clip_z=-2;b.clip_z=0;a.clip_w=b.clip_w=1;
+    clear();commands(r,{{0x08000201,0}});
+    require(pixel(140,120)==0 && pixel(180,120)==0xF801,
+        "Line crossing the near plane is dropped or not clipped");
+    a.is_screen_space=b.is_screen_space=true;
+    r.vertex_buffer[2]=b;r.vertex_buffer[2].screen_y=20;
+    const auto triangles=r.triangles_drawn;
+    const auto lines=r.lines_drawn;
+    commands(r,{{0x05000204,0},{0x06000204,0x00000204}});
+    require(r.triangles_drawn==triangles && r.lines_drawn==lines+9,
+        "L3DEX2 triangle commands render filled polygons instead of edges");
+    // The next OSTask must select its own microcode even if the last DL left lines active.
+    commands(r,{});
+    r.process_display_list(0x100,0x6800,0x800);
+    require(r.microcode==F3DEX2Interpreter::Microcode::F3DEX2,"Task does not restore F3DEX2 dispatch");
+    commands(r,{{0xE1000000,0x6000},{0xDD0007FF,0},{0xE1000000,0x6800},{0xDD0007FF,0}});
+    require(r.microcode==F3DEX2Interpreter::Microcode::F3DEX2,"In-list switch back to F3DEX2 failed");
+    const auto after=r.lines_drawn;
+    commands(r,{{0x08000201,0}});
+    require(r.lines_drawn==after,"LINE3D leaks into the F3DEX2 triangle microcode");
+    commands(r,{{0x05000204,0}});
+    require(r.triangles_drawn>triangles,"F3DEX2 triangles remain disabled after switching back");
+    // Loading from a child list discards the link back to the parent.
+    const uint32_t child[] = {0xE1000000,0x6000,0xDD0007FF,0,0xDF000000,0};
+    std::memcpy(ram+0x200,child,sizeof(child));
+    r.env_color=0x12345678;r.tmem[0]=42;r.geometry_mode=0xFFFFFF;
+    commands(r,{{0xDE000000,0x200},{0xFB000000,0xFFFFFFFF}});
+    require(r.env_color==0x12345678 && r.tmem[0]==42 && r.geometry_mode==0 && r.dl_stack_depth==0,
+        "LOAD_UCODE returns to an invalid parent link or erases RDP/TMEM state");
+}
+
 static void check_lighting(uint8_t* ram) {
     F3DEX2Interpreter r(ram);
     auto byte = [&](uint32_t address, uint8_t value) { ram[address ^ 3] = value; };
@@ -505,7 +597,8 @@ int main() {
         check_filtered_particles(ram.data());
         check_hud_combiner_and_depth(ram.data());
         check_lighting(ram.data());
-        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting and texgen\n";
+        check_line_microcode(ram.data());
+        std::cout << "PASS: ROM byte orders, texture rows/filtering/LOD/formats, HUD combiners, blender/alpha, depth controls, screen-coordinate edits, VI scanout, matrices, thread queues, lighting, texgen and L3DEX2 lines/switches\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

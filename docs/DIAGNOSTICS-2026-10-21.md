@@ -200,12 +200,79 @@ el backend de audio en esta iteración.
 capturas de frenado, derrape y continuación en el directorio del EXE. No cambia
 la conducción normal ni la navegación headless sin ese parámetro.
 
-Quedan la comparación visual precisa del color/escala/posición del humo,
-coverage subpíxel, Z comprimido/delta/decal, el desbordamiento del blender,
+Actualización tras la prueba del usuario: confirma el HUD y el humo corregidos
+en los casos observados. Se cierra el síntoma de color/escala/posición del humo.
+Quedan coverage subpíxel, Z comprimido/delta/decal, el desbordamiento del blender,
 noise/dither de hardware y los detalles de posicionamiento subpíxel de rectángulos.
 Las trazas temporales detectaron también cambio de microcódigo a L3DEX y opcode
-0x08 sin implementar; su efecto concreto no se atribuyó al humo y sigue abierto.
+0x08 sin implementar; su efecto concreto no se atribuyó al humo. La siguiente
+sección documenta la corrección de esa ruta.
 Las trazas privadas y capturas no se publican con el código ni el ZIP.
+
+## Líneas y cambios de microcódigo F3DEX2/L3DEX2
+
+### Evidencia y causa
+
+La prueba previa de 30 s registraba miles de opcode 0x08 ignorados y cambios
+0xDD que tampoco se interpretaron. Una traza privada identificó un LOAD_UCODE
+con texto físico `0x505E0`, datos `0x5EF00` y tamaño `0x800`; la vuelta usa
+`0x4F250`/`0x5EAE0`. Los identificadores son `RSP Gfx ucode L3DEX ... fifo 2.05`
+y `F3DEX ... fifo 2.05`: el nombre no lleva el sufijo «2», pero el ABI es 2.x.
+La referencia RT64 local deja LINE3D como TODO/assert; copiar esa ruta no lo
+resolvía. Se contrastaron los formatos con la implementación primaria de
+[L3DEX2 en GLideN64](https://github.com/gonetz/GLideN64/blob/master/src/uCodes/L3DEX2.cpp)
+y el ancho con su
+[gSPLine3D](https://github.com/gonetz/GLideN64/blob/master/src/gSP.cpp).
+
+Los primeros comandos, como `08000201/00000000`, unen los vértices 0 y 1 con
+ancho 2 píxeles. Sus segmentos son pequeños y próximos al vehículo en la
+secuencia observada; se comprobó que faltaba su dibujo, sin atribuirles un
+efecto concreto del juego ni confundirlos con el humo ya confirmado.
+
+### Corrección
+
+- Selección por identificador en memoria N64, con lectura de bytes y límites
+  de RDRAM; no se incorporan binarios de microcódigo ni direcciones fijas al código.
+- Cada OSTask proporciona su dirección/tamaño de datos. LOAD_UCODE usa la dirección
+  física de RDPHALF_1, cambia el despacho y descarta los enlaces de retorno del DL.
+  Mantiene TMEM y estado RDP. Se diagnostican microcódigos no reconocidos.
+- LINE3D decodifica índices duplicados y ancho firmado `1.5 + wd/2`.
+  Ignora culling de polígonos y texturas residuales; usa shade plano/suave,
+  combinador, blender y Z_CMP/Z_UPD/Z primitivo. Bajo L3DEX2, TRI1/TRI2 dibujan bordes.
+- Recorte del segmento antes de dividir por W, scissor y límites de framebuffer.
+  Cada píxel se procesa una vez para evitar doble mezcla en una diagonal interna.
+
+La semántica de ancho, estado y profundidad también se contrastó con los manuales
+primarios de
+[gSPLine3D](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gsp/gSPLine3D.html)
+y [gSPLoadUcode](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gsp/gSPLoadUcode.html).
+La implementación software es propia; no se incorporan archivos de GLideN64.
+
+### Comprobaciones y límites
+
+Las pruebas sin ROM verifican identificadores, memoria truncada/fuera de rango,
+LOAD_UCODE y regreso a F3DEX2, TRI1/TRI2 de líneas, color plano/suave, ancho,
+mezcla sin doble escritura, scissor, recorte cerca de cámara, índices inválidos,
+ancho no positivo, profundidad primitiva y comparación/escritura Z independientes.
+
+En la primera ejecución corregida de 30 s: 300 cambios, 2224 segmentos aceptados
+para rasterización y 1098 píxeles de línea escritos. Carrera activa hasta el final,
+4/4 catálogos, EEPROM de 2048 bytes, cero overruns/descartes/reemplazos de audio y
+6 transiciones a dispositivo vacío. No se registraron comandos desconocidos.
+Las capturas conservan los elementos recuperados del HUD y partículas.
+
+La ejecución final del binario de 60 s mantuvo carrera activa y verificó 4/4
+catálogos y EEPROM de 2048 bytes. Registró 786 cambios, 5278 segmentos aceptados
+y 4554 píxeles de línea; cero comandos desconocidos y cero microcódigos sin
+reconocer. Audio: cero overruns/descartes/reemplazos y 6 transiciones observadas
+a dispositivo vacío. La batería sin ROM también pasó después de añadir casos
+de retorno al microcódigo de triángulos y LOAD_UCODE dentro de un DL hijo.
+
+El trazado de líneas usa centros de píxel y extremos rectos: no reproduce la
+cobertura/antialias subpíxel ni todos los detalles del trapezoide RDP. Esta revisión
+no implica fidelidad completa de líneas ni validación de todos los circuitos.
+Esta corrección se incorpora al paquete preview.5; la descarga preview.4
+conserva el renderer anterior sin soporte de líneas L3DEX2.
 
 ## Distribución
 

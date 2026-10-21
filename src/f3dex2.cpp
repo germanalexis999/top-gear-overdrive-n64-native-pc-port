@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <iomanip>
+#include <string>
 
 static inline uint16_t f3d_read_u16(const uint8_t* rdram, uint32_t addr) {
     return *reinterpret_cast<const uint16_t*>(rdram + ((addr & 0x00FFFFFF) ^ 2));
@@ -96,6 +97,8 @@ void F3DEX2Interpreter::reset() {
     dl_stack_depth = 0;
     rects_drawn = 0;
     triangles_drawn = 0;
+    lines_drawn = line_pixels_written = microcode_loads = microcode_load_failures = 0;
+    microcode = Microcode::F3DEX2;
     triangles_culled = 0;
     pixels_depth_rejected = 0;
     pixels_texel_invalid = 0;
@@ -852,8 +855,128 @@ uint32_t F3DEX2Interpreter::resolve_segmented_address(uint32_t addr) const {
     return ((base + offset) & 0x01FFFFFF);
 }
 
-void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
+bool F3DEX2Interpreter::load_microcode(uint32_t data_address, uint32_t data_size) {
+    // Microcode addresses are physical/KSEG addresses, not segment-table entries.
+    const uint32_t address = data_address & 0x1FFFFFFF;
+    microcode = Microcode::Unknown;
+    auto unsupported = [&] {
+        if (microcode_load_failures++ == 0)
+            std::cout << "[RSP] Unsupported microcode data at 0x" << std::hex << address
+                      << " (size 0x" << data_size << ")" << std::dec << '\n';
+        return false;
+    };
+    if (!rdram || !data_size || data_size > 4096 ||
+        uint64_t(address) + data_size > 8 * 1024 * 1024) return unsupported();
+    std::string data(data_size, '\0');
+    for (uint32_t i = 0; i < data_size; ++i) data[i] = char(f3d_read_u8(rdram, address+i));
+    const size_t signature = data.find("RSP Gfx ucode ");
+    if (signature == std::string::npos) return unsupported();
+    const std::string version = data.substr(signature, data.find('\0', signature)-signature);
+    // The game's 2.05 identifiers say F3DEX/L3DEX without the trailing "2".
+    if (version.find("fifo 2.") == std::string::npos) return unsupported();
+    if (version.starts_with("RSP Gfx ucode F3DEX")) microcode = Microcode::F3DEX2;
+    else if (version.starts_with("RSP Gfx ucode L3DEX")) microcode = Microcode::L3DEX2;
+    if (microcode == Microcode::Unknown) return unsupported();
+    return true;
+}
+
+void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
+    int8_t width, const Vertex3D& flat_color) {
+    const float thickness = 1.5f + float(width)*0.5f;
+    if (!rdram || color_image_size != 2 || !color_image_width || thickness <= 0) return;
+    Vertex3D a = v0, b = v1;
+    if (!a.is_screen_space && !b.is_screen_space) {
+        // Clip the center segment before the perspective divide, including lines
+        // crossing the near plane. A clipped endpoint alone must not drop a line.
+        auto distance = [](const Vertex3D& v, int plane) {
+            switch (plane) {
+            case 0: return v.clip_w + v.clip_x;
+            case 1: return v.clip_w - v.clip_x;
+            case 2: return v.clip_w + v.clip_y;
+            case 3: return v.clip_w - v.clip_y;
+            case 4: return v.clip_w + v.clip_z;
+            default: return v.clip_w - v.clip_z;
+            }
+        };
+        auto interpolate = [](const Vertex3D& x, const Vertex3D& y, float t) {
+            Vertex3D v = x;
+            auto mix = [t](float p, float q) { return p+(q-p)*t; };
+            v.clip_x = mix(x.clip_x,y.clip_x); v.clip_y = mix(x.clip_y,y.clip_y);
+            v.clip_z = mix(x.clip_z,y.clip_z); v.clip_w = mix(x.clip_w,y.clip_w);
+            v.r = uint8_t(std::clamp(std::lround(mix(x.r,y.r)),0l,255l));
+            v.g = uint8_t(std::clamp(std::lround(mix(x.g,y.g)),0l,255l));
+            v.b = uint8_t(std::clamp(std::lround(mix(x.b,y.b)),0l,255l));
+            v.a = uint8_t(std::clamp(std::lround(mix(x.a,y.a)),0l,255l));
+            return v;
+        };
+        for (int plane=0; plane<6; ++plane) {
+            const float da = distance(a,plane), db = distance(b,plane);
+            if (!std::isfinite(da) || !std::isfinite(db) || (da<0 && db<0)) return;
+            if ((da<0) != (db<0)) {
+                Vertex3D intersection = interpolate(a,b,da/(da-db));
+                if (da<0) a=intersection; else b=intersection;
+            }
+        }
+        for (Vertex3D* v : {&a,&b}) {
+            if (v->clip_w <= 1e-7f) return;
+            v->screen_x = v->clip_x/v->clip_w*viewport_scale[0]/4.0f+viewport_trans[0]/4.0f;
+            v->screen_y = -v->clip_y/v->clip_w*viewport_scale[1]/4.0f+viewport_trans[1]/4.0f;
+            v->screen_z = v->clip_z/v->clip_w*viewport_scale[2]+viewport_trans[2];
+        }
+    }
+    const float dx = b.screen_x-a.screen_x, dy = b.screen_y-a.screen_y;
+    const float length_squared = dx*dx+dy*dy;
+    if (!std::isfinite(length_squared) || length_squared < 1e-8f ||
+        !std::isfinite(a.screen_z) || !std::isfinite(b.screen_z)) return;
+    const float length = std::sqrt(length_squared), radius = thickness*0.5f;
+    const uint64_t available_pixels = (8*1024*1024-std::min(color_image_addr,8u*1024*1024))/2;
+    const int height = int(available_pixels/color_image_width);
+    const float left = std::max({0.0f,float(scissor_xh),std::min(a.screen_x,b.screen_x)-radius});
+    const float right = std::min({float(color_image_width),float(scissor_xl),std::max(a.screen_x,b.screen_x)+radius});
+    const float top = std::max({0.0f,float(scissor_yh),std::min(a.screen_y,b.screen_y)-radius});
+    const float bottom = std::min({float(height),float(scissor_yl),std::max(a.screen_y,b.screen_y)+radius});
+    if (left>=right || top>=bottom) return;
+    ++lines_drawn;
+    const bool has_depth = (geometry_mode&1) && depth_image_addr &&
+        uint64_t(depth_image_addr)+uint64_t(color_image_width)*int(std::ceil(bottom))*2 <= 8*1024*1024;
+    const uint8_t white[4] = {255,255,255,255};
+    for (int y=int(std::floor(top)); y<int(std::ceil(bottom)); ++y) {
+        auto* row = reinterpret_cast<uint16_t*>(rdram+color_image_addr+uint64_t(y)*color_image_width*2);
+        auto* depth = has_depth ? reinterpret_cast<uint16_t*>(rdram+depth_image_addr+uint64_t(y)*color_image_width*2) : nullptr;
+        for (int x=int(std::floor(left)); x<int(std::ceil(right)); ++x) {
+            const float px=x+0.5f-a.screen_x, py=y+0.5f-a.screen_y;
+            const float t=(px*dx+py*dy)/length_squared;
+            // Butt caps; evaluate each pixel once, avoiding a blended quad seam.
+            if (t<0 || t>=1 || std::abs(px*dy-py*dx)>=radius*length) continue;
+            const float z = a.screen_z+(b.screen_z-a.screen_z)*t;
+            const uint16_t z_value = (other_mode_l&4) ? (primitive_depth&0x7FFF) :
+                uint16_t(std::clamp(z*32.0f,0.0f,65532.0f));
+            if (depth && (other_mode_l&0x10) && z_value>depth[x]) {
+                ++pixels_depth_rejected; continue;
+            }
+            uint8_t shade[4]{};
+            const uint8_t ca[4] = {a.r,a.g,a.b,a.a}, cb[4] = {b.r,b.g,b.b,b.a};
+            const uint8_t flat[4] = {flat_color.r,flat_color.g,flat_color.b,flat_color.a};
+            for (int channel=0; channel<4; ++channel) {
+                shade[channel] = !(geometry_mode&4) ? uint8_t(prim_color>>(24-channel*8)) :
+                    !(geometry_mode&0x200000) ? flat[channel] :
+                    uint8_t(std::clamp(ca[channel]+(cb[channel]-ca[channel])*t,0.0f,255.0f));
+            }
+            uint8_t color[4]{};
+            const uint8_t alpha = combine_colors(white,white,shade,255,color);
+            uint16_t pixel;
+            if (!blend_colors(color,shade[3],alpha,row[x],x,y,pixel)) continue;
+            row[x]=pixel;
+            if (depth && (other_mode_l&0x20)) depth[x]=z_value;
+            ++pixels_written; ++line_pixels_written;
+        }
+    }
+}
+
+void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_data, uint32_t ucode_size) {
     if (!rdram) return;
+    dl_stack_depth = 0;
+    if (ucode_size) load_microcode(ucode_data, ucode_size);
     uint32_t pc = resolve_segmented_address(dl_addr);
 
     // Limit instruction count per display list to prevent infinite loops
@@ -868,6 +991,20 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
         opcode_counts[op]++;
 
         switch (op) {
+            case 0xDD: { // G_LOAD_UCODE; E1 supplies the physical data address.
+                ++microcode_loads;
+                load_microcode(rdp_half_1,(w0&0xFFFF)+1);
+                // LOAD_UCODE discards the old display-list return links and RSP mode.
+                dl_stack_depth = modelview_stack_depth = 0;
+                geometry_mode = 0;
+                break;
+            }
+            case 0x08: { // L3DEX2 G_LINE3D: two doubled indices and signed width.
+                const uint32_t a=(w0>>17)&0x7F, b=(w0>>9)&0x7F;
+                if (microcode == Microcode::L3DEX2 && a<64 && b<64)
+                    rasterize_line(vertex_buffer[a],vertex_buffer[b],int8_t(w0),vertex_buffer[a]);
+                break;
+            }
             case 0xE2: // G_SETOTHERMODE_L
             case 0xE3: { // G_SETOTHERMODE_H
                 const uint32_t shift = (w0 >> 8) & 0xFF;
@@ -1061,7 +1198,14 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 uint32_t v1 = (w0 >> 9) & 0x7F;
                 uint32_t v2 = (w0 >> 1) & 0x7F;
                 if (v0 < 64 && v1 < 64 && v2 < 64) {
-                    rasterize_triangle(vertex_buffer[v0], vertex_buffer[v1], vertex_buffer[v2]);
+                    if (microcode == Microcode::L3DEX2) {
+                        const int8_t width = int8_t(w1>>24);
+                        if (v0!=v1) rasterize_line(vertex_buffer[v0],vertex_buffer[v1],width,vertex_buffer[v0]);
+                        if (v1!=v2) rasterize_line(vertex_buffer[v1],vertex_buffer[v2],width,vertex_buffer[v0]);
+                        if (v2!=v0) rasterize_line(vertex_buffer[v2],vertex_buffer[v0],width,vertex_buffer[v0]);
+                    } else if (microcode == Microcode::F3DEX2) {
+                        rasterize_triangle(vertex_buffer[v0], vertex_buffer[v1], vertex_buffer[v2]);
+                    }
                 }
                 break;
             }
@@ -1072,12 +1216,18 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr) {
                 uint32_t v10 = (w1 >> 17) & 0x7F;
                 uint32_t v11 = (w1 >> 9) & 0x7F;
                 uint32_t v12 = (w1 >> 1) & 0x7F;
-                if (v00 < 64 && v01 < 64 && v02 < 64) {
-                    rasterize_triangle(vertex_buffer[v00], vertex_buffer[v01], vertex_buffer[v02]);
-                }
-                if (v10 < 64 && v11 < 64 && v12 < 64) {
-                    rasterize_triangle(vertex_buffer[v10], vertex_buffer[v11], vertex_buffer[v12]);
-                }
+                auto draw = [&](uint32_t a,uint32_t b,uint32_t c) {
+                    if (a>=64 || b>=64 || c>=64) return;
+                    if (microcode == Microcode::L3DEX2) {
+                        const int8_t width = int8_t(w1>>24);
+                        if (a!=b) rasterize_line(vertex_buffer[a],vertex_buffer[b],width,vertex_buffer[a]);
+                        if (b!=c) rasterize_line(vertex_buffer[b],vertex_buffer[c],width,vertex_buffer[a]);
+                        if (c!=a) rasterize_line(vertex_buffer[c],vertex_buffer[a],width,vertex_buffer[a]);
+                    } else if (microcode == Microcode::F3DEX2) {
+                        rasterize_triangle(vertex_buffer[a],vertex_buffer[b],vertex_buffer[c]);
+                    }
+                };
+                draw(v00,v01,v02); draw(v10,v11,v12);
                 break;
             }
             case 0xD9: { // G_GEOMETRYMODE
