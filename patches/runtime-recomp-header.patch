@@ -1,0 +1,14 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..811bbf9 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -468,6 +468,9 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
+ 
+ void pause_self(uint8_t *rdram);
+ 
++void yield_self(uint8_t *rdram);
++void yield_self_1ms(uint8_t *rdram);
++
+ #ifdef __cplusplus
+ }
+ #endif

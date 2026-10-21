@@ -1,0 +1,192 @@
+diff --git a/librecomp/include/librecomp/game.hpp b/librecomp/include/librecomp/game.hpp
+index a4cf7e8..f78db89 100644
+--- a/librecomp/include/librecomp/game.hpp
++++ b/librecomp/include/librecomp/game.hpp
+@@ -127,6 +127,7 @@ namespace recomp {
+     void start(const Configuration& cfg);
+ 
+     SaveType get_save_type();
++    void set_save_type(SaveType type);
+     bool eeprom_allowed();
+     bool sram_allowed();
+     bool flashram_allowed();
+diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
+index 0195f2b..f4d1015 100644
+--- a/librecomp/src/ai.cpp
++++ b/librecomp/src/ai.cpp
+@@ -25,5 +25,8 @@ extern "C" void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
+ }
+ 
+ extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    ctx->r2 = 0x00000000; // Pretend the audio DMAs finish instantly
++    // AI_STATUS_FIFO_FULL is bit 31. A 32-bit MIPS load sign-extends into
++    // the 64-bit GPR; the game uses BGEZ to decide whether to wait for AI.
++    ctx->r2 = ultramodern::get_ai_buffered_bytes() >= (2 * 0x900)
++        ? S32(0x80000000u) : 0;
+ }
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 850689d..73df549 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -773,6 +773,10 @@ recomp::SaveType recomp::get_save_type() {
+     return save_type;
+ }
+ 
++void recomp::set_save_type(recomp::SaveType type) {
++    save_type = type;
++}
++
+ bool recomp::eeprom_allowed() {
+     return
+         save_type == SaveType::Eep4k || 
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 46aea61..c8737e3 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -101,6 +101,7 @@ bool is_entrypoint_thread();
+ bool is_game_thread();
+ void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
+ void send_si_message();
++void send_ai_message();
+ uint32_t get_speed_multiplier();
+ 
+ // Time
+@@ -121,13 +122,17 @@ void init_audio();
+ void set_audio_frequency(uint32_t freq);
+ void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
+ uint32_t get_remaining_audio_bytes();
++uint32_t get_audio_buffered_bytes();
++uint32_t get_ai_buffered_bytes();
+ 
+ struct audio_callbacks_t {
+     using queue_samples_t = void(int16_t*, size_t);
+     using get_samples_remaining_t = size_t();
++    using get_ai_frames_remaining_t = size_t();
+     using set_frequency_t = void(uint32_t);
+     queue_samples_t* queue_samples;
+     get_samples_remaining_t* get_frames_remaining;
++    get_ai_frames_remaining_t* get_ai_frames_remaining;
+     set_frequency_t* set_frequency;
+ };
+ 
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index 3198be0..6982698 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -43,8 +43,7 @@ float buffer_offset_frames = 0.5f;
+ // If there's ever any audio popping, check here first. Some games are very sensitive to
+ // the remaining sample count and reporting a number that's too high here can lead to issues.
+ // Reporting a number that's too low can lead to audio lag in some games.
+-uint32_t ultramodern::get_remaining_audio_bytes() {
+-    // Get the number of remaining buffered audio bytes.
++uint32_t ultramodern::get_audio_buffered_bytes() {
+     uint32_t buffered_byte_count;
+     if (audio_callbacks.get_frames_remaining != nullptr) {
+         buffered_byte_count = audio_callbacks.get_frames_remaining() * 2 * sizeof(int16_t);
+@@ -52,6 +51,18 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
+     else {
+         buffered_byte_count = 100;
+     }
++    return buffered_byte_count;
++}
++
++uint32_t ultramodern::get_ai_buffered_bytes() {
++    if (audio_callbacks.get_ai_frames_remaining != nullptr) {
++        return static_cast<uint32_t>(audio_callbacks.get_ai_frames_remaining() * 2 * sizeof(int16_t));
++    }
++    return get_audio_buffered_bytes();
++}
++
++uint32_t ultramodern::get_remaining_audio_bytes() {
++    uint32_t buffered_byte_count = get_audio_buffered_bytes();
+     // Adjust the reported count to be some number of refreshes in the future, which helps ensure that
+     // there are enough samples even if the audio thread experiences a small amount of lag. This prevents
+     // audio popping on games that use the buffered audio byte count to determine how many samples
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 17d7a47..f080499 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -248,10 +248,6 @@ void vi_thread_func() {
+                 }
+                 remaining_retraces = cur_state->retrace_count;
+             }
+-            if (events_context.ai.mq != NULLPTR) {
+-                // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
+-                ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+-            }
+         }
+ 
+         if (events_callbacks.vi_callback != nullptr) {
+@@ -579,6 +575,13 @@ void ultramodern::send_si_message() {
+     ultramodern::enqueue_external_message_src(events_context.si.mq, events_context.si.msg, false, ultramodern::EventMessageSource::Si);
+ }
+ 
++void ultramodern::send_ai_message() {
++    std::lock_guard lock{ events_context.message_mutex };
++    if (events_context.ai.mq != NULLPTR) {
++        ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
++    }
++}
++
+ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {
+     moodycamel::LightweightSemaphore gfx_thread_ready;
+     moodycamel::LightweightSemaphore task_thread_ready;
+diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
+index f9c0fa1..af687d4 100644
+--- a/ultramodern/src/threadqueue.cpp
++++ b/ultramodern/src/threadqueue.cpp
+@@ -43,14 +43,16 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
+ bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
+     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+ 
+-    PTR(PTR(OSThread)) cur = queue_;
+-    while (cur != NULLPTR) {
+-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
++    PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
++    while (*cur_ptr != NULLPTR) {
+         if (*cur_ptr == t_) {
+-            *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
++            OSThread* removed = TO_PTR(OSThread, *cur_ptr);
++            *cur_ptr = removed->next;
++            removed->queue = NULLPTR;
++            removed->next = NULLPTR;
+             return true;
+         }
+-        cur = TO_PTR(OSThread, *cur_ptr)->next;
++        cur_ptr = &TO_PTR(OSThread, *cur_ptr)->next;
+     }
+ 
+     return false;
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..8a6e254 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -165,8 +165,11 @@ void resume_thread(OSThread* t) {
+ }
+ 
+ void run_next_thread(RDRAM_ARG1) {
+-    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+-        throw std::runtime_error("No threads left to run!\n");
++    while (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
++        // All emulated threads may legitimately be waiting for hardware.
++        // Deliver host interrupts until one of their message queues wakes a
++        // thread, preserving the single cooperative execution token.
++        ultramodern::wait_for_external_message(PASS_RDRAM1);
+     }
+ 
+     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+@@ -314,9 +317,11 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+     if (t->priority != pri) {
+         t->priority = pri;
+ 
+-        if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+-            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+-            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
++        if (t_ != ultramodern::this_thread() && t->queue != NULLPTR) {
++            const auto queue = t->queue;
++            if (ultramodern::thread_queue_remove(PASS_RDRAM queue, t_)) {
++                ultramodern::thread_queue_insert(PASS_RDRAM queue, t_);
++            }
+         }
+ 
+         ultramodern::check_running_queue(PASS_RDRAM1);

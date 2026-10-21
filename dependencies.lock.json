@@ -1,0 +1,23 @@
+{
+  "repositories": [
+    {
+      "path": "N64ModernRuntime",
+      "url": "https://github.com/N64Recomp/N64ModernRuntime.git",
+      "commit": "cdf5abbd5026fef5c364c676e4667c45e42b6863",
+      "patch": "n64modernruntime.patch"
+    },
+    {
+      "path": "N64Recomp",
+      "url": "https://github.com/N64Recomp/N64Recomp.git",
+      "commit": "ffb39cdad1da5de07eaaa48bd1db4a89a7986771",
+      "patch": "n64recomp.patch"
+    }
+  ],
+  "nestedPatches": [
+    {
+      "path": "N64ModernRuntime/N64Recomp",
+      "commit": "81213c1831fab2521a6a5459c67b63437d67e253",
+      "patch": "runtime-recomp-header.patch"
+    }
+  ]
+}

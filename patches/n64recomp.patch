@@ -1,0 +1,29 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..b6b733d 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -468,6 +468,11 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
+ 
+ void pause_self(uint8_t *rdram);
+ 
++void yield_self(uint8_t *rdram);
++void yield_self_1ms(uint8_t *rdram);
++
++void tgod_poll_si(uint8_t* rdram, recomp_context* ctx);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..b58b2fd 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -414,6 +414,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     case InstrId::cpu_nop:
+         fmt::print(output_file, "\n");
+         break;
++    case InstrId::cpu_cache:
++        break;
+     // Cop0 (Limited functionality)
+     case InstrId::cpu_mfc0:
+         {

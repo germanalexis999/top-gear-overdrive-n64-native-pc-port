@@ -1,0 +1,123 @@
+#pragma once
+#include <cstdint>
+#include <cstddef>
+
+struct Matrix4x4 {
+    float m[4][4]{};
+    static Matrix4x4 identity();
+    static Matrix4x4 from_n64_fixed(const int16_t* int_part, const uint16_t* frac_part);
+    Matrix4x4 operator*(const Matrix4x4& rhs) const;
+    void transform(float x, float y, float z, float& ox, float& oy, float& oz, float& ow) const;
+};
+
+struct Vertex3D {
+    float x = 0, y = 0, z = 0;
+    float clip_x = 0, clip_y = 0, clip_z = 0, clip_w = 1.0f;
+    float screen_x = 0, screen_y = 0, screen_z = 0;
+    float u = 0, v = 0;
+    uint8_t r = 255, g = 255, b = 255, a = 255;
+    bool clipped = false;
+    bool is_screen_space = false;
+};
+
+class F3DEX2Interpreter {
+public:
+    uint8_t* rdram = nullptr;
+    uint32_t segments[16]{};
+    uint8_t tmem[4096]{};
+
+    // Framebuffer targets
+    uint32_t color_image_addr = 0;
+    uint32_t color_image_width = 320;
+    uint32_t color_image_format = 0;
+    uint32_t color_image_size = 2; // 0=4b, 1=8b, 2=16b, 3=32b
+    uint32_t depth_image_addr = 0;
+    uint32_t geometry_mode = 0;
+
+    // RDP colors
+    uint32_t fill_color = 0;
+    uint32_t env_color = 0xFFFFFFFF;
+    uint32_t prim_color = 0xFFFFFFFF;
+    uint32_t blend_color = 0;
+    uint32_t fog_color = 0;
+    uint32_t combine_mode_w0 = 0;
+    uint32_t combine_mode_w1 = 0;
+    bool combine_mode_set = false;
+    uint32_t combine_mode_updates = 0;
+    uint16_t primitive_depth = 0;
+    uint16_t primitive_depth_delta = 0;
+
+    // Texture image state
+    uint32_t texture_image_addr = 0;
+    uint32_t texture_format = 0;
+    uint32_t texture_size = 2;
+    uint32_t texture_width = 0;
+    uint8_t texture_tile = 0;
+    bool texture_enabled = true;
+    uint32_t texture_scale_s = 0x10000;
+    uint32_t texture_scale_t = 0x10000;
+    uint32_t tlut_tmem_addr = 2048;
+
+    // Tiles (0..7)
+    struct Tile {
+        uint32_t format = 0;
+        uint32_t size = 0;
+        uint32_t line = 0;
+        uint32_t tmem_addr = 0;
+        uint32_t palette = 0;
+        uint32_t clamp_s = 0, mirror_s = 0, mask_s = 0, shift_s = 0;
+        uint32_t clamp_t = 0, mirror_t = 0, mask_t = 0, shift_t = 0;
+        uint32_t uls = 0, ult = 0, lrs = 0, lrt = 0;
+    } tiles[8];
+
+    // Scissor bounds
+    int32_t scissor_xh = 0, scissor_yh = 0;
+    int32_t scissor_xl = 320, scissor_yl = 240;
+
+    // Other modes
+    uint32_t other_mode_h = 0;
+    uint32_t other_mode_l = 0;
+
+    // Call stack for nested DLs
+    static constexpr size_t MAX_DL_STACK = 18;
+    uint32_t dl_stack[MAX_DL_STACK]{};
+    size_t dl_stack_depth = 0;
+
+    uint32_t rects_drawn = 0;
+    uint32_t triangles_drawn = 0;
+    uint64_t triangles_culled = 0;
+    uint64_t pixels_depth_rejected = 0;
+    uint64_t pixels_texel_invalid = 0;
+    uint64_t pixels_written = 0;
+    uint64_t combine_cycle_triangles[4]{};
+    uint32_t untextured_triangles = 0;
+    uint32_t rdp_half_1 = 0;
+    uint32_t rdp_half_2 = 0;
+    uint32_t opcode_counts[256]{};
+    uint32_t fmt_counts[8][4]{};
+
+    // 3D Geometry State
+    static constexpr size_t MAX_MTX_STACK = 32;
+    Matrix4x4 modelview_mtx{};
+    Matrix4x4 proj_mtx{};
+    Matrix4x4 mvp_mtx{};
+    Matrix4x4 modelview_stack[MAX_MTX_STACK]{};
+    size_t modelview_stack_depth = 0;
+    Matrix4x4 proj_stack[4]{};
+    size_t proj_stack_depth = 0;
+
+    int16_t viewport_scale[4] = { 640, 480, 511, 0 };
+    int16_t viewport_trans[4] = { 640, 480, 511, 0 };
+
+    Vertex3D vertex_buffer[64]{};
+
+    void update_mvp();
+    void transform_vertex(Vertex3D& v);
+    void rasterize_triangle(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
+    void rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2);
+
+    F3DEX2Interpreter(uint8_t* rdram_in = nullptr);
+    void reset();
+    uint32_t resolve_segmented_address(uint32_t addr) const;
+    void process_display_list(uint32_t dl_addr);
+};

@@ -1,0 +1,42 @@
+# First code-generation experiment. Symbols are provisional candidates from
+# splat/spimdisasm and cover only the resident entry/main code sections.
+
+[input]
+entrypoint = 0x80000400
+symbols_file_path = "../symbols/topgearoverdrive.us.v0.candidates.toml"
+rom_file_path = "../top_gear_rom/normalized/Top Gear Overdrive (USA).z64"
+output_func_path = "../generated/RecompiledFuncs"
+functions_per_output_file = 50
+
+[patches]
+stubs = [
+    "func_80047030",
+    "func_80049630",
+    "func_80049BA4",
+    "func_80049C94",
+    "func_80049DF4",
+    "func_80049F80",
+    "func_80049F90",
+    "func_8004A010",
+    "func_8004A030",
+    "func_8004A050",
+    "func_8004A0F0",
+    "func_8004A100",
+    "func_8004A110",
+    "func_8004A120",
+    "func_8004A5A0",
+    "func_8004A5C0",
+    "func_8004A600",
+    "func_8004A810",
+    "func_8004A820",
+    "func_8004A840",
+    "func_8004A900",
+    "func_8004A954",
+    "func_8004A9C0",
+    "func_8004CB90",
+    "func_8004F180"
+]
+ignored = [
+    "tgod_poll_si",
+    "func_8004A580"
+]
