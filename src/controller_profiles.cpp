@@ -33,8 +33,19 @@ ControlsConfig default_controls() {
     return config;
 }
 
-static float strength(const Binding& b,const Gamepad& p,const Keys& keys,int deadzone,bool analog) {
+static float strength(const Binding& b,const RawPad& raw,const Keys& keys,int deadzone,bool analog) {
+    const auto& p=raw.pad;
     if(b.kind==BindingKind::Key)return b.code>0 && b.code<256 && keys[b.code] ? 1:0;
+    if(b.kind==BindingKind::RawButton)return b.code>=0 && b.code<raw.button_count && (raw.buttons&(uint64_t(1)<<b.code)) ? 1:0;
+    if(b.kind==BindingKind::Hat)return b.code>0 && (b.code>>4)<raw.hat_count && (raw.hats[b.code>>4]&(b.code&15)) ? 1:0;
+    if(b.kind==BindingKind::RawAxis) {
+        if(!b.code || std::abs(b.code)>raw.axis_count)return 0;
+        const float value=raw.axes[std::abs(b.code)-1],end=b.code<0?-32768.0f:32767.0f;
+        const float range=end-b.center;if(std::abs(range)<1000)return 0;
+        const float v=std::clamp((value-b.center)/range,0.0f,1.0f),dz=deadzone/100.0f;
+        return analog ? std::clamp((v-dz)/(1-dz),0.0f,1.0f):float(v>0.5f);
+    }
+    if(raw.raw_mode && (b.kind==BindingKind::Button || b.kind==BindingKind::Axis))return 0;
     if(b.kind==BindingKind::Button)return (p.buttons&b.code)?1:0;
     if(b.kind!=BindingKind::Axis || !b.code || std::abs(b.code)>6)return 0;
     const int a=std::abs(b.code)-1;
@@ -55,7 +66,7 @@ Snapshot map_controls(const ControlsConfig& config,const RawPads& pads,const Key
         auto& s=out[i];s.connected=connected||c.keyboard;
         std::array<float,action_count> values{};
         for(size_t a=0;a<action_count;++a) {
-            if(connected)for(const auto& b:p.gamepad[a])values[a]=std::max(values[a],strength(b,pads[c.slot].pad,keys,p.deadzone,a>=14));
+            if(connected)for(const auto& b:p.gamepad[a])values[a]=std::max(values[a],strength(b,pads[c.slot],keys,p.deadzone,a>=14));
             if(c.keyboard)for(const auto& b:p.keyboard[a])values[a]=std::max(values[a],strength(b,{},keys,p.deadzone,a>=14));
             if(a<14 && values[a]>0)s.buttons|=masks[a];
         }
@@ -74,10 +85,14 @@ bool valid_controls(const ControlsConfig& config,std::string& error) {
         if(c.keyboard && keyboard){error="El teclado ya pertenece a otro jugador.";return false;}keyboard|=c.keyboard;
         if(c.profile.deadzone<0 || c.profile.deadzone>50 || c.profile.name.empty() || c.profile.name.size()>96) {error="Perfil o zona muerta invalida (0-50%).";return false;}
         for(int device=0;device<2;++device)for(const auto& action:device?c.profile.keyboard:c.profile.gamepad)for(const auto& b:action) {
-            bool valid=b.kind==BindingKind::None && b.code==0;
+            bool valid=b.kind==BindingKind::None && b.code==0 && b.center==0;
             if(device==1 && b.kind==BindingKind::Key) valid=b.code>0 && b.code<256 && b.code!=VK_ESCAPE && !(b.code>=VK_F1 && b.code<=VK_F12);
             if(device==0 && b.kind==BindingKind::Axis)valid=b.code && b.code>=-6 && b.code<=6;
             if(device==0 && b.kind==BindingKind::Button)valid=b.code>0 && !(b.code&(b.code-1)) && !(b.code&~0xF3FF);
+            if(device==0 && b.kind==BindingKind::RawButton)valid=b.code>=0 && b.code<64;
+            if(device==0 && b.kind==BindingKind::RawAxis)valid=b.code && b.code>=-16 && b.code<=16 && b.center>=-32768 && b.center<=32767;
+            if(device==0 && b.kind==BindingKind::Hat)valid=b.code>0 && b.code<64 && ((b.code&15)==1 || (b.code&15)==2 || (b.code&15)==4 || (b.code&15)==8);
+            if(b.kind!=BindingKind::RawAxis && b.center!=0)valid=false;
             if(!valid){error="Asignacion de control invalida.";return false;}
         }
     }
@@ -86,17 +101,21 @@ bool valid_controls(const ControlsConfig& config,std::string& error) {
 
 using json=nlohmann::json;
 static json bindings_json(const Bindings& bindings) {
-    json out=json::array();for(const auto& action:bindings){json row=json::array();for(const auto& b:action)row.push_back({int(b.kind),b.code});out.push_back(row);}return out;
+    json out=json::array();for(const auto& action:bindings){json row=json::array();for(const auto& b:action)row.push_back({int(b.kind),b.code,b.center});out.push_back(row);}return out;
 }
 static Bindings parse_bindings(const json& rows) {
     if(!rows.is_array() || rows.size()!=action_count)throw std::runtime_error("Numero de acciones invalido.");
     Bindings out{};for(size_t a=0;a<action_count;++a) {
         if(!rows[a].is_array() || rows[a].size()!=binding_count)throw std::runtime_error("Numero de bindings invalido.");
         for(size_t b=0;b<binding_count;++b){const auto& item=rows[a][b];
-            if(!item.is_array() || item.size()!=2 || !item[0].is_number_integer() || !item[1].is_number_integer())throw std::runtime_error("Binding invalido.");
+            if(!item.is_array() || (item.size()!=2 && item.size()!=3) || !item[0].is_number_integer() || !item[1].is_number_integer())throw std::runtime_error("Binding invalido.");
             const auto kind=item[0].get<int64_t>(),code=item[1].get<int64_t>();
-            if(kind<0 || kind>3 || code<-65535 || code>65535)throw std::runtime_error("Binding fuera de rango.");
-            out[a][b]={BindingKind(kind),int(code)};
+            if(kind<0 || kind>6 || code<-65535 || code>65535)throw std::runtime_error("Binding fuera de rango.");
+            int center=0;if(item.size()==3) {
+                if(!item[2].is_number_integer())throw std::runtime_error("Centro de eje invalido.");
+                const auto n=item[2].get<int64_t>();if(n<-32768 || n>32767)throw std::runtime_error("Centro de eje fuera de rango.");center=int(n);
+            }
+            out[a][b]={BindingKind(kind),int(code),center};
         }
     }return out;
 }
@@ -104,7 +123,7 @@ bool load_controls(const std::filesystem::path& path,ControlsConfig& out,std::st
     try {
         if(std::filesystem::file_size(path)>256*1024)throw std::runtime_error("controls.json demasiado grande.");
         std::ifstream file(path);auto root=json::parse(file);
-        if(!root.at("version").is_number_integer() || root.at("version")!=1 || !root.at("players").is_array() || root.at("players").size()!=ports)throw std::runtime_error("Version o jugadores incompatibles.");
+        if(!root.at("version").is_number_integer() || (root.at("version")!=1 && root.at("version")!=2) || !root.at("players").is_array() || root.at("players").size()!=ports)throw std::runtime_error("Version o jugadores incompatibles.");
         ControlsConfig config;
         for(size_t i=0;i<ports;++i) {
             const auto& j=root.at("players").at(i);auto& c=config[i];auto& p=c.profile;
@@ -122,7 +141,7 @@ bool save_controls(const std::filesystem::path& path,const ControlsConfig& confi
     if(!valid_controls(config,error))return false;
     auto temporary=path;temporary+=L"."+std::to_wstring(GetCurrentProcessId())+L".tmp";
     try {
-        json root={{"version",1},{"players",json::array()}};
+        json root={{"version",2},{"players",json::array()}};
         for(const auto& c:config){const auto& p=c.profile;root["players"].push_back({{"slot",c.slot},{"keyboard",c.keyboard},{"name",p.name},
             {"deadzone",p.deadzone},{"invert_x",p.invert_x},{"invert_y",p.invert_y},{"gamepad",bindings_json(p.gamepad)},{"keys",bindings_json(p.keyboard)}});}
         {std::ofstream file(temporary,std::ios::binary|std::ios::trunc);file.exceptions(std::ios::badbit|std::ios::failbit);file<<root.dump(2)<<'\n';file.close();}

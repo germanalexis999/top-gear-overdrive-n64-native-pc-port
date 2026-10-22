@@ -1,3 +1,16 @@
+## Próxima revisión local — SDL3 y sincronización gráfica
+
+- Entrada SDL3 3.4.18: gamepads reconocidos y joysticks genéricos, con nombres de
+  dispositivo y captura manual de botones, ejes y crucetas en F7. Sin doble sondeo XInput.
+- Se cargan controles v1; guardado v2 con centro de eje capturado para joysticks.
+  Hasta cuatro mandos, 16 ejes/64 botones/4 crucetas por joystick sin mapping.
+- SDL y Win32 se sondean en el hilo principal; el juego consume snapshots sin
+  esperar a lecturas de dispositivos. SDL3.dll y licencia zlib incluidas.
+- Pospuesto SP gráfico hasta consumir las entradas nativas de la lista. El trabajo
+  HD continúa asíncrono. Corrección candidata para una carrera de matrices/vértices;
+  el tambaleo intermitente reportado sigue pendiente de confirmación en carrera.
+- No se cambió el redondeo ni la simulación. Compilado; faltan pruebas interactivas.
+
 ## v0.1.0-preview.8 — mapper, mandos y pantalla completa
 
 - Nuevo panel F7: perfiles por jugador, asignacion de mando/teclado, tres bindings

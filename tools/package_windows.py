@@ -13,11 +13,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO_URL = "https://github.com/germanalexis999/top-gear-overdrive-n64-native-pc-port"
+SDL_DLL = "SDL3.dll"
 RUNTIME_DLLS = {"libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"}
 WINDOWS_DLLS = {"advapi32.dll", "bcrypt.dll", "comdlg32.dll", "gdi32.dll",
                "kernel32.dll", "msvcrt.dll", "ntdll.dll", "ole32.dll", "shell32.dll",
                "user32.dll", "ucrtbase.dll", "winmm.dll", "ws2_32.dll",
-               "d3d11.dll", "dxgi.dll"}
+               "d3d11.dll", "dxgi.dll", "oleaut32.dll", "setupapi.dll"}
 
 
 def sha256(path: Path) -> str:
@@ -52,7 +53,7 @@ def audit_archive(archive: Path) -> dict:
         for name, info in manifest["files"].items():
             if ".." in Path(name).parts or "\\" in name or name.startswith("/"):
                 raise RuntimeError("Unsafe archive member")
-            if name not in required and not (name.startswith("LICENSES/") and name.endswith(".txt")):
+            if name not in required and name != SDL_DLL and not (name.startswith("LICENSES/") and name.endswith(".txt")):
                 raise RuntimeError(f"Unapproved release file: {name}")
             data = package.read(relative[name])
             if hashlib.sha256(data).hexdigest() != info["sha256"] or len(data) != info["bytes"]:
@@ -108,13 +109,19 @@ def main():
                 lower = dependency.lower()
                 if lower in WINDOWS_DLLS or lower.startswith(("api-ms-win-", "ext-ms-win-")):
                     continue
+                if lower == SDL_DLL.lower():
+                    target = stage / SDL_DLL
+                    if not target.exists():
+                        shutil.copyfile(args.exe.resolve().parent / SDL_DLL, target)
+                        pending.append(SDL_DLL)
+                    continue
                 if lower not in RUNTIME_DLLS:
                     raise SystemExit(f"Unexpected non-system DLL import: {dependency}")
                 target = stage / lower
                 if not target.exists():
                     shutil.copyfile(toolchain / lower, target)
                     pending.append(lower)
-        if not RUNTIME_DLLS <= {p.name for p in stage.iterdir()}:
+        if not (RUNTIME_DLLS | {SDL_DLL}) <= {p.name for p in stage.iterdir()}:
             raise SystemExit("Unexpected MinGW runtime dependency set")
         shutil.copyfile(ROOT / "packaging/Jugar.cmd", stage / "Jugar.cmd")
         shutil.copyfile(ROOT / "packaging/README-WINDOWS.txt", stage / "README.txt")
@@ -130,7 +137,7 @@ def main():
                   "Local changes to dependencies are in patches/. Dependencies are fetched separately at these exact revisions:", ""]
         lock = json.loads((ROOT / "dependencies.lock.json").read_text())
         for dependency in lock["repositories"]:
-            source.append(f"- {dependency['url']} at {dependency['commit']}; patch: {dependency['patch']}")
+            source.append(f"- {dependency['url']} at {dependency['commit']}; patch: {dependency.get('patch') or 'none'}")
         source += ["", "Compiler runtime: GCC 16.2.0 (GPLv3 with GCC Runtime Library Exception 3.1).",
                    "GCC source: https://gcc.gnu.org/git/?p=gcc.git;a=tree;hb=releases/gcc-16.2.0",
                    "MinGW-w64/winpthreads 14.0.0 source: https://github.com/mingw-w64/mingw-w64/tree/v14.0.0",

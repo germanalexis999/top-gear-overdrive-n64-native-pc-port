@@ -18,6 +18,7 @@ function Apply-PortPatch($Entry) {
     if ($LASTEXITCODE -ne 0 -or $revision -ne $Entry.commit) {
         throw "Unexpected dependency revision in $checkout. Expected $($Entry.commit); existing files were preserved."
     }
+    if (-not $Entry.patch) { Write-Host "Pinned dependency: $($Entry.path)"; return }
     $patchFile = Join-Path $projectRoot ('patches/' + $Entry.patch)
     & git -C $checkout apply --reverse --check $patchFile 2>$null
     if ($LASTEXITCODE -eq 0) {
@@ -35,7 +36,11 @@ foreach ($entry in $manifest.repositories) {
         if (Test-Path -LiteralPath $checkout) {
             throw "Dependency directory exists without Git metadata: $checkout"
         }
-        Invoke-GitChecked @('clone', '--no-checkout', $entry.url, $checkout)
+        if ($entry.PSObject.Properties['tag']) {
+            Invoke-GitChecked @('clone', '--depth', '1', '--branch', $entry.tag, $entry.url, $checkout)
+        } else {
+            Invoke-GitChecked @('clone', '--no-checkout', $entry.url, $checkout)
+        }
         Invoke-GitChecked @('-C', $checkout, 'checkout', '--detach', $entry.commit)
         Invoke-GitChecked @('-C', $checkout, 'submodule', 'update', '--init', '--recursive')
     }

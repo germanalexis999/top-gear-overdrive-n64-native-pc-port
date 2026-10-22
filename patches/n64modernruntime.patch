@@ -103,7 +103,7 @@ index 3198be0..6982698 100644
      // there are enough samples even if the audio thread experiences a small amount of lag. This prevents
      // audio popping on games that use the buffered audio byte count to determine how many samples
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 17d7a47..f080499 100644
+index 17d7a47..e3df69f 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -248,10 +248,6 @@ void vi_thread_func() {
@@ -117,6 +117,30 @@ index 17d7a47..f080499 100644
          }
  
          if (events_callbacks.vi_callback != nullptr) {
+@@ -364,11 +360,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+-                // is finished as well, so sending this early shouldn't be an issue in most cases.
+-                // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
++                // The CPU renderer still reads guest display lists, matrices and vertices.
++                // Keep SP ownership until these inputs have been consumed. Reporting SP
++                // completion here lets the game reuse them while native/HD capture reads.
++                // The asynchronous HD worker is never waited on by this path.
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+@@ -378,6 +373,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 renderer_context->send_dl(&task_action->task);
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+ 
++                sp_complete();
+                 dp_complete();
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+                 ultramodern::extensions::on_displaylist_parsed(displaylist);
 @@ -579,6 +575,13 @@ void ultramodern::send_si_message() {
      ultramodern::enqueue_external_message_src(events_context.si.mq, events_context.si.msg, false, ultramodern::EventMessageSource::Si);
  }

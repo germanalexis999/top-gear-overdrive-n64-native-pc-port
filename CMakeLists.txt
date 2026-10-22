@@ -26,6 +26,35 @@ add_subdirectory("${TGOD_RUNTIME_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tools/N64Mod
 
 # Gather generated recompiled functions
 if (TGOD_BUILD_GAME)
+set(TGOD_SDL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/SDL" CACHE PATH "Pinned SDL3 checkout")
+if (NOT EXISTS "${TGOD_SDL_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "SDL3 missing. Run tools/bootstrap.ps1 or set TGOD_SDL_DIR.")
+endif()
+set(SDL_SHARED ON CACHE BOOL "" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+# Input only: Win32/DXGI and WaveOut continue to own video and audio.
+foreach(subsystem AUDIO VIDEO GPU RENDER CAMERA DIALOG TRAY)
+    set(SDL_${subsystem} OFF CACHE BOOL "" FORCE)
+endforeach()
+add_subdirectory("${TGOD_SDL_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tools/SDL" EXCLUDE_FROM_ALL)
+if(MINGW)
+    # windres loses quoting for inherited -I paths containing spaces. This
+    # resource only includes the system winresrc.h; compile it without those -I's.
+    get_target_property(sdl_sources SDL3-shared SOURCES)
+    list(FILTER sdl_sources EXCLUDE REGEX "/version\\.rc$")
+    set_property(TARGET SDL3-shared PROPERTY SOURCES "${sdl_sources}")
+    set(sdl_version_object "${CMAKE_CURRENT_BINARY_DIR}/sdl-version.obj")
+    add_custom_command(OUTPUT "${sdl_version_object}"
+        COMMAND "${CMAKE_RC_COMPILER}" -O coff "${TGOD_SDL_DIR}/src/core/windows/version.rc" "${sdl_version_object}"
+        DEPENDS "${TGOD_SDL_DIR}/src/core/windows/version.rc" VERBATIM)
+    set_source_files_properties("${sdl_version_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    add_custom_target(tgod_sdl_version DEPENDS "${sdl_version_object}")
+    add_dependencies(SDL3-shared tgod_sdl_version)
+    target_sources(SDL3-shared PRIVATE "${sdl_version_object}")
+endif()
 file(GLOB RECOMP_SOURCES
     "generated/RecompiledFuncs/funcs_*.c"
 )
@@ -36,6 +65,7 @@ endif()
 add_executable(tgod_native
     src/controller_profiles.cpp
     src/controller_mapper.cpp
+    src/sdl_input.cpp
     src/main.cpp
     src/rom_loader.cpp
     src/f3dex2.cpp
@@ -58,6 +88,7 @@ target_include_directories(tgod_native PRIVATE
 )
 
 target_link_libraries(tgod_native PRIVATE
+    SDL3::SDL3-shared
     librecomp
     ultramodern
     miniz
@@ -70,6 +101,8 @@ target_link_libraries(tgod_native PRIVATE
     d3d11
     dxgi
 )
+add_custom_command(TARGET tgod_native POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3-shared> $<TARGET_FILE_DIR:tgod_native>/SDL3.dll)
 endif()
 
 # Small ROM-independent checks for the renderer and cooperative thread queues.

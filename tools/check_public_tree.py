@@ -19,6 +19,7 @@ EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
 EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "include/vi_scanout.hpp",
               "include/render_surface.hpp", "include/controller_input.hpp",
+              "include/sdl_input.hpp", "src/sdl_input.cpp",
               "include/controller_profiles.hpp", "include/controller_mapper.hpp",
               "src/controller_profiles.cpp", "src/controller_mapper.cpp",
               "include/gpu_raster.hpp", "src/gpu_raster.cpp", "src/gpu_raster_shader.inc",
@@ -28,12 +29,12 @@ EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "tools/release_windows.ps1",
               "docs/RELEASES.md", "docs/RELEASE-NOTES.md",
               "docs/DIAGNOSTICS-2026-10-21.md",
-              "docs/RENDERER-ARCHITECTURE.md", "docs/CONTROLLER-MAPPING-RESEARCH.md",
+              "docs/RENDERER-ARCHITECTURE.md", "docs/CONTROLLER-MAPPING-RESEARCH.md", "docs/PHYSICS-INVESTIGATION-2026-10-22.md",
               "packaging/README-WINDOWS.txt", "packaging/Jugar.cmd"})
 EXACT.update("LICENSES/" + name + ".txt" for name in (
     "miniz", "o1heap", "xxHash", "fmt", "rabbitizer", "ELFIO", "tomlplusplus",
     "sljit", "concurrentqueue", "GCC-RUNTIME-EXCEPTION", "winpthreads",
-    "mingw-w64-runtime", "nlohmann-json"))
+    "mingw-w64-runtime", "nlohmann-json", "SDL3-zlib"))
 
 
 def main():

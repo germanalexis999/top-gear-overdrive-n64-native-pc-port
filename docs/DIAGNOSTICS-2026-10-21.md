@@ -775,3 +775,37 @@ Se conserva el ejecutable de la compilación probada por el usuario; el paquete
 oficial registra el commit limpio de fuentes. No se ejecutan pruebas nuevas
 en esta publicación. SDL3 para genéricos sin XInput permanece pendiente.
 La confirmación no equivale a validar una carrera con cuatro mandos físicos.
+
+
+## SDL3 y tambaleo — 2026-10-22
+
+SDL3 3.4.18 se fijó a 829a65d769d935c4852f8159e964312c0957260a. Nuevo
+backend sdl_input.hpp/cpp: hasta cuatro gamepads/joysticks, mapping normalizado o
+captura raw (16 ejes, 64 botones, 4 hats), nombre y reconexión en sesión. Se
+carga gamecontrollerdb.txt solo si lo aporta el usuario. SDL es el único backend:
+no se combina con el sondeo XInput previo. controls.json v1 se migra al guardar
+v2; por binding raw se conserva el centro de eje observado al comenzar captura.
+
+SDL_Init/SetMainReady, sondeo y handles viven en el hilo UI; se publica un snapshot
+sin mantener su mutex durante llamadas SDL. Los hilos emulados no consultan
+hardware de entrada. Si la UI no publica en 250 ms se neutraliza la entrada.
+El cierre/captura conserva la puerta de liberación para evitar botones pegados.
+
+CMake compila y copia SDL3.dll (entrada solamente; DXGI/WaveOut no se sustituyen).
+Se resolvió un problema de windres con los -I de rutas con espacios compilando
+el recurso de versión sin esos -I, sin modificar las fuentes SDL. Se incluye
+licencia zlib original, procedencia en SOURCE.md y audit de imports; OLEAUT32 y
+SETUPAPI se aceptan como DLL del sistema, sin copiar archivos de Windows.
+
+Se investigó el tambaleo intermitente del primer circuito. Hallazgo: SP se
+notificaba antes de consumir/copiar las entradas RSP en el host. Se movió después
+de send_dl nativo y antes de DP; no se espera al worker HD. Es una corrección
+candidata, no un diagnóstico confirmado. No se modificó la aritmética. Evidencia,
+riesgos de temporización SP y plan de comparación en PHYSICS-INVESTIGATION-2026-10-22.md.
+
+Compilación Release correcta. No se añadieron ni ejecutaron pruebas nuevas.
+Pendiente validar mandos físicos y primer circuito con audio, nativo y HD.
+ZIP local: build/sdl3-package/top-gear-overdrive-v0.1.0-preview.9.sdl3.local-windows-x64.zip.
+SHA256 9a32e3a47bf9cbd0bdf6e08837764fdcafa1bb561d4dba391cdcebdda973e3e9.
+Auditoría: 68 fuentes de texto permitidas y 27 archivos empaquetados con hashes;
+no ROM, datos extraídos, capturas ni guardados. Sin publicación de esta revisión.

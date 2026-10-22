@@ -31,6 +31,7 @@ top_gear_rom/**
 tgod.ini
 controls.json
 controls.json.bak
+gamecontrollerdb.txt
 *.sav
 *.srm
 *.eep
@@ -42,6 +43,7 @@ controls.json.bak
 # Dependencies are fetched from pinned upstream repositories; publish patches only.
 /tools/N64ModernRuntime/
 /tools/N64Recomp/
+/tools/SDL/
 /saves/
 *.bin
 *.bmp

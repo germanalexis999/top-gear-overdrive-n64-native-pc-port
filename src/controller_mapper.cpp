@@ -1,4 +1,5 @@
 #include "controller_mapper.hpp"
+#include "sdl_input.hpp"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -16,11 +17,11 @@ Keys keys{};
 Snapshot current{};
 std::filesystem::path config_path;
 bool editing=false,release_gate=false;
-std::array<bool,ports> connected_before{};
-static_assert(sizeof(Gamepad)==12, "XInput gamepad ABI changed");
-using GetState=DWORD(WINAPI*)(DWORD,void*);
-GetState get_state=nullptr;
-std::once_flag xinput_once;
+std::unique_ptr<SDLInput> backend;
+DWORD input_thread=0;
+std::array<std::string,ports> device_names{};
+RawPad capture_origin{};
+std::chrono::steady_clock::time_point last_published{};
 std::atomic<HWND> panel{nullptr};
 HWND owner_window=nullptr;
 ControlsConfig draft;
@@ -52,6 +53,9 @@ void check(int id,bool value){SendMessage(item(id),BM_SETCHECK,value?BST_CHECKED
 
 std::wstring binding_name(const Binding& b) {
     if(b.kind==BindingKind::None)return L"Sin asignar";
+    if(b.kind==BindingKind::RawButton)return L"Boton fisico "+std::to_wstring(b.code+1);
+    if(b.kind==BindingKind::RawAxis)return L"Eje fisico "+std::to_wstring(std::abs(b.code))+(b.code<0?L" -":L" +");
+    if(b.kind==BindingKind::Hat){constexpr const wchar_t* directions[]{L"",L"arriba",L"derecha",L"",L"abajo",L"",L"",L"",L"izquierda"};return L"Cruceta "+std::to_wstring((b.code>>4)+1)+L" "+directions[b.code&15];}
     if(b.kind==BindingKind::Button) {
         constexpr int codes[]{1,2,4,8,0x10,0x20,0x40,0x80,0x100,0x200,0x1000,0x2000,0x4000,0x8000};
         constexpr const wchar_t* names[]{L"Cruceta arriba",L"Cruceta abajo",L"Cruceta izquierda",L"Cruceta derecha",L"Start",L"Back",L"Click stick izq.",L"Click stick der.",L"LB",L"RB",L"A",L"B",L"X",L"Y"};
@@ -116,7 +120,17 @@ bool pad_held(const Gamepad& p) {
     return p.buttons || p.left_trigger>30 || p.right_trigger>30 ||
         std::abs(int(p.lx))>18000 || std::abs(int(p.ly))>18000 || std::abs(int(p.rx))>18000 || std::abs(int(p.ry))>18000;
 }
-Binding capture_binding(const Gamepad& p,const Keys& k) {
+static bool raw_buttons_held(const RawPad& p) {if(p.buttons)return true;for(auto h:p.hats)if(h)return true;return false;}
+
+Binding capture_binding(const RawPad& raw,const Keys& k) {
+    const auto& p=raw.pad;
+    if(device==0 && raw.raw_mode) {
+        for(int b=0;b<raw.button_count;++b)if(raw.buttons&(uint64_t(1)<<b))return {BindingKind::RawButton,b};
+        for(int h=0;h<raw.hat_count;++h)for(int direction:{1,2,4,8})if(raw.hats[h]&direction)return {BindingKind::Hat,(h<<4)|direction};
+        int axis=-1,delta=0;for(int a=0;a<raw.axis_count;++a){const int d=int(raw.axes[a])-capture_origin.axes[a];if(std::abs(d)>std::abs(delta)){axis=a;delta=d;}}
+        if(axis>=0 && std::abs(delta)>12000)return {BindingKind::RawAxis,(axis+1)*(delta<0?-1:1),capture_origin.axes[axis]};
+        return {};
+    }
     if(device==1) {
         for(int i=8;i<255;++i) {
             if(i==VK_SHIFT || i==VK_CONTROL || i==VK_MENU || i==VK_ESCAPE || (i>=VK_F1 && i<=VK_F12))continue;
@@ -132,17 +146,28 @@ Binding capture_binding(const Gamepad& p,const Keys& k) {
     return {};
 }
 void timer() {
-    poll();RawPads pads;Keys k;
-    {std::lock_guard lock(mutex);pads=raw;k=keys;}
+    poll();RawPads pads;Keys k;std::array<std::string,ports> names;
+    {std::lock_guard lock(mutex);pads=raw;k=keys;names=device_names;}
     if(capture<0) {
         BOOL valid=FALSE;const UINT dz=GetDlgItemInt(panel,id_deadzone,&valid,FALSE);
         if(valid && dz<=50)draft[player].profile.deadzone=int(dz);
         draft[player].profile.invert_x=checked(id_invert_x);draft[player].profile.invert_y=checked(id_invert_y);
     }
-    std::wstring status=L"Detectados: ";for(size_t i=0;i<ports;++i)status+=L"XInput "+std::to_wstring(i+1)+(pads[i].connected?L" conectado   ":L" ausente   ");
-    const auto slot=draft[player].slot;const Gamepad pad=slot>=0 && pads[slot].connected?pads[slot].pad:Gamepad{};
+    std::wstring status=L"Detectados: ";for(size_t i=0;i<ports;++i)status+=L"Mando "+std::to_wstring(i+1)+(pads[i].connected?L" conectado   ":L" ausente   ");
+    const auto slot=draft[player].slot;const RawPad chosen=slot>=0 && pads[slot].connected?pads[slot]:RawPad{};
+    const Gamepad pad=chosen.pad;
+    for(size_t i=0;i<ports;++i) {
+        std::wstring label=L"Mando "+std::to_wstring(i+1)+L": "+(pads[i].connected?widen(names[i].substr(0,120)):L"desconectado");
+        if(pads[i].raw_mode)label+=L" (configurar)";
+        wchar_t old[256]{};SendMessageW(item(id_slot),CB_GETLBTEXT,i+1,LPARAM(old));
+        if(label!=old){SendMessage(item(id_slot),CB_DELETESTRING,i+1,0);SendMessageW(item(id_slot),CB_INSERTSTRING,i+1,LPARAM(label.c_str()));SendMessage(item(id_slot),CB_SETCURSEL,slot+1,0);}
+    }
     status+=L"\nMando: ";bool any=false;
     for(int bit=0;bit<16;++bit)if(pad.buttons&(1<<bit)){status+=binding_name({BindingKind::Button,1<<bit})+L" ";any=true;}
+    if(chosen.raw_mode) {
+        for(int b=0;b<chosen.button_count;++b)if(chosen.buttons&(uint64_t(1)<<b)){status+=L"Boton "+std::to_wstring(b+1)+L" ";any=true;}
+        status+=L"[Joystick sin mapping: asigna las acciones manualmente] ";
+    }
     if(!any)status+=L"sin botones pulsados";
     status+=L" | LT "+std::to_wstring(pad.left_trigger*100/255)+L"%  RT "+std::to_wstring(pad.right_trigger*100/255)+L"%";
     const auto preview=map_controls(draft,pads,k)[player];
@@ -152,9 +177,9 @@ void timer() {
     if(capture<0)return;
     if(std::chrono::steady_clock::now()>capture_deadline){capture_stop(L"Captura cancelada por tiempo. No se cambio el binding.");return;}
     if(device==0 && (slot<0 || !pads[slot].connected)) {capture_stop(L"Conecta el mando asignado a este jugador antes de capturar.");return;}
-    const bool active=device==0?pad_held(pad):held(k);
-    if(!capture_armed){if(!active)capture_armed=true;return;}
-    const auto binding=capture_binding(pad,k);
+    const bool active=device==0?(chosen.raw_mode?raw_buttons_held(chosen):pad_held(pad)):held(k);
+    if(!capture_armed){if(!active){capture_armed=true;capture_origin=chosen;}return;}
+    const auto binding=capture_binding(chosen,k);
     if(binding.kind!=BindingKind::None) {
         bindings()[selected_action()][capture]=binding;
         capture_stop(L"Asignado en la copia temporal. Usa Guardar para aplicar.");
@@ -170,8 +195,9 @@ void build_panel() {
     for(int i=0;i<4;++i){const auto s=L"Jugador "+std::to_wstring(i+1);SendMessageW(item(id_player),CB_ADDSTRING,0,LPARAM(s.c_str()));}
     control(L"STATIC",L"Mando",0,240,14,55,20,0);
     control(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,295,10,170,160,id_slot);
+    SendMessage(item(id_slot),CB_SETDROPPEDWIDTH,560,0);
     SendMessageW(item(id_slot),CB_ADDSTRING,0,LPARAM(L"Ninguno"));
-    for(int i=0;i<4;++i){const auto s=L"XInput "+std::to_wstring(i+1);SendMessageW(item(id_slot),CB_ADDSTRING,0,LPARAM(s.c_str()));}
+    for(int i=0;i<4;++i){const auto s=L"Mando "+std::to_wstring(i+1);SendMessageW(item(id_slot),CB_ADDSTRING,0,LPARAM(s.c_str()));}
     control(L"BUTTON",L"Compartir teclado",BS_AUTOCHECKBOX|WS_TABSTOP,490,10,180,24,id_keyboard);
     control(L"STATIC",L"Perfil",0,16,48,70,20,0);
     control(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL|WS_TABSTOP,90,44,210,24,id_name);SendMessage(item(id_name),EM_SETLIMITTEXT,64,0);
@@ -228,7 +254,7 @@ LRESULT CALLBACK panel_proc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
             if(!read_player_fields())return 0;capture=id-id_bind;capture_armed=false;capture_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(15);
             for(int field:{id_player,id_slot,id_keyboard,id_device,id_actions,id_name,id_deadzone,id_invert_x,id_invert_y,id_reset,id_save})EnableWindow(item(field),FALSE);
             for(size_t b=0;b<binding_count;++b){EnableWindow(item(id_bind+int(b)),FALSE);EnableWindow(item(id_clear+int(b)),FALSE);}
-            text(id_status,L"Suelta los controles y pulsa un boton, tecla o mueve un eje. Escape cancela (15 segundos).");return 0;
+            text(id_status,L"Deja los ejes en reposo, suelta botones y pulsa un control. Escape cancela (15 segundos).");return 0;
         }
         if(id>=id_clear && id<id_clear+int(binding_count) && notification==BN_CLICKED) {
             const int a=selected_action();if(a>=0)bindings()[a][id-id_clear]={};refresh_bindings();return 0;
@@ -249,6 +275,8 @@ LRESULT CALLBACK panel_proc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
 }
 
 void initialize(const std::filesystem::path& directory) {
+    input_thread=GetCurrentThreadId();
+    backend=std::make_unique<SDLInput>();backend->initialize(directory);
     config_path=directory/L"controls.json";std::error_code error;
     if(std::filesystem::exists(config_path,error)) {
         std::string reason;if(!load_controls(config_path,config,reason)) {
@@ -257,38 +285,29 @@ void initialize(const std::filesystem::path& directory) {
         }
     }
 }
-void set_game_window(HWND window){owner_window=window;}
+void shutdown(){close_mapper();backend.reset();}
+void set_game_window(HWND window){owner_window=window;poll();}
 void poll() {
-    std::lock_guard lock(mutex);
+    if(GetCurrentThreadId()!=input_thread)return; // N64 threads never call SDL or Win32 polling.
     static auto last=std::chrono::steady_clock::time_point{};
     const auto now=std::chrono::steady_clock::now();if(now-last<std::chrono::milliseconds(4))return;last=now;
-    std::call_once(xinput_once,[]{
-        for(const auto* dll:{L"xinput1_4.dll",L"xinput9_1_0.dll",L"xinput1_3.dll"})if(auto module=LoadLibraryW(dll)) {
-            get_state=reinterpret_cast<GetState>(GetProcAddress(module,"XInputGetState"));if(get_state)break;
-        }
-        std::cout<<"[Controls] XInput "<<(get_state?"ready; four slots available.":"unavailable; keyboard remains enabled.")<<'\n';
-    });
-    static std::array<std::chrono::steady_clock::time_point,ports> retry{};
-    for(size_t i=0;i<ports;++i) {
-        struct {DWORD packet;Gamepad pad;} state{};bool connected=false;
-        if(connected_before[i] || now>=retry[i]) {
-            connected=get_state && get_state(DWORD(i),&state)==ERROR_SUCCESS;retry[i]=now+std::chrono::milliseconds(250);
-        }
-        raw[i]={connected,state.pad};
-        if(connected!=connected_before[i])std::cout<<"[Input] XInput "<<i+1<<(connected?" connected.":" disconnected.")<<'\n';
-        connected_before[i]=connected;
-    }
+    // Never hold the shared snapshot lock while SDL enumerates or reads devices.
+    RawPads next_raw{};Keys next_keys{};std::array<std::string,ports> next_names{};
+    if(backend){backend->update(next_raw);next_names=backend->names();}
     const HWND foreground=GetForegroundWindow();const bool keyboard_focus=foreground==owner_window || foreground==panel;
-    for(int k=0;k<256;++k)keys[k]=keyboard_focus && (GetAsyncKeyState(k)&0x8000);
+    for(int k=0;k<256;++k)next_keys[k]=keyboard_focus && (GetAsyncKeyState(k)&0x8000);
+    std::lock_guard lock(mutex);
+    raw=next_raw;keys=next_keys;device_names=std::move(next_names);last_published=std::chrono::steady_clock::now();
     current=map_controls(config,raw,keys);
     if(release_gate) {
-        bool active=held(keys);for(const auto& r:raw)if(r.connected)active|=pad_held(r.pad);
+        bool active=held(keys);for(size_t i=0;i<ports;++i)if(raw[i].connected)active|=raw[i].raw_mode?raw_buttons_held(raw[i]):pad_held(raw[i].pad);
+        for(const auto& s:current)active|=s.connected && (s.buttons || std::abs(s.x)>0.2f || std::abs(s.y)>0.2f);
         if(!active)release_gate=false;
     }
 }
 Snapshot snapshot() {
     std::lock_guard lock(mutex);auto out=current;
-    if(editing || release_gate)for(auto& s:out){s.buttons=0;s.x=s.y=0;}
+    if(editing || release_gate || std::chrono::steady_clock::now()-last_published>std::chrono::milliseconds(250))for(auto& s:out){s.buttons=0;s.x=s.y=0;}
     return out;
 }
 void show_mapper(HWND owner) {
@@ -298,7 +317,7 @@ void show_mapper(HWND owner) {
     WNDCLASSW cls{};cls.lpfnWndProc=panel_proc;cls.hInstance=GetModuleHandle(nullptr);cls.hCursor=LoadCursor(nullptr,IDC_ARROW);
     cls.hbrBackground=HBRUSH(COLOR_BTNFACE+1);cls.lpszClassName=L"TGOD_CONTROLLER_MAPPER";RegisterClassW(&cls);
     RECT r{0,0,752,614};AdjustWindowRectEx(&r,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE,WS_EX_CONTROLPARENT|WS_EX_DLGMODALFRAME);
-    HWND created=CreateWindowExW(WS_EX_CONTROLPARENT|WS_EX_DLGMODALFRAME,cls.lpszClassName,L"Top Gear Overdrive - Controles (XInput)",
+    HWND created=CreateWindowExW(WS_EX_CONTROLPARENT|WS_EX_DLGMODALFRAME,cls.lpszClassName,L"Top Gear Overdrive - Controles (SDL3)",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,owner,nullptr,cls.hInstance,nullptr);
     if(!created){std::lock_guard lock(mutex);editing=false;std::cerr<<"[Controls] Could not create mapper window.\n";return;}
     EnableWindow(owner,FALSE);ShowWindow(created,SW_SHOW);SetForegroundWindow(created);

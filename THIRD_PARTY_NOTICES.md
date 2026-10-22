@@ -6,7 +6,7 @@ ROMs, assets, desensamblados, C generado del juego, bibliotecas ni ejecutables.
 El código propio del port se publica bajo GPL-3.0-only; ver `LICENSE`.
 
 Las releases de Windows se distribuyen por separado con el EXE y las DLL
-`libgcc_s_seh-1.dll`, `libstdc++-6.dll` y `libwinpthread-1.dll`. No contienen ROM
+`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll` y `SDL3.dll`. No contienen ROM
 ni archivos de datos extraídos del juego. El EXE contiene la lógica recompilada
 y necesita una ROM propia para cargar los datos durante la ejecución.
 
@@ -16,6 +16,7 @@ Las dependencias se descargan por separado desde sus repositorios originales:
 | --- | --- | --- |
 | [N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime) | Runtime y APIs de N64 | GPL versión 3; ver `COPYING` en el checkout |
 | [N64Recomp](https://github.com/N64Recomp/N64Recomp) | Generación local de C y ABI | MIT, copyright Wiseguy; ver `LICENSE` |
+| [SDL3 3.4.18](https://github.com/libsdl-org/SDL) | Gamepads y joysticks (HID, RawInput, XInput/WGI) | zlib, aviso en `LICENSES/SDL3-zlib.txt` |
 | GNU libgcc / libstdc++ 16.2.0 | DLL del compilador | GPLv3 con GCC Runtime Library Exception 3.1 |
 | MinGW-w64 / winpthreads 14.0.0 | Runtime Windows / hilos POSIX | Avisos de MinGW-w64 y MIT/BSD en `LICENSES/` |
 | miniz, o1heap, fmt, nlohmann-json, ELFIO, tomlplusplus | Bibliotecas enlazadas | MIT y avisos upstream en `LICENSES/` |

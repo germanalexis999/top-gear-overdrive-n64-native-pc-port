@@ -91,7 +91,8 @@ try {
         Invoke-Checked cmake @('-S', $projectRoot, '-B', $buildDirectory, '-G', 'Ninja',
             '-DCMAKE_BUILD_TYPE=Release', '-DTGOD_BUILD_GAME=ON',
             "-DTGOD_RUNTIME_DIR=$(Join-Path $dependencyDirectory 'N64ModernRuntime')",
-            "-DTGOD_RECOMPILER_DIR=$recompilerDirectory")
+            "-DTGOD_RECOMPILER_DIR=$recompilerDirectory",
+            "-DTGOD_SDL_DIR=$(Join-Path $dependencyDirectory 'SDL')")
         Invoke-Checked cmake @('--build', $buildDirectory, '--target', 'tgod_native', 'tgod_regression_checks', 'tgod_gpu_checks', '--parallel', "$Jobs")
         Write-Host '[4/7] Run ROM-independent checks and create the allowlisted package.'
         Invoke-Checked (Join-Path $buildDirectory 'tgod_regression_checks.exe') @()

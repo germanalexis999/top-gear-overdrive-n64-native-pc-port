@@ -182,3 +182,32 @@ No se ejecutaron pruebas nuevas para esta entrega.
 El usuario confirmó que el mapper funciona y autorizó publicar preview.8.
 Esto no confirma una carrera completa con cuatro mandos físicos. SDL3 para
 genéricos sin XInput y la identidad persistente de dispositivos siguen pendientes.
+
+
+## Actualización local SDL3 — 2026-10-22
+
+SDL3 3.4.18 ya está incorporado (829a65d769d935c4852f8159e964312c0957260a).
+Se eliminó el backend XInput paralelo: SDL administra hasta cuatro dispositivos.
+Gamepads reconocidos mantienen las acciones normalizadas; joysticks sin mapping
+pueden capturar botones físicos, ejes con centro en reposo y crucetas. El centro
+por binding permite manejar gatillos cuyo reposo no sea cero. Perfiles v1 se
+cargan; el nuevo guardado v2 agrega ese centro y tipos raw. No se descartan los
+perfiles anteriores al arrancar, ni se obliga a sobrescribirlos.
+
+La UI conserva Win32 y los render/audio backends existentes. SDL_Init/SetMainReady,
+PumpEvents, UpdateJoysticks/Gamepads y los handles son propiedad del hilo principal.
+No se mantiene el mutex de snapshots mientras SDL consulta dispositivos. Se
+conserva la asignación de los demás puertos al desconectar; se intenta recuperar
+una conexión de la sesión por GUID/serie/ruta. Dos unidades sin identidad única
+siguen siendo ambiguas, y no se persiste aún identidad entre sesiones.
+
+Se puede cargar un gamecontrollerdb.txt aportado localmente; no se copia una base
+de mappings de terceros al repositorio ni al ZIP. Persistencia de identidad,
+biblioteca de perfiles y pruebas físicas con varios genéricos siguen pendientes.
+Compilación correcta; no se realizaron pruebas nuevas de ejecución en esta entrega.
+
+Referencias oficiales: SDL_PumpEvents (solo hilo principal), SDL_SetJoystickEventsEnabled
+(sondeo manual si se desactivan eventos) y SDL_UpdateJoysticks:
+https://wiki.libsdl.org/SDL3/SDL_PumpEvents
+https://wiki.libsdl.org/SDL3/SDL_SetJoystickEventsEnabled
+https://wiki.libsdl.org/SDL3/SDL_UpdateJoysticks

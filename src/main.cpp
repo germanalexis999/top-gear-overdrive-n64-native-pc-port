@@ -1345,6 +1345,8 @@ int main(int argc, char** argv) {
     };
     ultramodern::renderer::set_callbacks(render_cbs);
 
+    std::cout<<"[Sync] Graphics SP completion follows native DL consumption; HD replay stays asynchronous.\n";
+
     // 4. Register input callbacks
     ultramodern::input::callbacks_t input_cbs{};
     input_cbs.poll_input = []() {
@@ -1874,6 +1876,7 @@ int main(int argc, char** argv) {
     std::cout << "\n[Host] Top Gear Overdrive runner completed.\n";
 
     ultramodern::quit();
+    tgod::controls::shutdown();
     g_hd_renderer.shutdown();
     g_hd_renderer.diagnostics();
     if(g_hwnd&&IsWindow(g_hwnd))DestroyWindow(g_hwnd);

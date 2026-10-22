@@ -1,4 +1,15 @@
-# Estado del port — 2026-10-21
+# Estado del port — 2026-10-22
+
+Revisión local posterior a preview.8: SDL3 3.4.18 incorporado para gamepads y
+joysticks genéricos, con captura manual de botones/ejes/crucetas sin mapping.
+Se incluyen DLL, licencia y procedencia fijada. Migración de controles v1 a v2.
+Compilado; pendiente de validación con dispositivos físicos.
+
+Tambaleo del primer circuito: se detectó un aviso SP anterior al consumo de las
+entradas gráficas; se pospuso hasta terminar el procesamiento nativo, manteniendo
+HD asíncrono. Es una corrección candidata: el síntoma sigue sin confirmarse como
+resuelto y no se modificaron redondeos/física. Ver PHYSICS-INVESTIGATION-2026-10-22.md.
+
 
 El usuario confirma que el HUD quedó bien y el humo quedó arreglado en los casos
 probados con preview.4. También mantiene la mejora musical. Se cierra ese síntoma;
