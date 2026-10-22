@@ -1,4 +1,4 @@
-## Próxima revisión local — SDL3 y sincronización gráfica
+## v0.1.0-preview.9 — SDL3 y sincronización gráfica
 
 - Entrada SDL3 3.4.18: gamepads reconocidos y joysticks genéricos, con nombres de
   dispositivo y captura manual de botones, ejes y crucetas en F7. Sin doble sondeo XInput.

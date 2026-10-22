@@ -1,6 +1,6 @@
 # Estado del port — 2026-10-22
 
-Revisión local posterior a preview.8: SDL3 3.4.18 incorporado para gamepads y
+Cambios de preview.9: SDL3 3.4.18 incorporado para gamepads y
 joysticks genéricos, con captura manual de botones/ejes/crucetas sin mapping.
 Se incluyen DLL, licencia y procedencia fijada. Migración de controles v1 a v2.
 Compilado; pendiente de validación con dispositivos físicos.

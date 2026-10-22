@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
-EXACT = {"README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
+EXACT = {"AGENTS.md", "README.md", "CMakeLists.txt", ".gitignore", ".gitattributes",
          "dependencies.lock.json", "THIRD_PARTY_NOTICES.md",
          "src/main.cpp", "src/f3dex2.cpp", "include/f3dex2.hpp",
          "config/topgearoverdrive.us.v0.toml", "symbols/topgearoverdrive.us.v0.candidates.toml",

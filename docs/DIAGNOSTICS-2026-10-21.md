@@ -809,3 +809,11 @@ ZIP local: build/sdl3-package/top-gear-overdrive-v0.1.0-preview.9.sdl3.local-win
 SHA256 9a32e3a47bf9cbd0bdf6e08837764fdcafa1bb561d4dba391cdcebdda973e3e9.
 Auditoría: 68 fuentes de texto permitidas y 27 archivos empaquetados con hashes;
 no ROM, datos extraídos, capturas ni guardados. Sin publicación de esta revisión.
+
+## Publicación preview.9 — 2026-10-22
+
+El usuario autorizó publicar SDL3 y estableció que los próximos pushes del agente
+siempre incluyan su release, registrado en AGENTS.md y RELEASES.md. Se conservan
+EXE/SDL3.dll idénticos al ZIP local compilado, con manifiesto de fuentes limpio
+y nueva versión oficial. No se realizaron pruebas nuevas de juego; el tambaleo
+continúa como síntoma pendiente de confirmación, según las notas de release.

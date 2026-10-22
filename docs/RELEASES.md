@@ -4,6 +4,15 @@
 como adjuntos de GitHub Releases, sin EXE, DLL ni ZIP en el historial Git.
 Localmente se usa una carpeta hermana `../release-packages/`.
 
+## Convención del proyecto
+
+Por indicación del usuario (2026-10-22), cada push solicitado al agente incluye
+la publicación de una prerelease con ZIP Windows y SHA-256 correspondientes al
+mismo commit. No hace falta pedir la release por separado. Se conserva explícito
+qué correcciones están pendientes de validar. Esta convención está en AGENTS.md.
+Un git push ejecutado directamente fuera del flujo de release no activa por sí
+solo una compilación remota: no se ha instalado un hook ni un workflow de CI.
+
 ## Flujo con un solo script
 
 La publicación se inicia manualmente; un `git push` por sí solo no compila ni
