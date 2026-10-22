@@ -29,6 +29,8 @@ top_gear_rom/**
 
 # Per-user runtime data and capture files.
 tgod.ini
+controls.json
+controls.json.bak
 *.sav
 *.srm
 *.eep

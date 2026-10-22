@@ -29,6 +29,8 @@
 #include "f3dex2.hpp"
 #include "rom_loader.hpp"
 #include "vi_scanout.hpp"
+#include "controller_input.hpp"
+#include "controller_mapper.hpp"
 
 // Recompiled function headers and overlay definitions
 #include "funcs.h"
@@ -58,130 +60,15 @@ static std::atomic<bool> g_filter_smooth{true};
 static std::mutex g_window_output_mutex;
 static std::atomic<uint64_t> g_rsp_task_types[5]{}; // 0..3 plus unclassified.
 
-// Dynamic XInput gamepad definitions (zero extra DLL link dependencies)
-typedef struct {
-    WORD wButtons;
-    BYTE bLeftTrigger;
-    BYTE bRightTrigger;
-    SHORT sThumbLX;
-    SHORT sThumbLY;
-    SHORT sThumbRX;
-    SHORT sThumbRY;
-} TGOD_XINPUT_GAMEPAD;
-
-typedef struct {
-    DWORD dwPacketNumber;
-    TGOD_XINPUT_GAMEPAD Gamepad;
-} TGOD_XINPUT_STATE;
-
-typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD dwUserIndex, TGOD_XINPUT_STATE* pState);
-static PFN_XInputGetState g_pfnXInputGetState = nullptr;
-static bool g_xinput_initialized = false;
-
-static void init_xinput() {
-    if (g_xinput_initialized) return;
-    g_xinput_initialized = true;
-    HMODULE hXInput = LoadLibraryA("xinput1_4.dll");
-    if (!hXInput) hXInput = LoadLibraryA("xinput9_1_0.dll");
-    if (!hXInput) hXInput = LoadLibraryA("xinput1_3.dll");
-    if (hXInput) {
-        g_pfnXInputGetState = (PFN_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
-        if (g_pfnXInputGetState) {
-            std::cout << "[Host] XInput gamepad support initialized successfully.\n";
-        }
-    }
-}
+static std::mutex g_input_mutex;
+static tgod::input::Snapshot g_controllers;
 
 static void update_key_input() {
-    if (g_is_headless) return;
-    init_xinput();
-
-    uint16_t btns = 0;
-    float sx = 0.0f;
-    float sy = 0.0f;
-
-    // 1. Check XInput Gamepad if connected
-    if (g_pfnXInputGetState) {
-        TGOD_XINPUT_STATE xstate{};
-        if (g_pfnXInputGetState(0, &xstate) == 0) { // ERROR_SUCCESS == 0
-            const auto& pad = xstate.Gamepad;
-            if (pad.wButtons & 0x0010) btns |= 0x1000; // Start -> CONT_START
-            if (pad.wButtons & 0x1000) btns |= 0x8000; // A -> CONT_A (Accelerate)
-            if (pad.wButtons & 0x2000) btns |= 0x4000; // B -> CONT_B (Brake)
-            if (pad.wButtons & 0x4000) btns |= 0x2000; // X -> CONT_G (Z-trigger / Handbrake)
-            if (pad.wButtons & 0x8000) btns |= 0x0004; // Y -> CONT_D (C-Down: Camera)
-            if (pad.wButtons & 0x0100) btns |= 0x0020; // LB -> CONT_L (Shift down)
-            if (pad.wButtons & 0x0200) btns |= 0x0010; // RB -> CONT_R (Shift up)
-
-            // Triggers
-            if (pad.bRightTrigger > 30) btns |= 0x8000; // RT -> Accelerate
-            if (pad.bLeftTrigger > 30)  btns |= 0x4000; // LT -> Brake
-
-            // D-Pad
-            if (pad.wButtons & 0x0001) { btns |= 0x0800; sy += 1.0f; } // Up
-            if (pad.wButtons & 0x0002) { btns |= 0x0400; sy -= 1.0f; } // Down
-            if (pad.wButtons & 0x0004) { btns |= 0x0200; sx -= 1.0f; } // Left
-            if (pad.wButtons & 0x0008) { btns |= 0x0100; sx += 1.0f; } // Right
-
-            // Left Thumbstick Analog Steering
-            constexpr SHORT deadzone = 7849;
-            if (std::abs(pad.sThumbLX) > deadzone) {
-                sx = (pad.sThumbLX > 0) ? ((float)(pad.sThumbLX - deadzone) / (32767.0f - deadzone))
-                                        : ((float)(pad.sThumbLX + deadzone) / (32768.0f - deadzone));
-            }
-            if (std::abs(pad.sThumbLY) > deadzone) {
-                sy = (pad.sThumbLY > 0) ? ((float)(pad.sThumbLY - deadzone) / (32767.0f - deadzone))
-                                        : ((float)(pad.sThumbLY + deadzone) / (32768.0f - deadzone));
-            }
-
-            // Right Thumbstick for C-buttons
-            if (pad.sThumbRY < -12000) btns |= 0x0004; // C-Down (Camera)
-            if (pad.sThumbRX < -12000) btns |= 0x0002; // C-Left (Look back)
-            if (pad.sThumbRX > 12000)  btns |= 0x0001; // C-Right (Nitro)
-            if (pad.sThumbRY > 12000)  btns |= 0x0008; // C-Up (Horn)
-        }
-    }
-
-    // 2. Check Keyboard state
-    if ((GetAsyncKeyState(VK_RETURN) & 0x8000) || (GetAsyncKeyState(VK_TAB) & 0x8000)) btns |= 0x1000; // CONT_START
-    if ((GetAsyncKeyState('X') & 0x8000) || (GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState('W') & 0x8000)) btns |= 0x8000; // CONT_A
-    if ((GetAsyncKeyState('Z') & 0x8000) || (GetAsyncKeyState(VK_BACK) & 0x8000) || (GetAsyncKeyState('S') & 0x8000)) btns |= 0x4000; // CONT_B
-    if ((GetAsyncKeyState('C') & 0x8000) || (GetAsyncKeyState(VK_LCONTROL) & 0x8000)) btns |= 0x2000; // CONT_G (Z-trigger)
-    if ((GetAsyncKeyState('A') & 0x8000) || (GetAsyncKeyState('Q') & 0x8000)) btns |= 0x0020; // CONT_L
-    if ((GetAsyncKeyState('D') & 0x8000) || (GetAsyncKeyState('E') & 0x8000)) btns |= 0x0010; // CONT_R
-
-    // C-buttons for camera toggle, look back, nitro
-    if ((GetAsyncKeyState('V') & 0x8000) || (GetAsyncKeyState('1') & 0x8000)) btns |= 0x0004; // CONT_D (C-Down: Camera)
-    if ((GetAsyncKeyState('B') & 0x8000) || (GetAsyncKeyState('2') & 0x8000)) btns |= 0x0002; // CONT_C (C-Left: Rear view)
-    if ((GetAsyncKeyState('N') & 0x8000) || (GetAsyncKeyState('3') & 0x8000)) btns |= 0x0001; // CONT_F (C-Right: Nitro)
-    if ((GetAsyncKeyState('T') & 0x8000) || (GetAsyncKeyState('4') & 0x8000)) btns |= 0x0008; // CONT_E (C-Up: Horn/Map)
-
-    // D-Pad and Analog stick
-    if (GetAsyncKeyState(VK_UP) & 0x8000) {
-        btns |= 0x0800; // CONT_UP
-        sy = 1.0f;
-    }
-    if (GetAsyncKeyState(VK_DOWN) & 0x8000) {
-        btns |= 0x0400; // CONT_DOWN
-        sy = -1.0f;
-    }
-    if ((GetAsyncKeyState(VK_LEFT) & 0x8000) || (GetAsyncKeyState('A') & 0x8000)) {
-        btns |= 0x0200; // CONT_LEFT
-        sx = -1.0f;
-    }
-    if ((GetAsyncKeyState(VK_RIGHT) & 0x8000) || (GetAsyncKeyState('D') & 0x8000)) {
-        btns |= 0x0100; // CONT_RIGHT
-        sx = 1.0f;
-    }
-
-    uint16_t old_btns = g_buttons.exchange(btns);
-    g_stick_x.store(sx);
-    g_stick_y.store(sy);
-
-    if (btns != old_btns && btns != 0) {
-        std::cout << "[Input Event] Pressed: 0x" << std::hex << btns
-                  << ", Stick: (" << std::dec << sx << ", " << sy << ")\n";
-    }
+    if(g_is_headless)return;
+    tgod::controls::poll();
+    const auto snapshot=tgod::controls::snapshot();
+    {std::lock_guard lock(g_input_mutex);g_controllers=snapshot;}
+    g_buttons=snapshot[0].buttons;g_stick_x=snapshot[0].x;g_stick_y=snapshot[0].y;
 }
 
 // Native Win32 Decoupled Audio Backend
@@ -1214,29 +1101,14 @@ static std::atomic<uint32_t> g_si_poll_count{0};
 // Hook for Top Gear Overdrive SI polling function (0x800470A0)
 extern "C" void tgod_poll_si(uint8_t* rdram, recomp_context* ctx) {
     g_si_poll_count.fetch_add(1, std::memory_order_relaxed);
-    // 1. Mark controller 0 as present in status registers
-    write_rdram_u8(rdram, 0x800522D0, read_rdram_u8(rdram, 0x800522D0) | 0x01); // Controller 1 connected
-    write_rdram_u8(rdram, 0x80100184, 1);    // 1 controller
-
-    // 2. Read host buttons and analog stick
-    uint16_t btns = g_buttons.load();
-    float sx = g_stick_x.load();
-    float sy = g_stick_y.load();
-
-    int8_t stick_x = (int8_t)std::clamp((int)(sx * 80.0f), -128, 127);
-    int8_t stick_y = (int8_t)std::clamp((int)(sy * 80.0f), -128, 127);
-
-    // 3. Inject directly into OSContPad 0 at RDRAM 0x80077058
-    write_rdram_u16(rdram, 0x80077058, btns);
-    write_rdram_u8(rdram, 0x8007705A, (uint8_t)stick_x);
-    write_rdram_u8(rdram, 0x8007705B, (uint8_t)stick_y);
-    write_rdram_u8(rdram, 0x8007705C, 0); // errno = 0 (no error)
-
-    // 4. Also inject into SI command/response buffer at D_800F7B30
-    write_rdram_u32(rdram, 0x800F7B30, 0x01040000);
-    write_rdram_u16(rdram, 0x800F7B34, btns);
-    write_rdram_u8(rdram, 0x800F7B36, (uint8_t)stick_x);
-    write_rdram_u8(rdram, 0x800F7B37, (uint8_t)stick_y);
+    update_key_input();
+    tgod::input::Snapshot snapshot;
+    {
+        std::lock_guard input_lock(g_input_mutex);
+        snapshot=g_controllers;
+    }
+    if(g_is_headless) snapshot[0]={true,g_buttons.load(),g_stick_x.load(),g_stick_y.load()};
+    tgod::input::write_si(rdram,snapshot);
 
     ultramodern::send_si_message();
 }
@@ -1246,6 +1118,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_ERASEBKGND:
             return 1; // Prevent window background erasing flicker
         case WM_CLOSE:
+            tgod::controls::close_mapper();
             g_running = false;
             PostQuitMessage(0); // HWND stays alive until the GPU worker shuts down.
             return 0;
@@ -1275,14 +1148,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const auto value=std::to_wstring(next);
                 if (!WritePrivateProfileStringW(L"Graphics",L"RenderHeight",value.c_str(),g_graphics_config.c_str()))
                     std::cerr << "[Graphics] Could not save tgod.ini; resolution applies to this session.\n";
+            } else if (wParam == VK_F7) {
+                if (!(lParam & (1ll<<30))) tgod::controls::show_mapper(hwnd);
+                return 0;
             } else if (wParam == VK_F11) {
-                toggle_fullscreen(hwnd);
+                if (!(lParam & (1ll<<30))) toggle_fullscreen(hwnd);
+                return 0;
             }
             update_key_input();
             break;
         case WM_SYSKEYDOWN:
-            if (wParam == VK_RETURN && (lParam & (1 << 29))) { // Alt + Enter
-                toggle_fullscreen(hwnd);
+            if (wParam == VK_F11 || (wParam == VK_RETURN && (lParam & (1ll << 29)))) {
+                if (!(lParam & (1ll<<30))) toggle_fullscreen(hwnd);
                 return 0;
             }
             break;
@@ -1403,6 +1280,7 @@ int main(int argc, char** argv) {
     // a shortcut, a different working directory, or by dropping a ROM onto it.
     const auto program_directory = tgod::executable_directory();
     g_graphics_config=program_directory/L"tgod.ini";
+    if(!headless)tgod::controls::initialize(program_directory);
     uint32_t selected_height=headless ? 0 : GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,g_graphics_config.c_str());
     if (selected_height!=720 && selected_height!=1080 && selected_height!=2160) selected_height=0;
     if (render_height_override>=0) selected_height=uint32_t(render_height_override);
@@ -1444,6 +1322,7 @@ int main(int argc, char** argv) {
             wr.right - wr.left, wr.bottom - wr.top,
             nullptr, nullptr, GetModuleHandle(nullptr), nullptr
         );
+        tgod::controls::set_game_window(g_hwnd);
         if(!g_presentation_check){ShowWindow(g_hwnd, SW_SHOW);UpdateWindow(g_hwnd);}
         std::cout << "[Host] Created native Win32 window (HWND: 0x" << std::hex << (uintptr_t)g_hwnd << std::dec << ", 640x480 client area)\n";
     } else {
@@ -1472,26 +1351,28 @@ int main(int argc, char** argv) {
         update_key_input();
     };
     input_cbs.get_input = [](int controller_num, uint16_t* buttons, float* x, float* y) -> bool {
-        if (controller_num == 0) {
-            update_key_input();
-            *buttons = g_buttons.load();
-            *x = g_stick_x.load();
-            *y = g_stick_y.load();
-            return true;
-        }
-        return false;
+        update_key_input();
+        std::lock_guard input_lock(g_input_mutex);
+        if(controller_num<0 || controller_num>=int(tgod::input::ports))return false;
+        auto state=g_controllers[controller_num];
+        if(g_is_headless && controller_num==0)state={true,g_buttons.load(),g_stick_x.load(),g_stick_y.load()};
+        if(!state.connected)return false;
+        *buttons=state.buttons;*x=state.x;*y=state.y;
+        return true;
     };
     input_cbs.set_rumble = [](int, bool) {};
     input_cbs.get_connected_device_info = [](int controller_num) -> ultramodern::input::connected_device_info_t {
-        if (controller_num == 0) {
-            return { ultramodern::input::Device::Controller, ultramodern::input::Pak::None };
-        }
-        return { ultramodern::input::Device::None, ultramodern::input::Pak::None };
+        update_key_input();
+        std::lock_guard input_lock(g_input_mutex);
+        const bool connected=controller_num>=0 && controller_num<int(tgod::input::ports) &&
+            ((g_is_headless && controller_num==0) || g_controllers[controller_num].connected);
+        return {connected ? ultramodern::input::Device::Controller:ultramodern::input::Device::None,
+            ultramodern::input::Pak::None};
     };
     ultramodern::input::set_callbacks(input_cbs);
     std::cout << "[Host] Input callbacks registered:\n"
-              << "       Enter=Start | X/Space=A | Z/Back=B | C=Z-Trig | A/S=L/R | Arrows=D-Pad/Stick | Esc=Quit\n"
-              << "       F1-F4=Window Scale | F5=Output Filter | F6=Internal Resolution | F11 / Alt+Enter=Fullscreen\n";
+              << "       Enter=Start | X/Space=A | Z/Back=B | C=Z-Trig | A/Q=L | D/E=R | Arrows=D-Pad/Stick | Esc=Quit\n"
+              << "       F1-F4=Window Scale | F5=Output Filter | F6=Internal Resolution | F7=Controls | F11 / Alt+Enter=Fullscreen\n";
 
     ultramodern::rsp::callbacks_t rsp_cbs{};
     rsp_cbs.init = []() {};
@@ -1614,8 +1495,10 @@ int main(int argc, char** argv) {
                     g_running = false;
                     break;
                 }
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
+                if(!tgod::controls::handle_message(msg)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
             }
             if (!g_running.load()) break;
 
@@ -1676,7 +1559,14 @@ int main(int argc, char** argv) {
                     if(s==180)g_render_height=720;
                     if(s==210)g_render_height=2160;
                     if(s==100||s==140||s==200)resize_window_scale(g_hwnd,s==100 ? 3:s==140 ? 1:2);
-                    if(s==160||s==170)toggle_fullscreen(g_hwnd);
+                    if(s==160||s==170) {
+                        SendMessage(g_hwnd,WM_KEYDOWN,VK_F11,1);
+                        const bool expected=s==160;
+                        SendMessage(g_hwnd,WM_KEYDOWN,VK_F11,1ll|(1ll<<30));
+                        if(g_fullscreen!=expected) {
+                            std::cerr<<"[Fullscreen check] F11 toggle/repeat failed.\n";g_running=false;
+                        } else std::cout<<"[Fullscreen check] F11 "<<(expected?"enter":"exit")<<" and repeat suppression: PASS.\n";
+                    }
                     if(s==120||s==190)g_filter_smooth=!g_filter_smooth.load();
                 }
             }

@@ -1,6 +1,7 @@
 #include "f3dex2.hpp"
 #include "rom_loader.hpp"
 #include "vi_scanout.hpp"
+#include "controller_input.hpp"
 #include <ultramodern/ultramodern.hpp>
 #include <array>
 #include <cmath>
@@ -710,8 +711,43 @@ static void check_lighting(uint8_t* ram) {
         "Reflection texture coordinates ignore normal direction or texture scale");
 }
 
+static void check_controller_ports() {
+    using namespace tgod::input;
+    std::vector<uint8_t> ram(8*1024*1024,0xCD);
+    Snapshot states;
+    constexpr uint16_t keys[]{0x1000,0x2000,0x4000,0x8000};
+    constexpr uint16_t mapped[]{0x8000,0x4000,0x2000,0x0004};
+    for(size_t i=0;i<ports;++i) {
+        Gamepad raw{};raw.buttons=keys[i];raw.lx=i%2 ? -32768:32767;
+        states[i]=map_gamepad(raw);
+        require(states[i].buttons==mapped[i],"Gamepad button mapping mixed players");
+        require(states[i].x==(i%2 ? -1.0f:1.0f),"Stick endpoint mapping");
+    }
+    auto byte=[&](uint32_t a){return ram[(a&0x7FFFFF)^3];};
+    auto half=[&](uint32_t a){return uint16_t(byte(a)<<8|byte(a+1));};
+    write_si(ram.data(),states);
+    require(byte(0x800522D0)==15 && byte(0x80100184)==4,"Four-controller presence/channel scan");
+    for(size_t i=0;i<ports;++i) {
+        const uint32_t pad=0x80077058+uint32_t(i)*6,reply=0x800F7B30+uint32_t(i)*8;
+        require(half(pad)==mapped[i] && half(reply+4)==mapped[i],"OSContPad/SI player stride or byte order");
+        require(byte(pad+2)==uint8_t(int8_t(i%2 ? -80:80)) && byte(pad+4)==0 && byte(reply+2)==4,
+            "Connected pad stick/status");
+    }
+    states[1]={};states[3]={};write_si(ram.data(),states);
+    require(byte(0x800522D0)==5 && byte(0x80100184)==4,"Sparse ports truncate later players or leave stale presence");
+    require(half(0x8007705E)==0 && byte(0x80077062)==8 && byte(0x800F7B3A)==0x84,
+        "Disconnected controller retains pressed buttons/status");
+    require(half(0x80077064)==mapped[2],"Disconnecting player 2 remaps player 3");
+    states[1]=map_gamepad(Gamepad{0x1000});write_si(ram.data(),states);
+    require(byte(0x800522D0)==7 && byte(0x80077062)==0,"Controller reconnect not restored");
+    require(byte(0x80077057)==0xCD && byte(0x80077070)==0xCD && byte(0x800F7B50)==0xCD,
+        "Controller writes overrun four-port buffers");
+    std::cout<<"PASS: four independent controller ports, button/stick mapping, SI/OSContPad bytes, sparse slots, disconnect/reconnect.\n";
+}
+
 int main() {
     try {
+        check_controller_ports();
         const std::vector<uint8_t> expected = {0x80, 0x37, 0x12, 0x40, 1, 2, 3, 4};
         auto big_endian = expected;
         std::vector<uint8_t> swapped16 = {0x37, 0x80, 0x40, 0x12, 2, 1, 4, 3};

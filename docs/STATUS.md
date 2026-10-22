@@ -143,3 +143,17 @@ Opción 4K de preview.7: F6 alterna nativo/720p/1080p/4K; mantiene 4:3 (2880×21
 Pasaron regresiones de CPU y GPU, presentación residente y feedback explícito
 a 2160p, además de una carrera de 20 s con capturas reales 2880×2160 y escala
 autoritativa 1.0. El usuario confirmó la mejora de la presentación DXGI previa.
+
+
+Cambios de preview.8: soporte de cuatro puertos XInput en el
+sondeo, callbacks y hook SI; teclado compartido con P1. F11/Alt+Enter suprimen
+repetición. Pasaron pruebas simuladas de cuatro mandos y desconexión/reconexión,
+F11 sobre ventana real y prueba completa del ZIP. Pendiente validar mandos físicos
+y una carrera multijugador completa.
+
+
+Mapper F7 de preview.8: perfiles por jugador, asignación XInput,
+tres bindings por acción, teclado, ejes/gatillos, zona muerta, inversión,
+guardado controls.json con respaldo y bloqueo de entrada durante la edición.
+El usuario confirmó su funcionamiento el 2026-10-22. **SDL3 para mandos genéricos
+sin XInput sigue pendiente**, junto con identificación por modelo/serie.

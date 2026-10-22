@@ -62,3 +62,27 @@ El auditor usa una lista explícita de archivos permitidos y examina los bytes
 del índice, de modo que también detecta contenido ya preparado para un commit.
 
 4K conserva el formato 4:3: renderiza 2880×2160 y muestra barras laterales en una pantalla 3840×2160. Se selecciona con F6, RenderHeight=2160 o --render-height 4k. Requiere más trabajo de GPU que 1080p.
+
+Mandos: hasta cuatro dispositivos Xbox/XInput, incluidos genéricos en ese modo.
+Los slots XInput 0–3 corresponden a jugadores 1–4; el teclado comparte jugador 1,
+sin consumir un puerto extra. Los puertos conservan su asignación al desconectar
+un mando. La consola informa conexiones/desconexiones por jugador. Si el genérico
+tiene selector X/D, usar X (XInput); un dispositivo solo DirectInput no usa esta ruta.
+F11 o Alt+Enter alterna pantalla completa sin bordes; mantener la tecla pulsada
+no vuelve a alternar. La resolución interna se cambia por separado con F6.
+
+La propuesta de mapper de mandos, con comparación de los otros ports, está en
+[CONTROLLER-MAPPING-RESEARCH.md](docs/CONTROLLER-MAPPING-RESEARCH.md).
+
+
+Mapper de mandos: F7 abre Controles. Elige jugador 1–4 y mando XInput 1–4;
+si el mando ya estaba asignado, se intercambia con el del otro jugador. El teclado
+puede compartirse con un solo jugador. Selecciona Mando o Teclado, una acción y
+una de sus tres asignaciones; suelta los controles y pulsa el botón/tecla o mueve
+el eje. Escape cancela la captura. Hay zona muerta (0–50%) e inversión de ejes.
+Guardar y cerrar aplica y escribe controls.json junto al EXE (con respaldo .bak);
+Cancelar descarta los cambios. Mientras el panel está abierto el juego recibe
+controles neutros; al cerrar, suelta los controles para volver a jugar.
+
+Pendiente: SDL3 para mandos genéricos sin XInput. Esta versión del mapper usa
+Xbox/XInput; si el mando genérico tiene selector X/D, usar X.

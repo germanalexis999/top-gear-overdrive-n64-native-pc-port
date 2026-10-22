@@ -1,3 +1,18 @@
+## v0.1.0-preview.8 — mapper, mandos y pantalla completa
+
+- Nuevo panel F7: perfiles por jugador, asignacion de mando/teclado, tres bindings
+  por accion, zona muerta, inversion, captura y guardado controls.json.
+  El usuario confirmó el funcionamiento del mapper. SDL3 para genéricos sin
+  XInput sigue pendiente.
+- Se consultan los cuatro slots XInput y se transmiten cuatro puertos al juego,
+  con botones, stick y estado de conexión independientes. Se eliminó la máscara
+  fija de jugador 1 y el límite de un canal en el hook SI.
+- El teclado comparte jugador 1 por defecto y puede asignarse a otro jugador;
+  los mandos adicionales no replican su entrada.
+  Se limpia la entrada y el error de puerto se actualiza al desconectar/reconectar.
+- F11 y Alt+Enter ignoran repetición de tecla al alternar pantalla completa.
+- Compatible con mandos Xbox y genéricos configurados en modo XInput.
+
 ## v0.1.0-preview.7 — Windows 10/11 x64
 
 Versión preliminar con renderizado HD por GPU y opción 4K.

@@ -93,6 +93,8 @@ def main():
                 or not re.search(r"\[DXGI\] Presents: [1-9]\d*",dxgi_log)
                 or not re.search(r"resizes: [1-9]\d*, resident HD frames: [1-9]\d*, final CPU readbacks: 0\.",dxgi_log)
                 or not re.search(r"\[Native render\].*scale: 1(?:\.0+)?\.",dxgi_log)
+                or "[Fullscreen check] F11 enter and repeat suppression: PASS." not in dxgi_log
+                or "[Fullscreen check] F11 exit and repeat suppression: PASS." not in dxgi_log
                 or "Presentation failed:" in dxgi_log or "Replay failed:" in dxgi_log):
                 raise RuntimeError("Packaged DXGI/native timing check failed:\n"+dxgi_log[-3000:])
             (ROOT/"build/package-test-dxgi.log").write_text(dxgi_log,encoding="utf-8")

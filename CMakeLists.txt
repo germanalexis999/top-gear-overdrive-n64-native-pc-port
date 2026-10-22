@@ -34,6 +34,8 @@ if (NOT RECOMP_SOURCES OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/Reco
 endif()
 
 add_executable(tgod_native
+    src/controller_profiles.cpp
+    src/controller_mapper.cpp
     src/main.cpp
     src/rom_loader.cpp
     src/f3dex2.cpp

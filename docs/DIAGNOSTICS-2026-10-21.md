@@ -704,3 +704,74 @@ contadores. Logs finales: `dxgi_package_test_final.log`, `package-test.log`,
   carrera HD y presentación DXGI de 24 s iniciada en 4K y alternando todos los modos,
   resize/fullscreen/filtro, sin readback final y escala nativa 1.0.
   SHA256: 171533ed12a00ae0e3f6aaa1f6f405f906a4c84c626595d6efb7831068a25a89.
+
+
+## Cuatro mandos y F11
+
+Causa: XInputGetState solo consultaba slot 0; los callbacks solo anunciaban
+controller_num=0; tgod_poll_si forzaba máscara de presencia 1, escaneaba un canal,
+y solo rellenaba OSContPad 0 y la primera respuesta SI. El juego sí recorre cuatro
+puertos en func_80009108. func_80047128 consume respuestas SI de 8 bytes y produce
+OSContPad de 6 bytes. El byte 0x80100184 controla canales a recorrer, no el número
+de dispositivos conectados: se fija a 4, incluso si hay huecos entre mandos.
+
+Corrección: captura independiente y protegida por mutex de los cuatro slots,
+XInput inicializado una vez, sondeo limitado a 4 ms, teclado compartido con P1,
+actualización completa de máscara/respuestas/OSContPad y error 8 para ausentes.
+No se editan archivos generados ni dependencias. Tests sin ROM comprueban cuatro
+entradas diferentes, extremos de stick, disposición SI/OSContPad, máscara 15,
+huecos de puertos, limpieza al desconectar, reconexión y límites de buffers.
+
+F11 ya existía; se corrigió la repetición tanto en WM_KEYDOWN como WM_SYSKEYDOWN
+(y Alt+Enter). La prueba de presentación ahora envía los mensajes F11 reales,
+comprueba entrar/salir y confirma que un mensaje repetido no cambia el estado.
+No había mandos XInput conectados al consultar los cuatro slots en esta sesión;
+la validación con mandos físicos queda pendiente. El usuario informa un mando
+Xbox y otro genérico que funciona como Xbox; debe estar en modo XInput.
+
+
+Resultado de validación: PASS regresiones software (incluidas las cuatro entradas
+simuladas), carrera DXGI 24 s con F11 entrar/salir y repetición, catálogos 4/4,
+audio 0/0/0, EEPROM y escala nativa 1.0. PASS prueba del ZIP extraído con PATH
+solo Windows y sus DLL: nativo 16 s, HD 20 s y DXGI 24 s con todos los modos.
+ZIP local: build/input-package/top-gear-overdrive-v0.1.0-preview.8.input.local-windows-x64.zip.
+SHA256: fd19ea2a5dedefadcc0ba41e311e15d9999c86b6aaacdb1c6c459e642e629dcf.
+No publicado; queda pendiente confirmar dos/cuatro mandos físicos y partida
+multijugador completa. Las pruebas simuladas no sustituyen esa comprobación.
+
+
+## Primera implementación del mapper F7 (XInput)
+
+Se separaron lectura XInput/teclado, perfiles/mapeo y adaptación SI/runtime.
+controller_profiles.cpp contiene defaults, validación, persistencia JSON y
+conversión a Snapshot; controller_mapper.cpp contiene el panel Win32 y sondeo.
+El estado de configuración/entrada se protege con mutex; la UI edita una copia.
+La ventana es propiedad del hilo principal y no sustituye el HWND de DXGI.
+Al cerrar se exige liberar controles antes de reactivar la entrada del juego.
+El backend sondea mandos conectados cada 4 ms y reintenta ausentes cada 250 ms.
+
+El panel permite perfiles con nombre por jugador, intercambio de mandos,
+transferencia del teclado, tres bindings por acción/dispositivo, botones/ejes/
+gatillos, captura con filtro de mando y umbral, zona muerta e inversión. Guarda
+controls.json versión 1 junto al EXE con backup y reemplazo atómico; errores no
+sobrescriben una configuración inválida durante la carga. controls.json y .bak
+están ignorados por Git. No se integran fuentes ni dependencias de los ejemplos.
+
+Compilación Release de tgod_native correcta. No se añadieron ni ejecutaron
+pruebas nuevas en esta entrega; quedan pendientes la revisión interactiva y
+los mandos físicos. SDL3 para genéricos que no exponen XInput sigue PENDIENTE.
+No hay identificación de modelo/serie: las asignaciones usan slots XInput.
+
+ZIP local del mapper (compilado, no probado interactivamente):
+build/mapper-package/top-gear-overdrive-v0.1.0-preview.8.mapper.local-windows-x64.zip.
+SHA256 b4781a3aa77c034eefe8d96fa45898c56ba451f98669ddcc31a5fe9f26c28b03.
+Auditoría de fuentes: 64 textos permitidos. Auditoría de paquete: 25 archivos
+permitidos con hashes y dependencias PE, sin ROM/capturas/datos/guardados.
+
+## Publicación preview.8 — 2026-10-22
+
+El usuario confirmó que el mapper funciona y solicitó publicar código y ZIP.
+Se conserva el ejecutable de la compilación probada por el usuario; el paquete
+oficial registra el commit limpio de fuentes. No se ejecutan pruebas nuevas
+en esta publicación. SDL3 para genéricos sin XInput permanece pendiente.
+La confirmación no equivale a validar una carrera con cuatro mandos físicos.
