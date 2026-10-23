@@ -4,6 +4,7 @@
 #include "controller_input.hpp"
 #include <ultramodern/ultramodern.hpp>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
@@ -745,6 +746,100 @@ static void check_controller_ports() {
     std::cout<<"PASS: four independent controller ports, button/stick mapping, SI/OSContPad bytes, sparse slots, disconnect/reconnect.\n";
 }
 
+static void check_cpu_texture_math(uint8_t* ram) {
+    F3DEX2Interpreter r(ram);
+    uint32_t random=0x61704754;
+    auto next=[&] {random=random*1664525u+1013904223u;return random;};
+    auto lod_reference=[&](float footprint) {
+        F3DEX2Interpreter::TextureLOD lod;
+        if(!(r.other_mode_h&(1u<<16)))return lod;
+        const bool sharpen=(r.other_mode_h&(1u<<17))!=0,detail=(r.other_mode_h&(1u<<18))!=0;
+        if(sharpen||detail)footprint=std::max(footprint,r.primitive_min_lod/32.0f);
+        footprint=std::max(footprint,1e-8f);
+        int level=int(std::floor(std::log2(footprint)));
+        lod.fraction=footprint/std::ldexp(1.0f,std::max(level,0))-1.0f;
+        if(sharpen&&footprint<1)lod.fraction=footprint-1;
+        if(detail){if(lod.fraction<0)lod.fraction=footprint;++level;}
+        else if(level>=r.texture_max_level)lod.fraction=1;
+        if(detail||sharpen)level=std::max(level,0);
+        else lod.fraction=std::max(lod.fraction,0.0f);
+        lod.first=uint8_t(std::clamp(level,0,int(r.texture_max_level)));
+        lod.second=uint8_t(std::clamp(level+1,0,int(r.texture_max_level)));
+        return lod;
+    };
+    auto compare_lod=[&](float footprint) {
+        const uint32_t flags=next();
+        r.other_mode_h=(flags&7)<<16;r.texture_max_level=(flags>>3)&7;r.primitive_min_lod=flags>>8;
+        const auto a=lod_reference(footprint),b=r.select_texture_lod(footprint);
+        require(a.first==b.first&&a.second==b.second&&
+            std::bit_cast<uint32_t>(a.fraction)==std::bit_cast<uint32_t>(b.fraction),
+            "Optimized LOD differs from log2/ldexp reference");
+    };
+    // Both sides of powers of two, including log2f rounding up just below them.
+    for(uint32_t exponent=1;exponent<255;++exponent)
+        for(int delta=-1024;delta<=1024;++delta)
+            compare_lod(std::bit_cast<float>((exponent<<23)+delta));
+    for(int i=0;i<100000;++i)compare_lod(std::bit_cast<float>(next()%0x7F800000u));
+
+    auto sample_reference=[&](const F3DEX2Interpreter::Tile& tile,float s,float t,bool linear,uint8_t (&color)[4]) {
+        std::fill(color,color+4,0);
+        s=std::ldexp(s,tile.shift_s<=10 ? -int(tile.shift_s):16-int(tile.shift_s))-float(tile.uls)-tile.uls_fraction/4.0f;
+        t=std::ldexp(t,tile.shift_t<=10 ? -int(tile.shift_t):16-int(tile.shift_t))-float(tile.ult)-tile.ult_fraction/4.0f;
+        if(!std::isfinite(s)||!std::isfinite(t)||std::abs(s)>10000000.0f||std::abs(t)>10000000.0f)return false;
+        const int32_t x=int32_t(std::floor(s)),y=int32_t(std::floor(t));
+        if(!linear)return r.fetch_tile_texel(tile,x,y,color[0],color[1],color[2],color[3]);
+        const float fs=std::floor((s-float(x))*32.0f)/32.0f,ft=std::floor((t-float(y))*32.0f)/32.0f;
+        float weights[4]{};uint8_t samples[4][4]{};
+        if(((r.other_mode_h>>12)&3)==3&&fs==0.5f&&ft==0.5f)std::fill(weights,weights+4,0.25f);
+        else if(fs+ft<1){weights[0]=1-fs-ft;weights[1]=fs;weights[2]=ft;}
+        else {weights[1]=1-ft;weights[2]=1-fs;weights[3]=fs+ft-1;}
+        for(int i=0;i<4;++i)if(!r.fetch_tile_texel(tile,x+(i&1),y+(i>>1),samples[i][0],samples[i][1],samples[i][2],samples[i][3]))return false;
+        for(int channel=0;channel<4;++channel){
+            float value=0;for(int i=0;i<4;++i)value+=samples[i][channel]*weights[i];
+            color[channel]=uint8_t(std::clamp(value,0.0f,255.0f));
+        }
+        return true;
+    };
+    for(auto& value:r.tmem)value=next()>>24;
+    for(int i=0;i<50000;++i) {
+        F3DEX2Interpreter::Tile tile;
+        const uint32_t flags=next();
+        tile.format=(flags>>3)%5;tile.size=flags&3;tile.line=(flags>>6)&15;
+        tile.tmem_addr=(flags>>10)&4095;tile.palette=(flags>>22)&15;
+        tile.lrs=31;tile.lrt=15;tile.shift_s=(flags>>14)&15;tile.shift_t=(flags>>18)&15;
+        tile.mask_s=(flags>>2)&15;tile.mask_t=(flags>>8)&15;
+        tile.clamp_s=(flags>>1)&1;tile.clamp_t=(flags>>5)&1;
+        tile.mirror_s=(flags>>7)&1;tile.mirror_t=(flags>>11)&1;
+        r.other_mode_h=((flags>>26)&3)<<12;
+        const float s=i%2 ? std::bit_cast<float>(next()):int32_t(next()%65536)-32768.5f;
+        const float t=i%2 ? std::bit_cast<float>(next()):int32_t(next()%65536)-32768.5f;
+        uint8_t a[4]{},b[4]{};const bool linear=flags&1;
+        const bool valid_a=sample_reference(tile,s,t,linear,a),valid_b=r.sample_tile(tile,s,t,linear,b);
+        require(valid_a==valid_b&&(!valid_a||std::memcmp(a,b,4)==0),"Optimized filter differs from ldexp/four-fetch reference");
+    }
+    // Independently check modulo addressing, including negative coordinates.
+    auto coordinate_reference=[](int32_t c,bool clamp,bool mirror,uint32_t mask) {
+        if(clamp)c=std::clamp(c,0,31);
+        if(mask){const int period=1<<mask;int phase=c%(period*2);if(phase<0)phase+=period*2;
+            c=mirror&&phase>=period ? period*2-1-phase:phase%period;}
+        return c;
+    };
+    for(int i=0;i<50000;++i) {
+        F3DEX2Interpreter::Tile tile;tile.format=0;tile.size=2;tile.line=8;tile.lrs=tile.lrt=31;
+        const uint32_t flags=next();tile.mask_s=flags&15;tile.mask_t=(flags>>4)&15;
+        tile.clamp_s=(flags>>8)&1;tile.clamp_t=(flags>>9)&1;tile.mirror_s=(flags>>10)&1;tile.mirror_t=(flags>>11)&1;
+        const int32_t s=int32_t(next()%20000001)-10000000,t=int32_t(next()%20000001)-10000000;
+        const auto x=coordinate_reference(s,tile.clamp_s,tile.mirror_s,tile.mask_s);
+        const auto y=coordinate_reference(t,tile.clamp_t,tile.mirror_t,tile.mask_t);
+        const uint32_t address=(uint32_t(y)*64+uint32_t(x)*2)^((y&1)?4u:0u);
+        const uint16_t pixel=uint16_t(r.tmem[address&4095]<<8|r.tmem[(address+1)&4095]);
+        uint8_t color[4]{};require(r.fetch_tile_texel(tile,s,t,color[0],color[1],color[2],color[3]),"Modulo fixture rejected");
+        require(color[0]==((pixel>>11)&31)*255/31&&color[1]==((pixel>>6)&31)*255/31&&
+            color[2]==((pixel>>1)&31)*255/31&&color[3]==((pixel&1)?255:0),"Bitmask addressing differs from positive modulo");
+    }
+    std::cout<<"PASS: CPU texture math matches reference LOD boundaries/random values, shifts/filtering and signed mask addressing.\n";
+}
+
 int main() {
     try {
         check_controller_ports();
@@ -759,6 +854,7 @@ int main() {
         require(tgod::normalize_rom_bytes(swapped32) && swapped32 == expected, "n64 normalization failed");
         require(!tgod::normalize_rom_bytes(invalid) && !tgod::normalize_rom_bytes(truncated), "Invalid ROM header accepted");
         std::vector<uint8_t> ram(8 * 1024 * 1024);
+        check_cpu_texture_math(ram.data());
         check_texture_rows(ram.data());
         check_tile_sampling(ram.data());
         check_intro_texture_masks(ram.data());

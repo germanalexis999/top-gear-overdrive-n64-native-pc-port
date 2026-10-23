@@ -1,8 +1,45 @@
 # Estado del port — 2026-10-23
 
+Optimización CPU de texturas aplicada y comprobada: tres tareas reales bajaron
+de 69.53/68.28/61.97 ms a 34.54/34.03/30.80 ms. Los 8 MiB de salida coinciden
+byte por byte con la versión anterior. Carrera 4K/Full con las mismas mejoras:
+CPU ~33 ms y ~22 tareas/s (antes ~67 ms y ~12.6 tareas/s). Nativo: ~22.8 tareas/s.
+Pasaron regresiones CPU/GPU y presentación DXGI; las dos carreras de 24 s
+salieron con código 0. Revisión preparada para v0.1.0-preview.11. No confirma aún
+cuadros nuevos realmente mostrados por segundo ni resolución del síntoma
+subjetivo específico de F6; tampoco establece el ritmo original de la consola.
+
+Fluidez 4K frente a F6 nativo, diagnóstico previo: el contador anterior mostraba VI/s como FPS.
+El título ahora separa VI, tareas gráficas/s y tiempos de rasterizado CPU/GPU;
+la consola añade edad del snapshot. Son métricas diferentes de FPS de física y
+de latencia completa. Comparaciones automáticas locales: nativo y 4K/Full dieron
+12.68 y 12.60 tareas/s, respectivamente; CPU nativa ~67 ms, GPU 4K ~7 ms.
+No reproducen una caída de ritmo exclusiva de 4K; sí muestran coste nativo alto
+y preparación HD adicional. Capturas de carrera revisadas. Se optimizó la
+importación de buffers HD conservando el muestreo: replay medio 19.4 → 13.3 ms,
+sin mejora del ritmo GFX ni de edad visible demostrada en ese primer cambio.
+La optimización posterior de texturas descrita arriba sí mejoró GFX. Evidencia y límites en
+DETAIL-AND-DRAW-DISTANCE.md. No se modificó VSync ni temporización para este síntoma.
+
+Cierre al seleccionar ROM con Full: reproducido con GDB y corregido. Había una
+dirección KSEG sin extensión de signo en el callback de arranque; se corrigieron
+también dos lecturas similares del módulo de mejoras. El EXE local arranca con
+el perfil mejorado 4K/Full. Full/1080p llegó a Mode 2 en diagnóstico; quedan
+límites de comprobación descritos en DETAIL-AND-DRAW-DISTANCE.md. No publicado.
+
+Cambios locales experimentales de detalle/distancia: opciones `ForceHighDetail`,
+`DrawDistancePercent` y `ExtraTrackSections` en tgod.ini. Hooks de selección del
+primer modelo por distancia, parámetros de cámara y consulta extra de decorado.
+LegacyVersion=true fuerza los valores originales. LegacyVersion=false activa
+el perfil mejorado, personalizable con las otras claves. Compilado; no hay
+confirmación de desaparición del popping; primeras mediciones de rendimiento arriba. Alcance
+y direcciones en [DETAIL-AND-DRAW-DISTANCE.md](DETAIL-AND-DRAW-DISTANCE.md).
+
 Expansion Pak: se conservan los 8 MiB y se incorporó una preferencia reversible
 de arranque `OriginalResolution=game|off|half|full`, separada de F6, con `game`
-por defecto. Hook explícito tras la inicialización, sin escrituras continuas.
+por defecto en preview.10. El perfil mejorado local usa Full si no hay otra
+preferencia guardada; legacy deja la selección al juego. Hook explícito tras la
+inicialización, sin escrituras continuas.
 El renderer recibe las dimensiones originales y usa escalas X/Y separadas en
 CPU, GPU, LOD, readbacks y scanout; Half conserva el área visible reducida.
 Se recrean superficies al cambiar su altura y se distinguen modos en los frames

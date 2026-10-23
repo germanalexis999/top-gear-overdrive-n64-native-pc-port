@@ -84,6 +84,13 @@ y no puede combinarse con `--graphics-check`. No modifica la intro normal.
 
 ## Resolución interna y configuración gráfica
 
+Interruptor general en `[Graphics]`: `LegacyVersion=true` usa resolución nativa,
+LOD y distancias originales, sin sectores extra. Tiene prioridad sobre las otras
+claves y los argumentos gráficos; F6 queda en nativo. `LegacyVersion=false`
+activa el perfil mejorado: las claves ausentes toman 1080p, Full, detalle alto,
+200% de distancia y dos sectores extra. Las claves individuales lo personalizan.
+Se conservan los valores guardados al alternar perfiles; reinicia al cambiarlo.
+
 F6 alterna **nativo → 720p → 1080p → 4K → nativo**. La elección aparece en el título
 y se guarda en `tgod.ini`, junto al EXE, en `[Graphics]`, clave `RenderHeight`:
 `0` conserva el modo del juego; `720`, `1080` y `2160` (4K) dibujan a mayor resolución.
@@ -99,6 +106,18 @@ laterales. F1–F4 cambian el tamaño de ventana; F5 cambia el filtro de present
 Esos controles no reemplazan la resolución interna de F6. Los modos 2D/VI
 pueden tener recortes propios del juego.
 
+### Modelos y distancia de dibujo (experimental)
+
+En `[Graphics]` de `tgod.ini`, `ForceHighDetail=1` selecciona el modelo de cerca
+en la familia que usa variantes por distancia. `DrawDistancePercent=200` amplía
+las distancias hasta el doble y `ExtraTrackSections=2` consulta sectores extra
+de decorado. Reinicia el juego después de editarlos. Para volver al original:
+`ForceHighDetail=0`, `DrawDistancePercent=100`, `ExtraTrackSections=0`.
+
+Se mantienen los límites de las listas y los modelos disponibles: no garantiza
+eliminar todo el popping. Compilado; comparación visual y rendimiento pendientes.
+Detalles en [DETAIL-AND-DRAW-DISTANCE.md](DETAIL-AND-DRAW-DISTANCE.md).
+
 ### Ajuste original de Expansion Pak
 
 El port siempre proporciona 8 MiB de RDRAM. El ajuste original y la resolución
@@ -110,8 +129,8 @@ RenderHeight=1080
 OriginalResolution=full
 ```
 
-`OriginalResolution` admite `game` (predeterminado, deja los ajustes originales),
-`off`, `half` o `full`. Se aplica una sola vez tras inicializar/cargar los ajustes
+`OriginalResolution` admite `game` (deja los ajustes originales),
+`off`, `half` o `full` (valor inicial del perfil mejorado). Se aplica una sola vez tras inicializar/cargar los ajustes
 del juego; después puedes cambiarlo desde Setup. Para desactivar la preferencia
 de arranque, vuelve a `game`. El menú puede guardar elecciones en el guardado
 original, igual que antes; `game` no borra esas elecciones.
@@ -127,15 +146,14 @@ Half conserva el área reducida de 640×120 con bandas arriba y abajo. El juego
 mantiene sus restricciones de escena/multijugador. El escalado usa dimensiones
 de la escena y ejes separados: a 1080p Full tiene superficie 1440×1080 y Half
 1440×540 centrada; la intro de 640×480 usa su escala propia. El área VI visible
-puede recortar márgenes. No se fuerza Full por defecto. Esta implementación está
+puede recortar márgenes. Legacy deja la selección original al juego. Esta implementación está
 compilada y pendiente de comparación visual e interactiva de todos esos modos.
 Evidencia en [EXPANSION-PAK-RESEARCH.md](EXPANSION-PAK-RESEARCH.md).
 
 **Las fuentes posteriores a preview.6 usan GPU Direct3D 11 para 720p/1080p/4K.**
 Se requiere un adaptador con feature level 11.0; no se usa WARP/software como si
 fuera hardware. Si no está disponible, o falla el dispositivo, se informa en la
-consola y se vuelve al renderer HD por CPU, mucho más lento. Nativo sigue siendo
-el valor predeterminado. El juego y los eventos SP/DP conservan el renderer nativo;
+consola y se vuelve al renderer HD por CPU, mucho más lento. Legacy selecciona nativo; el perfil mejorado usa 1080p si no hay preferencia guardada. El juego y los eventos SP/DP conservan el renderer nativo;
 el trabajador HD usa memoria privada y nunca entrega esos eventos. Se eliminó el
 tope de captura de 100 ms de preview.6; sigue habiendo un trabajo pendiente máximo,
 que se sustituye por el más reciente. No se añaden cuadros a la simulación.
@@ -254,3 +272,31 @@ CMake compila SDL3.dll y la copia junto al EXE. SDL no sustituye DXGI ni WaveOut
 El empaquetador incluye esa DLL, su licencia zlib y su revisión en SOURCE.md.
 El build MinGW compila el recurso de versión sin los -I heredados para evitar
 un problema de windres con rutas que contienen espacios; SDL no se modifica.
+
+## Comparación del rasterizador CPU
+
+En una copia aislada del paquete, con un `tgod.ini` que conserve las opciones
+que se quieren medir:
+
+```powershell
+.\tgod_native.exe --rom "ruta\propia.z64" --headless --performance-check --seconds 24 --render-height 2160
+```
+
+Este modo navega hasta la primera carrera y guarda métricas, capturas y tres
+entradas `cpu_task_16.bin`, `cpu_task_60.bin`, `cpu_task_120.bin` junto al EXE.
+Esas entradas contienen memoria del juego y solo sirven para diagnóstico local;
+no deben publicarse ni incluirse en ZIP. El formato depende del ABI y de la
+disposición de estado del renderer de esta revisión; no es un save-state portable.
+
+Compilar la herramienta opcional y reproducir una captura desde el checkout:
+
+```powershell
+cmake --build build --target tgod_cpu_benchmark
+.\build\tgod_cpu_benchmark.exe "ruta\cpu_task_60.bin" "build\salida.rdram"
+```
+
+La herramienta excluye la primera repetición del tiempo medio y verifica que
+las diez siguientes produzcan la misma memoria. Para comparar optimizaciones,
+conservar el benchmark anterior y ejecutar ambos con la misma captura compatible;
+comparar los archivos de salida completos además de los tiempos. Resultados y
+límites actuales en `docs/DETAIL-AND-DRAW-DISTANCE.md`.

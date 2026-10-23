@@ -47,3 +47,17 @@ ignored = [
 func = "func_8002C930"
 before_vram = 0x8002CBA0
 text = "{ extern void tgod_apply_original_resolution(uint8_t*); tgod_apply_original_resolution(rdram); }"
+
+[[patches.hook]]
+func = "func_800121A8"
+text = "{ extern void tgod_extend_camera(uint8_t*, recomp_context*); tgod_extend_camera(rdram, ctx); }"
+
+[[patches.hook]]
+func = "func_80004B50"
+before_vram = 0x80005CC4
+text = "{ extern void tgod_select_high_detail(uint8_t*, recomp_context*); tgod_select_high_detail(rdram, ctx); }"
+
+[[patches.hook]]
+func = "func_8003597C"
+before_vram = 0x80035AA8
+text = "{ extern void tgod_extend_track_visibility(uint8_t*, recomp_context*); tgod_extend_track_visibility(rdram, ctx); }"

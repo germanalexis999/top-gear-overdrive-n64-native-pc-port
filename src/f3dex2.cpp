@@ -6,6 +6,7 @@
 #include <vector>
 #include <iomanip>
 #include <string>
+#include <bit>
 
 static inline uint16_t f3d_read_u16(const uint8_t* rdram, uint32_t addr) {
     return *reinterpret_cast<const uint16_t*>(rdram + ((addr & 0x00FFFFFF) ^ 2));
@@ -305,9 +306,10 @@ bool F3DEX2Interpreter::fetch_tile_texel(const Tile& tile, int32_t su, int32_t s
         if (clamp) coordinate = std::clamp(coordinate, 0, extent - 1);
         if (mask) {
             const int32_t period = 1 << mask;
-            int32_t phase = coordinate % (period * 2);
-            if (phase < 0) phase += period * 2;
-            coordinate = mirror && phase >= period ? period * 2 - 1 - phase : phase % period;
+            // Unsigned reduction is identical to positive modulo for a power
+            // of two, including negative texture coordinates.
+            const int32_t phase = int32_t(uint32_t(coordinate) & uint32_t(period * 2 - 1));
+            coordinate = mirror && phase >= period ? period * 2 - 1 - phase : phase & (period - 1);
         }
         // With neither clamp nor mask, the coordinate is not bounded by SETTILESIZE.
         return coordinate;
@@ -422,8 +424,15 @@ F3DEX2Interpreter::TextureLOD F3DEX2Interpreter::select_texture_lod(float footpr
     const bool detail = (other_mode_h & (1u << 18)) != 0;
     if (sharpen || detail) footprint = std::max(footprint, primitive_min_lod / 32.0f);
     footprint = std::max(footprint, 1e-8f);
-    int level = int(std::floor(std::log2(footprint)));
-    lod.fraction = footprint / std::ldexp(1.0f, std::max(level, 0)) - 1.0f;
+    const uint32_t bits=std::bit_cast<uint32_t>(footprint);
+    int level=int((bits>>23)&255)-127;
+    // log2f may round a value just below a power of two up to an integer.
+    // Preserve that existing boundary behavior, rather than silently switching
+    // to mathematical floor(log2). The ordinary case only needs the exponent.
+    if((bits&0x7FFFFF)>=0x7FFF00 || !std::isfinite(footprint))
+        level=int(std::floor(std::log2(footprint)));
+    const float level_scale=std::bit_cast<float>(uint32_t(std::max(level,0)+127)<<23);
+    lod.fraction = footprint / level_scale - 1.0f;
     if (sharpen && footprint < 1) lod.fraction = footprint - 1;
     if (detail) {
         if (lod.fraction < 0) lod.fraction = footprint;
@@ -443,6 +452,9 @@ bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool lin
     std::fill(color, color + 4, 0);
     auto shift_coordinate = [](float coordinate, uint32_t shift) {
         // RDP shifts 0..10 divide; 11..15 multiply by 2^(16-shift).
+        static constexpr float factors[]={1,0.5f,0.25f,0.125f,0.0625f,0.03125f,
+            0.015625f,0.0078125f,0.00390625f,0.001953125f,0.0009765625f,32,16,8,4,2};
+        if(shift<16)return coordinate*factors[shift];
         return std::ldexp(coordinate, shift <= 10 ? -int(shift) : 16 - int(shift));
     };
     s = shift_coordinate(s, tile.shift_s) - float(tile.uls) - tile.uls_fraction / 4.0f;
@@ -469,6 +481,9 @@ bool F3DEX2Interpreter::sample_tile(const Tile& tile, float s, float t, bool lin
         weights[1]=1-ft; weights[2]=1-fs; weights[3]=fs+ft-1;
     }
     for (int i = 0; i < 4; ++i) {
+        // Three-point filtering never uses all four neighbors except at the
+        // G_TF_AVERAGE center. A zero weight cannot contribute to the result.
+        if(weights[i]==0)continue;
         if (!fetch_tile_texel(tile, x + (i & 1), y + (i >> 1),
             samples[i][0], samples[i][1], samples[i][2], samples[i][3])) return false;
     }
@@ -732,6 +747,8 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
         untextured_triangles++;
     }
     const bool perspective = (other_mode_h & (1u << 19)) != 0;
+    const bool texture_lod = (other_mode_h & (1u << 16)) != 0;
+    const bool linear_texture = ((other_mode_h >> 12) & 3) >= 2 && ((other_mode_h >> 20) & 3) != 2;
     float inv_w0 = perspective ? 1.0f / (std::abs(v0.clip_w) > 0.0001f ? std::abs(v0.clip_w) : 1.0f) : 1.0f;
     float inv_w1 = perspective ? 1.0f / (std::abs(v1.clip_w) > 0.0001f ? std::abs(v1.clip_w) : 1.0f) : 1.0f;
     float inv_w2 = perspective ? 1.0f / (std::abs(v2.clip_w) > 0.0001f ? std::abs(v2.clip_w) : 1.0f) : 1.0f;
@@ -804,18 +821,19 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     tv = (w0_p * v0.v + w1_p * v1.v + w2_p * v2.v) * inv_sum;
 
                     uint8_t sampled[4]{};
-                    const bool linear = ((other_mode_h >> 12) & 3) >= 2 && ((other_mode_h >> 20) & 3) != 2;
                     TextureLOD lod;
-                    const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum)/scale,
-                        std::abs((uy-tu*wy)*inv_sum)/scale_y, std::abs((vx-tv*wx)*inv_sum)/scale,
-                        std::abs((vy-tv*wy)*inv_sum)/scale_y});
-                    lod = select_texture_lod(footprint);
+                    if(texture_lod) {
+                        const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum)/scale,
+                            std::abs((uy-tu*wy)*inv_sum)/scale_y, std::abs((vx-tv*wx)*inv_sum)/scale,
+                            std::abs((vy-tv*wy)*inv_sum)/scale_y});
+                        lod = select_texture_lod(footprint);
+                    }
                     lod_fraction = int32_t(lod.fraction * 255.0f);
                     const Tile& first = lod.first ? tiles[(cur_tile + lod.first) & 7] : tile;
-                    texel_valid = sample_tile(first, tu, tv, linear, sampled);
+                    texel_valid = sample_tile(first, tu, tv, linear_texture, sampled);
                     tr = sampled[0]; tg = sampled[1]; tb = sampled[2]; ta = sampled[3];
                     if (uses_second_texture) {
-                        sample_tile(tiles[(cur_tile + lod.second) & 7], tu, tv, linear, second_texel);
+                        sample_tile(tiles[(cur_tile + lod.second) & 7], tu, tv, linear_texture, second_texel);
                     } else {
                         std::copy(sampled, sampled + 4, second_texel);
                     }

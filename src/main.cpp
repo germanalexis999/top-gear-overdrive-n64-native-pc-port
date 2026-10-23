@@ -31,6 +31,7 @@
 #include "vi_scanout.hpp"
 #include "controller_input.hpp"
 #include "controller_mapper.hpp"
+#include "graphics_enhancements.hpp"
 
 // Recompiled function headers and overlay definitions
 #include "funcs.h"
@@ -49,11 +50,13 @@ static std::atomic<float> g_stick_y{0.0f};
 static std::atomic<bool> g_running{true};
 static bool g_is_headless = false;
 static bool g_presentation_check = false;
+static bool g_performance_check = false;
 static std::atomic<uint32_t> g_render_height{0};
 static bool g_resolution_check = false;
 static std::atomic<bool> g_resolution_check_done{false};
 static std::atomic<uint64_t> g_native_render_us{0},g_native_render_count{0},g_native_render_max_us{0};
 static std::filesystem::path g_graphics_config;
+static bool g_legacy_version = false;
 static int g_original_resolution = -1; // -1: game, 0: off, 1: half, 2: full
 static bool g_original_resolution_applied = false;
 
@@ -71,7 +74,9 @@ extern "C" void tgod_apply_original_resolution(uint8_t* rdram) {
     if(g_original_resolution_applied)return;
     g_original_resolution_applied=true;
     if(g_original_resolution>=0 && g_original_resolution<=2) {
-        MEM_B(0x80102344,0)=uint8_t(g_original_resolution);
+        // MEM_* expects a sign-extended KSEG base, not a positive 32-bit
+        // absolute address in its offset argument.
+        MEM_B(0,(gpr)(int32_t)0x80102344)=uint8_t(g_original_resolution);
         std::cout<<"[Graphics] Original startup mode: "
             <<(g_original_resolution==2 ? "Full":g_original_resolution==1 ? "Half":"Off")
             <<"; subsequent Setup choices remain available.\n";
@@ -479,6 +484,8 @@ class AsyncHDRenderer {
     std::atomic<bool> worker_done{true};
     std::atomic<uint64_t> completed{0},replaced{0},last_ms{0},gpu_frames{0};
     std::atomic<uint64_t> replay_us{0},replays{0},display_age_ms{0},resident_frames{0};
+    std::atomic<uint64_t> live_gpu_us{0};
+    uint64_t reported_gpu_samples=0,reported_gpu_us=0; // GPU worker only
     GPURaster::Statistics final_stats{};
     void start_locked() {
         if(!worker.joinable()){worker_done=false;worker=std::thread([this]{run();});}
@@ -495,6 +502,7 @@ class AsyncHDRenderer {
         bool gpu_failed=false,direct_failed=false;
         Screen screen;
         Resident resident;
+        bool performance_capture=false;
         for (;;) {
             std::unique_ptr<Job> job;
             {
@@ -572,15 +580,20 @@ class AsyncHDRenderer {
                         gpu->present_target(screen.window,resident.address,resident.width,resident.height,resident.offset,screen.smooth);
                         display_age_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-resident.captured).count();
                     } else gpu->present_native(screen.window,screen.native,screen.width,screen.height,screen.smooth);
-                    if(g_presentation_check&&gpu->statistics().presents>before_present&&gpu->statistics().presents%60==1) {
+                    const bool capture_performance=g_performance_check&&!performance_capture&&
+                        (screen.scene&255)==2&&replays.load()>300;
+                    if((g_presentation_check||capture_performance)&&gpu->statistics().presents>before_present&&
+                        (capture_performance||gpu->statistics().presents%60==1)) {
                         std::vector<uint32_t> rgba;uint32_t w=0,h=0;
                         if(gpu->capture_output(rgba,w,h)){
                             std::vector<uint16_t> pixels(rgba.size());
                             for(size_t i=0;i<rgba.size();++i){const auto p=rgba[i];
                                 pixels[i]=uint16_t(((p&255)>>3)<<11|(((p>>8)&255)>>3)<<6|(((p>>16)&255)>>3)<<1|1);
                             }
-                            const auto name="framebuffer_dxgi_"+std::to_string(gpu->statistics().presents)+".bmp";
+                            const auto name=capture_performance ? std::string("framebuffer_performance_hd.bmp") :
+                                "framebuffer_dxgi_"+std::to_string(gpu->statistics().presents)+".bmp";
                             save_fb_to_bmp(name.c_str(),reinterpret_cast<const uint8_t*>(pixels.data()),0,w,h,pixels.size()*sizeof(uint16_t));
+                            if(capture_performance)performance_capture=true;
                         }
                     }
                 } catch(const std::exception& error) {
@@ -589,11 +602,22 @@ class AsyncHDRenderer {
                     if(g_hwnd)InvalidateRect(g_hwnd,nullptr,FALSE);
                 }
             }
+            if(gpu && gpu->available() && !gpu_failed) {
+                // Poll timestamps only on their device's worker. CPU replay
+                // duration measures submission, not completed GPU execution.
+                const auto timing=gpu->statistics();
+                if(timing.gpu_samples>reported_gpu_samples) {
+                    live_gpu_us=(timing.gpu_elapsed_us-reported_gpu_us)/(timing.gpu_samples-reported_gpu_samples);
+                    reported_gpu_us=timing.gpu_elapsed_us;reported_gpu_samples=timing.gpu_samples;
+                }
+            }
         }
         if(gpu){final_stats=gpu->statistics();gpu.reset();}
         g_gpu_window_owned=false;worker_done=true;
     }
 public:
+    uint64_t gpu_raster_us() const { return live_gpu_us.load(); }
+    uint64_t snapshot_age_ms() const { return display_age_ms.load(); }
     void submit(const F3DEX2Interpreter& interpreter,const OSTask* task,uint32_t height) {
         uint64_t captured_generation=0;
         std::unique_ptr<Job> job;
@@ -789,6 +813,23 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
     };
     static uint32_t race_frames=0;
     uint32_t mode=0;std::memcpy(&mode,interpreter.rdram+0x117DA4,4);
+    if(g_performance_check&&mode==2) {
+        static uint32_t captured_race_tasks=0;
+        const auto index=++captured_race_tasks;
+        if(index==16||index==60||index==120) {
+            // Private diagnostic input, tied to this executable's ABI. Never
+            // serialize pointers, container ownership or include it in releases.
+            const auto* tail=reinterpret_cast<const char*>(&interpreter.layout_width);
+            const uint32_t tail_bytes=uint32_t(sizeof(interpreter)-(tail-reinterpret_cast<const char*>(&interpreter)));
+            const uint32_t header[]={0x43504754,1,tail_bytes,uint32_t(task->t.data_ptr),uint32_t(task->t.ucode_data),uint32_t(task->t.ucode_data_size)};
+            std::ofstream capture("cpu_task_"+std::to_string(index)+".bin",std::ios::binary);
+            capture.write(reinterpret_cast<const char*>(header),sizeof(header));
+            capture.write(reinterpret_cast<const char*>(interpreter.segments),sizeof(interpreter.segments));
+            capture.write(reinterpret_cast<const char*>(interpreter.tmem),sizeof(interpreter.tmem));
+            capture.write(tail,tail_bytes);
+            capture.write(reinterpret_cast<const char*>(interpreter.rdram),8*1024*1024);
+        }
+    }
     if (g_resolution_check && !g_resolution_check_done.load() && mode==2 && ++race_frames==100) {
         // Replay one captured display list with its initial RDRAM and RSP/RDP state
         // at each height. This compares identical geometry rather than two moving races.
@@ -1179,6 +1220,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (wParam == VK_F5) {
                 g_filter_smooth.store(!g_filter_smooth.load());
             } else if (wParam == VK_F6 && !(lParam&(1l<<30))) {
+                if(g_legacy_version) {
+                    std::cout<<"[Graphics] LegacyVersion=true: native rendering. Set false and restart to enable HD.\n";
+                    return 0;
+                }
                 const auto current=g_render_height.load();
                 const uint32_t next=current==0 ? 720 : current==720 ? 1080 : current==1080 ? 2160 : 0;
                 g_render_height.store(next);
@@ -1255,6 +1300,8 @@ int main(int argc, char** argv) {
             intro_check = true;
         } else if (arg == L"--presentation-check") {
             g_presentation_check = true;
+        } else if (arg == L"--performance-check") {
+            g_performance_check = true;
         } else if (arg == L"--resolution-check") {
             g_resolution_check = true;
         } else if (arg == L"--render-height" && i+1<arguments.size()) {
@@ -1277,7 +1324,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--original-resolution game|off|half|full] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--original-resolution game|off|half|full] [--headless --seconds N [--graphics-check | --intro-check | --performance-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -1288,6 +1335,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if(g_performance_check && (!headless || graphics_check || intro_check || g_presentation_check || g_resolution_check)) {
+        std::cerr << "--performance-check requires --headless and no other check mode.\n";
+        return 2;
+    }
     if (graphics_check && !headless) {
         std::cerr << "--graphics-check requires --headless.\n";
         return 2;
@@ -1323,22 +1374,56 @@ int main(int argc, char** argv) {
     // a shortcut, a different working directory, or by dropping a ROM onto it.
     const auto program_directory = tgod::executable_directory();
     g_graphics_config=program_directory/L"tgod.ini";
+    const bool use_graphics_config=!headless || g_performance_check;
     if(!headless)tgod::controls::initialize(program_directory);
-    uint32_t selected_height=headless ? 0 : GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,g_graphics_config.c_str());
+    if(use_graphics_config) {
+        wchar_t legacy[32]{};
+        if(GetPrivateProfileStringW(L"Graphics",L"LegacyVersion",L"",legacy,32,g_graphics_config.c_str())==0) {
+            WritePrivateProfileStringW(L"Graphics",L"LegacyVersion",L"false",g_graphics_config.c_str());
+        } else if(_wcsicmp(legacy,L"true")==0 || wcscmp(legacy,L"1")==0)g_legacy_version=true;
+        else if(_wcsicmp(legacy,L"false")!=0 && wcscmp(legacy,L"0")!=0) {
+            std::cerr<<"[Graphics] Invalid LegacyVersion; using legacy mode. Expected true or false.\n";
+            g_legacy_version=true;
+        }
+    }
+    uint32_t selected_height=use_graphics_config ? GetPrivateProfileIntW(L"Graphics",L"RenderHeight",1080,g_graphics_config.c_str()) : 0;
     if (selected_height!=720 && selected_height!=1080 && selected_height!=2160) selected_height=0;
     if (render_height_override>=0) selected_height=uint32_t(render_height_override);
-    g_render_height.store(selected_height);
     wchar_t original_mode[32]{};
-    GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"game",original_mode,32,g_graphics_config.c_str());
-    g_original_resolution=headless ? -1 : original_resolution_value(original_mode);
+    GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"full",original_mode,32,g_graphics_config.c_str());
+    g_original_resolution=use_graphics_config ? original_resolution_value(original_mode) : -1;
     if(g_original_resolution==-2) {
         std::cerr<<"[Graphics] Invalid OriginalResolution; using game.\n";g_original_resolution=-1;
     }
     if(original_resolution_override!=-2)g_original_resolution=original_resolution_override;
-    if (!headless && !std::filesystem::exists(g_graphics_config))
-        WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"0",g_graphics_config.c_str());
+    if(!headless && GetPrivateProfileStringW(L"Graphics",L"RenderHeight",L"",original_mode,32,g_graphics_config.c_str())==0)
+        WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"1080",g_graphics_config.c_str());
     if(!headless && GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"",original_mode,32,g_graphics_config.c_str())==0)
-        WritePrivateProfileStringW(L"Graphics",L"OriginalResolution",L"game",g_graphics_config.c_str());
+        WritePrivateProfileStringW(L"Graphics",L"OriginalResolution",L"full",g_graphics_config.c_str());
+    tgod::GraphicsEnhancements enhancements;
+    if(use_graphics_config) {
+        auto option=[&](const wchar_t* key,int initial,int low,int high) {
+            wchar_t stored[32]{};
+            if(GetPrivateProfileStringW(L"Graphics",key,L"",stored,32,g_graphics_config.c_str())==0) {
+                const auto value=std::to_wstring(initial);
+                WritePrivateProfileStringW(L"Graphics",key,value.c_str(),g_graphics_config.c_str());
+            }
+            return std::clamp(int(GetPrivateProfileIntW(L"Graphics",key,initial,g_graphics_config.c_str())),low,high);
+        };
+        enhancements.force_high_detail=option(L"ForceHighDetail",1,0,1)!=0;
+        enhancements.draw_distance_percent=option(L"DrawDistancePercent",200,100,200);
+        enhancements.extra_track_sections=option(L"ExtraTrackSections",2,0,2);
+    }
+    if(g_legacy_version) {
+        selected_height=0;g_original_resolution=-1;enhancements={};
+    }
+    g_render_height.store(selected_height);
+    tgod::configure_graphics_enhancements(enhancements);
+    std::cout<<"[Graphics] Profile: "<<(!use_graphics_config ? "diagnostic":g_legacy_version ? "legacy":"enhanced")
+        <<"; LegacyVersion takes priority over graphics overrides in legacy mode.\n";
+    std::cout<<"[Graphics] High detail: "<<(enhancements.force_high_detail ? "on":"game")
+        <<"; draw distance: "<<enhancements.draw_distance_percent<<"%; extra scenery sections: "
+        <<enhancements.extra_track_sections<<". Experimental, restart to change.\n";
     std::cout << "[Graphics] Internal resolution: " << (selected_height ? std::to_string(selected_height)+"p (4:3)" : "native")
               << "; F6 cycles native/720p/1080p/4K. Native timing plus hardware HD.\n";
     if (!program_directory.empty()) {
@@ -1352,7 +1437,7 @@ int main(int argc, char** argv) {
     g_audio_backend.start();
 
     // 2. Setup Win32 Window if in interactive mode
-    if (!headless || g_presentation_check) {
+    if (!headless || g_presentation_check || g_performance_check) {
         WNDCLASSEX wc{};
         wc.cbSize = sizeof(WNDCLASSEX);
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1542,6 +1627,7 @@ int main(int argc, char** argv) {
         MSG msg{};
         auto last_title_update = std::chrono::steady_clock::now();
         uint64_t last_vis = total_vis;
+        uint64_t last_native_count=g_native_render_count.load(),last_native_us=g_native_render_us.load();
 
         while (g_running.load()) {
             while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1565,14 +1651,22 @@ int main(int argc, char** argv) {
                 uint64_t cur_vis = total_vis;
                 double fps = (cur_vis - last_vis) * 1000.0 / (elapsed_ms > 0 ? elapsed_ms : 1);
                 last_vis = cur_vis;
+                const uint64_t native_count=g_native_render_count.load(),native_us=g_native_render_us.load();
+                const uint64_t native_delta=native_count-last_native_count;
+                const double gfx_rate=native_delta*1000.0/std::max(int64_t(1),int64_t(elapsed_ms));
+                const double native_ms=native_delta ? (native_us-last_native_us)/double(native_delta)/1000.0 : 0.0;
+                last_native_count=native_count;last_native_us=native_us;
+                const double gpu_ms=g_render_height.load() ? g_hd_renderer.gpu_raster_us()/1000.0 : 0.0;
+                char gpu_time[32];
+                if(gpu_ms>0)std::snprintf(gpu_time,sizeof(gpu_time),"%.1f ms",gpu_ms);
+                else std::snprintf(gpu_time,sizeof(gpu_time),"n/a");
 
                 uint32_t mode = read_rdram_u32(rdram, 0x80117DA4);
                 const char* mode_name = (mode == 0) ? "Intro" : (mode == 1) ? "Menus" : (mode == 2) ? "Race (In-Game)" : "Game";
-                uint32_t tris = g_renderer_win32 ? g_renderer_win32->interpreter.triangles_drawn : 0;
-                char title_buf[256];
+                char title_buf[384];
                 std::snprintf(title_buf, sizeof(title_buf),
-                    "Top Gear Overdrive (PC) | %s | %.1f FPS | Tris: %u | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
-                    mode_name, fps, tris, g_audio_backend.buffers_queued.load(),
+                    "Top Gear Overdrive (PC) | %s | VI: %.1f Hz | GFX: %.1f/s | CPU raster: %.1f ms | GPU raster: %s | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
+                    mode_name, fps, gfx_rate,native_ms,gpu_time,g_audio_backend.buffers_queued.load(),
                     g_filter_smooth.load() ? "Smooth" : "Crisp",
                     g_render_height.load()==2160 ? "4K (2160p)" : g_render_height.load()==1080 ? "1080p" : g_render_height.load()==720 ? "720p" : "Native");
                 SetWindowTextA(g_hwnd, title_buf);
@@ -1585,7 +1679,9 @@ int main(int argc, char** argv) {
                     uint8_t stage = read_rdram_u8(rdram, 0x80053650);
                     uint32_t itimer = read_rdram_u32(rdram, 0x80053654);
                     std::cout << "[Live] Mode: " << mode_name
-                              << " | FPS: " << std::fixed << std::setprecision(1) << fps
+                              << " | VI: " << std::fixed << std::setprecision(1) << fps<<" Hz"
+                              << " | GFX: "<<gfx_rate<<" tasks/s | CPU raster: "<<native_ms<<" ms | GPU raster: "<<gpu_time
+                              << " | HD snapshot age: "<<(g_render_height.load() ? g_hd_renderer.snapshot_age_ms():0)<<" ms"
                               << " | DLs: " << (g_renderer_win32 ? g_renderer_win32->dl_count.load() : 0)
                               << " | Screens: " << (g_renderer_win32 ? g_renderer_win32->screen_update_count.load() : 0)
                               << " | RSP_Busy: " << rsp_busy
@@ -1600,7 +1696,25 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "[Host] Waiting " << (headless_seconds * 1000) << " ms for background game threads ("
                   << (intro_check ? "uninterrupted intro capture" : "automated navigation to Mode 2") << ")...\n";
+        auto perf_time=std::chrono::steady_clock::now();
+        uint64_t perf_vis=total_vis,perf_count=g_native_render_count.load(),perf_us=g_native_render_us.load();
         for (int s = 0; s < headless_seconds * 10; s++) {
+            if(g_performance_check) {
+                MSG msg;while(PeekMessage(&msg,nullptr,0,0,PM_REMOVE)) {
+                    if(msg.message!=WM_QUIT){TranslateMessage(&msg);DispatchMessage(&msg);}
+                }
+                if(s%10==0) {
+                    const auto now=std::chrono::steady_clock::now();
+                    const double elapsed=std::chrono::duration<double>(now-perf_time).count();
+                    const uint64_t count=g_native_render_count.load(),us=g_native_render_us.load(),vis=total_vis;
+                    if(elapsed>0.5)std::cout<<"[Perf] T="<<s/10<<" mode="<<read_rdram_u32(rdram,0x80117DA4)
+                        <<" VI="<<(vis-perf_vis)/elapsed<<" GFX="<<(count-perf_count)/elapsed
+                        <<" CPU_ms="<<(count>perf_count ? (us-perf_us)/double(count-perf_count)/1000.0 : 0.0)
+                        <<" GPU_ms="<<g_hd_renderer.gpu_raster_us()/1000.0
+                        <<" age_ms="<<g_hd_renderer.snapshot_age_ms()<<std::endl;
+                    perf_time=now;perf_vis=vis;perf_count=count;perf_us=us;
+                }
+            }
             if(g_presentation_check){
                 MSG msg;while(PeekMessage(&msg,nullptr,0,0,PM_REMOVE)){
                     if(msg.message!=WM_QUIT){TranslateMessage(&msg);DispatchMessage(&msg);}
@@ -1748,7 +1862,15 @@ int main(int argc, char** argv) {
                           << " | Rects: " << rects
                           << " | Tris: " << tris << "\n";
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if(g_performance_check) {
+                const auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(100);
+                do {
+                    MSG msg;while(PeekMessage(&msg,nullptr,0,0,PM_REMOVE)) {
+                        if(msg.message!=WM_QUIT){TranslateMessage(&msg);DispatchMessage(&msg);}
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                } while(std::chrono::steady_clock::now()<until);
+            } else std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 

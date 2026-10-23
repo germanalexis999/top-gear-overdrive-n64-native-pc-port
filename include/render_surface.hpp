@@ -24,11 +24,23 @@ class RenderSurfaces {
 
     void import(Surface& s) {
         std::memcpy(s.mirror.data(), ram+s.address, s.mirror.size()*2);
+        // Every scaled row uses the same horizontal mapping. Compute it once,
+        // then copy rows that sample the same native row (common at HD/4K).
+        // Keep the original float division and truncation at sample boundaries.
+        std::vector<uint32_t> source_x(s.width);
+        for(uint32_t x=0;x<s.width;++x)
+            source_x[x]=std::min(uint32_t(x/s.scale),s.native_width-1);
+        uint32_t previous_sy=s.native_height;
         for (uint32_t y=0; y<s.height; ++y) {
             const auto sy=std::min(uint32_t(y/s.scale_y),s.native_height-1);
-            for (uint32_t x=0; x<s.width; ++x)
-                s.pixels[size_t(y)*s.width+x]=s.mirror[size_t(sy)*s.native_width+
-                    std::min(uint32_t(x/s.scale),s.native_width-1)];
+            auto* destination=s.pixels.data()+size_t(y)*s.width;
+            if(sy==previous_sy) {
+                std::memcpy(destination,destination-s.width,size_t(s.width)*sizeof(uint16_t));
+            } else {
+                const auto* source=s.mirror.data()+size_t(sy)*s.native_width;
+                for (uint32_t x=0; x<s.width; ++x)destination[x]=source[source_x[x]];
+            }
+            previous_sy=sy;
         }
         s.dirty=false;
     }

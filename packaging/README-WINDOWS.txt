@@ -30,7 +30,8 @@ F6 alterna nativo/720p/1080p/4K y guarda RenderHeight=0/720/1080/2160 en la secc
 HD usa la GPU mediante Direct3D 11 (hardware con feature level 11.0).
 Se dibuja en un hilo separado; el juego conserva el avance nativo. Si la GPU
 no esta disponible se informa en consola y se usa CPU, que es lenta en HD.
-No hace falta instalar un compilador de shaders. Nativo sigue como valor inicial.
+No hace falta instalar un compilador de shaders. Legacy usa nativo; el perfil
+mejorado usa 1080p si no existe otra preferencia guardada.
 HD presenta directamente con DXGI y reutiliza recursos de GPU. Si falla la
 presentacion, vuelve a la ruta de lectura/GDI. Se mantienen los efectos que
 necesitan leer el framebuffer y la sincronizacion nativa del juego.
@@ -38,12 +39,26 @@ HD sirve para comparar contornos y detalle. Las texturas son las
 originales. F1-F4/F5 solo cambian la ventana y el filtro de presentacion.
 
 Expansion Pak: el juego ya recibe 8 MiB. En tgod.ini, seccion [Graphics],
-OriginalResolution=game deja la seleccion original (valor inicial).
+OriginalResolution=game deja la seleccion original; full es el valor inicial
+del perfil mejorado cuando no existe otra preferencia guardada.
 Puedes elegir off, half o full, o iniciar con --original-resolution full.
 La preferencia se aplica una vez al arrancar; luego Setup sigue disponible.
 F6 elige HD por separado. Half conserva su area reducida con bandas.
 Preview.10: buen funcionamiento general confirmado por el usuario;
 comparacion exhaustiva de modos y multijugador pendiente.
+
+Interruptor general en [Graphics] de tgod.ini, con reinicio:
+LegacyVersion=true usa resolucion nativa, LOD y distancias originales y cero
+sectores extra. F6 queda en nativo. LegacyVersion=false activa el perfil
+mejorado, personalizable con las otras claves. Legacy conserva esos valores
+para recuperarlos al volver a false. Las correcciones del port se mantienen.
+
+Opciones experimentales en [Graphics] de tgod.ini, con reinicio:
+ForceHighDetail=1 elige el modelo cercano cuando hay variantes por distancia.
+DrawDistancePercent=200 amplia distancias de camara hasta el doble.
+ExtraTrackSections=2 consulta sectores extra de decorado. Para volver al
+original usa 0, 100 y 0 respectivamente. La capacidad de las listas sigue
+limitada; no garantiza eliminar todo el popping. Validacion pendiente.
 
 Esta version recupera numeros del HUD y el titulo del showroom, y corrige
 mezcla, profundidad y filtrado de particulas. HUD y humo confirmados como

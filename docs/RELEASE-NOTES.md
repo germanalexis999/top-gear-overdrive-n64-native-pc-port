@@ -1,3 +1,42 @@
+## v0.1.0-preview.11 — rendimiento CPU, detalle y distancia
+
+- Optimiza muestreo de texturas y cálculo LOD del rasterizador CPU: evita
+  operaciones repetidas y lecturas de peso cero, conservando los límites de
+  redondeo. Tres tareas reales tardaron aproximadamente la mitad, con salida
+  RDRAM idéntica. Carrera 4K/Full: ~22 tareas/s frente a ~12.6 antes; CPU ~33 ms
+  frente a ~67 ms. Pruebas de referencia, regresiones CPU/GPU y DXGI aprobadas.
+- Benchmark CPU opcional con capturas privadas de tareas; esos datos de juego
+  y los buffers de comparación quedan fuera del código y de los paquetes.
+- Corrige el contador que llamaba FPS a la frecuencia VI. Muestra VI Hz,
+  tareas gráficas/s y tiempos CPU/GPU, para diagnosticar fluidez HD. No se
+  confirma todavía la causa de la lentitud 4K reportada al alternar F6.
+- Modo de diagnóstico `--performance-check`: comparación con las opciones reales
+  del INI y resolución fija. Corridas locales y capturas documentadas; la
+  optimización reduce el coste nativo, con margen pendiente de mejora.
+- Reduce trabajo al importar buffers HD: reutiliza el muestreo horizontal y
+  copia filas idénticas. Equivalencia de píxeles comprobada en 48 importaciones.
+  Replay HD medio 4K/Full: 19.4 → 13.3 ms en corrida local de 24 s; sin mejora
+  demostrada del ritmo de tareas ni de latencia visible.
+
+- Corrige el cierre de arranque al seleccionar Full desde el host: extensión
+  de signo de la dirección KSEG. Corrige dos lecturas similares de las mejoras.
+  Reproducido en GDB antes y arranque confirmado después con perfil 4K/Full.
+
+- Interruptor LegacyVersion=true/false: legacy fuerza los gráficos originales
+  y bloquea F6 HD; false usa el perfil mejorado con preferencias individuales.
+  Conserva los valores guardados para volver al otro perfil. Requiere reinicio.
+
+- Nuevas claves en tgod.ini: `ForceHighDetail`, `DrawDistancePercent` y
+  `ExtraTrackSections`. Selección del modelo cercano en la rama con variantes,
+  ampliación conjunta de distancias de cámara y consultas extra de decorado.
+- Valores iniciales del perfil mejorado: 1080p/Full, detalle alto, 200% y dos
+  sectores extra; legacy fuerza nativo/game/0/100/0. Reiniciar al cambiar. Se conservan las
+  comprobaciones de capacidad y el frustum. No promete eliminar todo el popping.
+- Compilado y primeras carreras automáticas de rendimiento ejecutadas. Falta
+  validar conducción, todos los efectos y multijugador. Las tareas gráficas/s
+  y VI Hz no equivalen a cuadros nuevos realmente mostrados; no se acredita
+  un objetivo de 60 FPS ni se establece aquí el ritmo original de la consola.
+
 ## v0.1.0-preview.10 — Expansion Pak y escalado original
 
 - Escalado separado por eje para los modos originales 640×120/240 y la intro

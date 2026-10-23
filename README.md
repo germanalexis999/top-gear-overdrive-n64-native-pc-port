@@ -30,9 +30,17 @@ en [BUILDING.md](docs/BUILDING.md#resolución-interna-y-configuración-gráfica)
 
 El Expansion Pak ya está disponible mediante 8 MiB de memoria. El ajuste original
 se puede elegir al iniciar con `OriginalResolution=game|off|half|full` en
-`[Graphics]` de `tgod.ini`, o `--original-resolution full`. El valor inicial es
-`game`; F6 controla HD por separado. El usuario confirmó el buen funcionamiento
+`[Graphics]` de `tgod.ini`, o `--original-resolution full`. El perfil mejorado usa `full` si no hay otra preferencia guardada; F6 controla HD por separado. El usuario confirmó el buen funcionamiento
 general de preview.10; continúa la comparación de todos los modos y multijugador.
+
+El interruptor `[Graphics] LegacyVersion=true` de `tgod.ini` selecciona gráficos
+originales; `false` usa el perfil mejorado. Reinicia al cambiarlo. Las claves
+individuales permiten personalizar el perfil mejorado y se conservan al alternar.
+
+Las fuentes locales añaden opciones experimentales de modelos y distancia en
+`tgod.ini`: `ForceHighDetail`, `DrawDistancePercent` y `ExtraTrackSections`.
+Consulta su alcance y configuración en
+[DETAIL-AND-DRAW-DISTANCE.md](docs/DETAIL-AND-DRAW-DISTANCE.md).
 
 La presentación HD se realiza directamente con DXGI, reutilizando recursos de GPU
 y conservando las lecturas de framebuffer que necesitan los efectos del juego.

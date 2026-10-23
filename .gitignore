@@ -52,6 +52,7 @@ gamecontrollerdb.txt
 *.jpeg
 *.wav
 *.raw
+*.rdram
 *.mp3
 *.ogg
 *.log

@@ -51,8 +51,10 @@ def main() -> None:
         config_path.write_text(config, encoding="utf-8")
         subprocess.run([str(args.recompiler.resolve()), str(config_path)], cwd=ROOT, check=True)
         sources = {p: p.read_text(encoding="utf-8") for p in generated.glob("funcs_*.c")}
-        if sum(text.count("tgod_apply_original_resolution(rdram);") for text in sources.values()) != 1:
-            raise SystemExit("Original-resolution startup hook missing or duplicated in generator output.")
+        for callback in ("tgod_apply_original_resolution(rdram);", "tgod_extend_camera(rdram, ctx);",
+                         "tgod_select_high_detail(rdram, ctx);", "tgod_extend_track_visibility(rdram, ctx);"):
+            if sum(text.count(callback) for text in sources.values()) != 1:
+                raise SystemExit(f"Graphics hook missing or duplicated in generator output: {callback}")
         for label in POLL_LABELS:
             marker = f"L_{label}:\n"
             owners = [p for p, text in sources.items() if marker in text]

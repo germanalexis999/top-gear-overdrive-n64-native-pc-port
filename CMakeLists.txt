@@ -66,6 +66,7 @@ add_executable(tgod_native
     src/controller_profiles.cpp
     src/controller_mapper.cpp
     src/sdl_input.cpp
+    src/graphics_enhancements.cpp
     src/main.cpp
     src/rom_loader.cpp
     src/f3dex2.cpp
@@ -106,6 +107,9 @@ add_custom_command(TARGET tgod_native POST_BUILD
 endif()
 
 # Small ROM-independent checks for the renderer and cooperative thread queues.
+add_executable(tgod_cpu_benchmark EXCLUDE_FROM_ALL tools/cpu_raster_benchmark.cpp src/f3dex2.cpp)
+target_include_directories(tgod_cpu_benchmark PRIVATE include)
+
 add_executable(tgod_regression_checks EXCLUDE_FROM_ALL
     tools/renderer_regression_checks.cpp
     src/f3dex2.cpp
