@@ -1,5 +1,16 @@
 # Estado del port — 2026-10-23
 
+Revisión preparada para preview.12: rasterizado nativo acelerado por GPU,
+con copia privada, readbacks completos y commit de targets antes de SP/DP.
+`NativeRasterizer=gpu|cpu`; GPU por defecto en el perfil mejorado, CPU en legacy.
+En la comparación 4K/Full nueva: CPU de referencia ~33.4 ms/tarea frente a
+~3.3 ms en la ruta nativa GPU; GFX ~22.7/s frente a ~28.2/s. Nativo con GPU:
+~29.9 tareas/s. Full y Off conservan presupuesto original de 2 VIs en carrera;
+no se encontró un limitador exclusivo de Full. No se fuerza 60 FPS ni se quita
+el paso nativo de buffers. Hay diferencias pequeñas de cuantización CPU/GPU,
+documentadas en DETAIL-AND-DRAW-DISTANCE.md. Compilado y comprobado localmente;
+no está en el ZIP preview.11 publicado.
+
 Optimización CPU de texturas aplicada y comprobada: tres tareas reales bajaron
 de 69.53/68.28/61.97 ms a 34.54/34.03/30.80 ms. Los 8 MiB de salida coinciden
 byte por byte con la versión anterior. Carrera 4K/Full con las mismas mejoras:

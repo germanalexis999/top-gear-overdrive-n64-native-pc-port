@@ -51,6 +51,9 @@ static std::atomic<bool> g_running{true};
 static bool g_is_headless = false;
 static bool g_presentation_check = false;
 static bool g_performance_check = false;
+static bool g_native_gpu = false;
+static int g_hd_priority=THREAD_PRIORITY_NORMAL;
+static std::atomic<uint64_t> g_native_gpu_tasks{0},g_native_gpu_fallbacks{0};
 static std::atomic<uint32_t> g_render_height{0};
 static bool g_resolution_check = false;
 static std::atomic<bool> g_resolution_check_done{false};
@@ -443,8 +446,8 @@ static uint32_t graphics_scene(const uint8_t* ram) {
 
 static void save_fb_to_bmp(const char*,const uint8_t*,uint32_t,uint32_t,uint32_t,size_t = 8*1024*1024);
 
-// Native RDP work remains authoritative for RSP/DP completion and game timing.
-// HD replays run on private RDRAM; a slow frame never holds up those events.
+// Native RDP results remain authoritative for RSP/DP completion. HD replays
+// run on separate private RDRAM and never delay those events.
 class AsyncHDRenderer {
     struct Job {
         std::vector<uint8_t> ram;
@@ -485,6 +488,7 @@ class AsyncHDRenderer {
     std::atomic<uint64_t> completed{0},replaced{0},last_ms{0},gpu_frames{0};
     std::atomic<uint64_t> replay_us{0},replays{0},display_age_ms{0},resident_frames{0};
     std::atomic<uint64_t> live_gpu_us{0};
+    std::atomic<uint64_t> snapshot_us{0},snapshot_count{0},screen_bytes{0};
     uint64_t reported_gpu_samples=0,reported_gpu_us=0; // GPU worker only
     GPURaster::Statistics final_stats{};
     void start_locked() {
@@ -497,12 +501,15 @@ class AsyncHDRenderer {
         if(!stopping && !spare)spare=std::move(job);
     }
     void run() {
-        SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+        if(!SetThreadPriority(GetCurrentThread(),g_hd_priority))
+            std::cerr<<"[HD worker] Cannot set requested thread priority.\n";
+        std::cout<<"[HD worker] Priority: "<<GetThreadPriority(GetCurrentThread())<<" (normal=0).\n";
         std::unique_ptr<GPURaster> gpu;
         bool gpu_failed=false,direct_failed=false;
         Screen screen;
         Resident resident;
         bool performance_capture=false;
+        uint32_t performance_race_jobs=0;
         for (;;) {
             std::unique_ptr<Job> job;
             {
@@ -513,6 +520,7 @@ class AsyncHDRenderer {
                 if(screen_pending){screen=std::move(*screen_pending);screen_pending.reset();}
             }
             if(job) {
+                if(g_performance_check&&(job->scene&255)==2)++performance_race_jobs;
                 resident.valid=false;
                 const auto start=std::chrono::steady_clock::now();
                 auto& r=job->interpreter;
@@ -554,7 +562,7 @@ class AsyncHDRenderer {
                 {
                     std::lock_guard lock(mutex);
                     if(valid&&!stopping&&job->generation==generation&&job->height==requested_height){
-                        latest=std::move(frame);completed.fetch_add(1);
+                        std::swap(latest,frame);completed.fetch_add(1);
                     } else resident.valid=false;
                     // Use the latest VI/scene after a replay, not the screen
                     // state from before it started computing.
@@ -581,7 +589,7 @@ class AsyncHDRenderer {
                         display_age_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-resident.captured).count();
                     } else gpu->present_native(screen.window,screen.native,screen.width,screen.height,screen.smooth);
                     const bool capture_performance=g_performance_check&&!performance_capture&&
-                        (screen.scene&255)==2&&replays.load()>300;
+                        (screen.scene&255)==2&&compatible&&screen.visible&&performance_race_jobs>=60;
                     if((g_presentation_check||capture_performance)&&gpu->statistics().presents>before_present&&
                         (capture_performance||gpu->statistics().presents%60==1)) {
                         std::vector<uint32_t> rgba;uint32_t w=0,h=0;
@@ -633,6 +641,8 @@ public:
         if(!job)job=std::make_unique<Job>();
         job->captured=std::chrono::steady_clock::now();
         job->ram.assign(interpreter.rdram,interpreter.rdram+8*1024*1024);
+        snapshot_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-job->captured).count());
+        snapshot_count.fetch_add(1);
         job->interpreter=interpreter;
         job->dl=task->t.data_ptr;job->data=task->t.ucode_data;job->data_size=task->t.ucode_data_size;
         job->height=height;job->scene=graphics_scene(job->ram.data());job->offset=0;
@@ -649,7 +659,7 @@ public:
         if(stopping||height!=requested_height||captured_generation!=generation)return;
         job->generation=captured_generation;
         if(pending)replaced.fetch_add(1);
-        pending=std::move(job);start_locked();
+        pending.swap(job);start_locked();
     }
     bool queue_screen(HWND window,const uint8_t* ram,uint32_t origin,uint32_t w,uint32_t h,bool visible) {
         if(!g_render_height.load()&&!g_gpu_window_owned.load())return false;
@@ -658,9 +668,10 @@ public:
         if(visible&&origin&&w&&h&&uint64_t(origin)+uint64_t(w)*h*2<=8*1024*1024){
             next->width=w;next->height=h;next->native.resize(size_t(w)*h);
             std::memcpy(next->native.data(),ram+origin,next->native.size()*2);
+            screen_bytes.fetch_add(next->native.size()*2);
             next->visible=true;
         } else next->native.assign(1,0);
-        {std::lock_guard lock(mutex);if(stopping)return false;screen_pending=std::move(next);start_locked();}
+        {std::lock_guard lock(mutex);if(stopping)return false;screen_pending.swap(next);start_locked();}
         return g_gpu_window_owned.load();
     }
     bool copy_frame(uint32_t scene,uint32_t height,std::vector<uint16_t>& pixels,uint32_t& w,uint32_t& h) {
@@ -690,6 +701,9 @@ public:
         std::cout<<"[HD worker] Completed: "<<completed.load()<<", pending snapshots replaced: "<<replaced.load()
             <<", last replay: "<<last_ms.load()<<" ms; native timing path retained.\n";
         std::cout<<"[HD GPU] Hardware frames: "<<gpu_frames.load()<<".\n";
+        std::cout<<"[HD copies] RDRAM snapshots: "<<snapshot_count.load()<<", 8388608 bytes each, average copy: "
+            <<snapshot_us.load()/double(std::max(uint64_t(1),snapshot_count.load()))/1000.0
+            <<" ms; native scanout bytes copied total: "<<screen_bytes.load()<<".\n";
         std::cout<<"[HD latency] Average replay: "<<(replays.load() ? replay_us.load()/replays.load()/1000.0:0.0)
             <<" ms; last submitted snapshot age: "<<display_age_ms.load()<<" ms.\n";
         std::cout<<"[GPU resources] Surface allocations: "<<final_stats.surface_allocations<<", input allocations: "<<final_stats.input_allocations
@@ -806,7 +820,35 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
     g_hd_renderer.submit(interpreter,task,g_render_height.load());
     auto render_native=[&] {
         const auto start=std::chrono::steady_clock::now();
-        interpreter.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
+        // This device belongs only to the runtime graphics thread. Native
+        // rendering uses private input RAM, so failure cannot leave partial
+        // GPU writes in live game/audio memory. Only completed targets commit.
+        thread_local std::unique_ptr<GPURaster> gpu;
+        thread_local std::vector<uint8_t> private_ram;
+        thread_local bool gpu_disabled=false;
+        if(g_native_gpu&&!gpu_disabled&&!gpu) {
+            gpu=std::make_unique<GPURaster>();
+            if(!gpu->available()){gpu.reset();gpu_disabled=true;}
+        }
+        bool rendered=false;
+        if(g_native_gpu&&!gpu_disabled&&gpu) {
+            auto original=interpreter;
+            auto* live_ram=interpreter.rdram;
+            private_ram.assign(live_ram,live_ram+8*1024*1024);
+            try {
+                interpreter.rdram=private_ram.data();interpreter.raster_backend=gpu.get();
+                gpu->begin_frame(false);
+                interpreter.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
+                gpu->commit_native_results(interpreter,live_ram);
+                interpreter.rdram=live_ram;interpreter.raster_backend=nullptr;
+                rendered=true;g_native_gpu_tasks.fetch_add(1);
+            } catch(const std::exception& error) {
+                interpreter=std::move(original);gpu_disabled=true;gpu.reset();
+                g_native_gpu_fallbacks.fetch_add(1);
+                std::cerr<<"[Native GPU] Task failed: "<<error.what()<<"; retrying untouched native input on CPU.\n";
+            }
+        }
+        if(!rendered)interpreter.process_display_list(task->t.data_ptr,task->t.ucode_data,task->t.ucode_data_size);
         const uint64_t us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
         g_native_render_us.fetch_add(us);g_native_render_count.fetch_add(1);
         g_native_render_max_us.store(std::max(g_native_render_max_us.load(),us));
@@ -1280,6 +1322,7 @@ int main(int argc, char** argv) {
     int headless_seconds = 4;
     int render_height_override = -1;
     int original_resolution_override = -2;
+    int native_gpu_override=-1;
     std::filesystem::path rom_path = "top_gear_rom/normalized/Top Gear Overdrive (USA).z64";
 
     // The Unicode command line preserves non-ASCII ROM paths and drag-and-drop.
@@ -1304,6 +1347,16 @@ int main(int argc, char** argv) {
             g_performance_check = true;
         } else if (arg == L"--resolution-check") {
             g_resolution_check = true;
+        } else if(arg==L"--native-rasterizer"&&i+1<arguments.size()) {
+            const auto& value=arguments[++i];
+            if(value==L"gpu")native_gpu_override=1;
+            else if(value==L"cpu")native_gpu_override=0;
+            else {std::cerr<<"--native-rasterizer expects cpu or gpu.\n";return 2;}
+        } else if(arg==L"--hd-priority"&&i+1<arguments.size()) {
+            const auto& value=arguments[++i];
+            if(value==L"normal")g_hd_priority=THREAD_PRIORITY_NORMAL;
+            else if(value==L"below-normal")g_hd_priority=THREAD_PRIORITY_BELOW_NORMAL;
+            else {std::cerr<<"--hd-priority expects normal or below-normal.\n";return 2;}
         } else if (arg == L"--render-height" && i+1<arguments.size()) {
             const auto& value=arguments[++i];
             if (value==L"0" || value==L"native") render_height_override=0;
@@ -1324,7 +1377,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--original-resolution game|off|half|full] [--headless --seconds N [--graphics-check | --intro-check | --performance-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--original-resolution game|off|half|full] [--native-rasterizer cpu|gpu] [--hd-priority normal|below-normal] [--headless --seconds N [--graphics-check | --intro-check | --performance-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -1396,6 +1449,16 @@ int main(int argc, char** argv) {
         std::cerr<<"[Graphics] Invalid OriginalResolution; using game.\n";g_original_resolution=-1;
     }
     if(original_resolution_override!=-2)g_original_resolution=original_resolution_override;
+    if(use_graphics_config) {
+        wchar_t rasterizer[32]{};
+        GetPrivateProfileStringW(L"Graphics",L"NativeRasterizer",L"gpu",rasterizer,32,g_graphics_config.c_str());
+        if(_wcsicmp(rasterizer,L"gpu")==0)g_native_gpu=true;
+        else if(_wcsicmp(rasterizer,L"cpu")!=0)
+            std::cerr<<"[Graphics] Invalid NativeRasterizer; using CPU.\n";
+        if(GetPrivateProfileStringW(L"Graphics",L"NativeRasterizer",L"",rasterizer,32,g_graphics_config.c_str())==0)
+            WritePrivateProfileStringW(L"Graphics",L"NativeRasterizer",L"gpu",g_graphics_config.c_str());
+    }
+    if(native_gpu_override>=0)g_native_gpu=native_gpu_override!=0;
     if(!headless && GetPrivateProfileStringW(L"Graphics",L"RenderHeight",L"",original_mode,32,g_graphics_config.c_str())==0)
         WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"1080",g_graphics_config.c_str());
     if(!headless && GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"",original_mode,32,g_graphics_config.c_str())==0)
@@ -1415,9 +1478,11 @@ int main(int argc, char** argv) {
         enhancements.extra_track_sections=option(L"ExtraTrackSections",2,0,2);
     }
     if(g_legacy_version) {
-        selected_height=0;g_original_resolution=-1;enhancements={};
+        selected_height=0;g_original_resolution=-1;enhancements={};g_native_gpu=false;
     }
+    if(g_resolution_check)g_native_gpu=false; // Resolution comparisons retain the CPU reference.
     g_render_height.store(selected_height);
+    std::cout<<"[Native renderer] "<<(g_native_gpu ? "GPU with completed native readback and CPU fallback":"CPU reference")<<".\n";
     tgod::configure_graphics_enhancements(enhancements);
     std::cout<<"[Graphics] Profile: "<<(!use_graphics_config ? "diagnostic":g_legacy_version ? "legacy":"enhanced")
         <<"; LegacyVersion takes priority over graphics overrides in legacy mode.\n";
@@ -1665,7 +1730,7 @@ int main(int argc, char** argv) {
                 const char* mode_name = (mode == 0) ? "Intro" : (mode == 1) ? "Menus" : (mode == 2) ? "Race (In-Game)" : "Game";
                 char title_buf[384];
                 std::snprintf(title_buf, sizeof(title_buf),
-                    "Top Gear Overdrive (PC) | %s | VI: %.1f Hz | GFX: %.1f/s | CPU raster: %.1f ms | GPU raster: %s | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
+                    "Top Gear Overdrive (PC) | %s | VI: %.1f Hz | GFX: %.1f/s | Native task: %.1f ms | HD GPU: %s | Audio: %u buf | Filter: %s [F5] | Render: %s [F6]",
                     mode_name, fps, gfx_rate,native_ms,gpu_time,g_audio_backend.buffers_queued.load(),
                     g_filter_smooth.load() ? "Smooth" : "Crisp",
                     g_render_height.load()==2160 ? "4K (2160p)" : g_render_height.load()==1080 ? "1080p" : g_render_height.load()==720 ? "720p" : "Native");
@@ -1680,7 +1745,7 @@ int main(int argc, char** argv) {
                     uint32_t itimer = read_rdram_u32(rdram, 0x80053654);
                     std::cout << "[Live] Mode: " << mode_name
                               << " | VI: " << std::fixed << std::setprecision(1) << fps<<" Hz"
-                              << " | GFX: "<<gfx_rate<<" tasks/s | CPU raster: "<<native_ms<<" ms | GPU raster: "<<gpu_time
+                              << " | GFX: "<<gfx_rate<<" tasks/s | Native task: "<<native_ms<<" ms | HD GPU: "<<gpu_time
                               << " | HD snapshot age: "<<(g_render_height.load() ? g_hd_renderer.snapshot_age_ms():0)<<" ms"
                               << " | DLs: " << (g_renderer_win32 ? g_renderer_win32->dl_count.load() : 0)
                               << " | Screens: " << (g_renderer_win32 ? g_renderer_win32->screen_update_count.load() : 0)
@@ -1707,11 +1772,14 @@ int main(int argc, char** argv) {
                     const auto now=std::chrono::steady_clock::now();
                     const double elapsed=std::chrono::duration<double>(now-perf_time).count();
                     const uint64_t count=g_native_render_count.load(),us=g_native_render_us.load(),vis=total_vis;
+                    const auto budget_bits=read_rdram_u32(rdram,0x80051EC4);
+                    float vi_budget=0;std::memcpy(&vi_budget,&budget_bits,sizeof(vi_budget));
                     if(elapsed>0.5)std::cout<<"[Perf] T="<<s/10<<" mode="<<read_rdram_u32(rdram,0x80117DA4)
                         <<" VI="<<(vis-perf_vis)/elapsed<<" GFX="<<(count-perf_count)/elapsed
-                        <<" CPU_ms="<<(count>perf_count ? (us-perf_us)/double(count-perf_count)/1000.0 : 0.0)
+                        <<" Native_ms="<<(count>perf_count ? (us-perf_us)/double(count-perf_count)/1000.0 : 0.0)
                         <<" GPU_ms="<<g_hd_renderer.gpu_raster_us()/1000.0
-                        <<" age_ms="<<g_hd_renderer.snapshot_age_ms()<<std::endl;
+                        <<" age_ms="<<g_hd_renderer.snapshot_age_ms()<<" VI_budget="<<vi_budget
+                        <<" Original="<<unsigned(read_rdram_u8(rdram,0x80102344))<<std::endl;
                     perf_time=now;perf_vis=vis;perf_count=count;perf_us=us;
                 }
             }
@@ -2056,6 +2124,7 @@ int main(int argc, char** argv) {
     if(g_hwnd&&IsWindow(g_hwnd))DestroyWindow(g_hwnd);
     std::cout << "[Native render] Average: " << g_native_render_us.load()/std::max(uint64_t(1),g_native_render_count.load())
               << " us, maximum: " << g_native_render_max_us.load() << " us; scale: " << authoritative_scale << ".\n";
+    std::cout<<"[Native GPU] Completed: "<<g_native_gpu_tasks.load()<<", failed tasks retried on CPU: "<<g_native_gpu_fallbacks.load()<<".\n";
     g_audio_backend.shutdown();
     ultramodern::join_saving_thread();
     if (std::filesystem::exists("saves/tgod_usa.bin")) {

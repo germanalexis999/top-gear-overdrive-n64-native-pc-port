@@ -50,6 +50,10 @@ def main():
         run(["--render-height"], 2)
         run(["--resolution-check"], 2)
         run(["--presentation-check"], 2)
+        run(["--performance-check"], 2)
+        run(["--native-rasterizer", "invalid"], 2)
+        run(["--hd-priority", "invalid"], 2)
+        run(["--headless", "--performance-check", "--graphics-check"], 2)
         run(["--headless", "--presentation-check", "--resolution-check"], 2)
         run(["--headless", "--resolution-check", "--intro-check"], 2)
         run(["--headless", "--resolution-check", "--render-height", "1080"], 2)
@@ -99,6 +103,16 @@ def main():
                 raise RuntimeError("Packaged DXGI/native timing check failed:\n"+dxgi_log[-3000:])
             (ROOT/"build/package-test-dxgi.log").write_text(dxgi_log,encoding="utf-8")
             print("PASS: DXGI presentation, native/720p/1080p/4K switches, resize/fullscreen/filter, no final framebuffer readback")
+            native_gpu_log=run(["--headless","--performance-check","--render-height","4k",
+                                "--original-resolution","full","--seconds","20","--rom",rom],timeout=45)
+            if (not all(marker in native_gpu_log for marker in required)
+                or "[Native renderer] GPU with completed native readback and CPU fallback." not in native_gpu_log
+                or not re.search(r"\[Native GPU\] Completed: [1-9]\d*, failed tasks retried on CPU: 0\.",native_gpu_log)
+                or "[Native GPU] Task failed:" in native_gpu_log
+                or not re.search(r"\[DXGI\] Presents: [1-9]\d*",native_gpu_log)):
+                raise RuntimeError("Packaged native GPU/default enhanced profile check failed:\n"+native_gpu_log[-3000:])
+            (ROOT/"build/package-test-native-gpu.log").write_text(native_gpu_log,encoding="utf-8")
+            print("PASS: default enhanced INI profile, native GPU with completed readbacks, 4K/Full race, audio and save")
         (ROOT / "build/package-test-hd.log").write_text(hd_log,encoding="utf-8")
         print("PASS: Windows-only PATH, included DLLs, Unicode paths, 3 ROM byte orders, invalid ROM rejection, race/audio/save")
         print("PASS: asynchronous 1080p output with native game timing, race, audio and save")

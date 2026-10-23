@@ -1,3 +1,22 @@
+## v0.1.0-preview.12 — GPU nativa y ritmo VI
+
+- Nuevo `NativeRasterizer=gpu|cpu`: GPU por defecto en el perfil mejorado,
+  CPU en legacy. El trabajo nativo usa RDRAM privada, devuelve color/profundidad
+  y confirma solo los targets antes de SP/DP. El replay HD sigue independiente.
+  Ante un fallo se recupera el estado original del intérprete y se usa CPU.
+- Prioridad HD normal y destrucción de cuadros reemplazados fuera del mutex.
+  No se atribuye una demora fija a la prioridad baja: el A/B no la confirmó.
+- Contadores distinguen tarea nativa de GPU HD; diagnóstico registra copia
+  de snapshots y presupuesto VI original. Full y Off dieron 2 VIs en carrera.
+- 4K/Full: ~33.4 → ~3.3 ms por tarea nativa y ~22.7 → ~28.2 tareas/s en
+  corridas locales; nativo ~29.9 tareas/s. Sin promesa de 60 FPS ni de <2 ms.
+  Tres tareas aisladas GPU: 2.53/2.51/1.96 ms. Existen diferencias de
+  cuantización respecto a CPU, con máximos observados de 2 niveles RGB de 5 bits
+  en unos pocos píxeles y 1 unidad de profundidad. No hay equivalencia binaria.
+- Pruebas CPU/GPU/DXGI y de commit nativo aprobadas; corridas Full/Off/nativo
+  con salida normal y contadores de audio sin desbordes/descartes. Siguen
+  pendientes conducción manual, todos los circuitos y multijugador.
+
 ## v0.1.0-preview.11 — rendimiento CPU, detalle y distancia
 
 - Optimiza muestreo de texturas y cálculo LOD del rasterizador CPU: evita

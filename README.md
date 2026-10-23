@@ -37,6 +37,13 @@ El interruptor `[Graphics] LegacyVersion=true` de `tgod.ini` selecciona gráfico
 originales; `false` usa el perfil mejorado. Reinicia al cambiarlo. Las claves
 individuales permiten personalizar el perfil mejorado y se conservan al alternar.
 
+Desde preview.12 se permite `NativeRasterizer=gpu|cpu`
+en `[Graphics]` (reiniciar). El perfil mejorado usa `gpu` por defecto: acelera
+el dibujo nativo y devuelve sus buffers antes de completar SP/DP. El HD sigue
+separado. `cpu` conserva la referencia anterior; legacy fuerza esa referencia.
+Hay pequeñas diferencias de cuantización CPU/GPU; las comprobaciones y límites
+están documentados en [DETAIL-AND-DRAW-DISTANCE.md](docs/DETAIL-AND-DRAW-DISTANCE.md).
+
 Las fuentes locales añaden opciones experimentales de modelos y distancia en
 `tgod.ini`: `ForceHighDetail`, `DrawDistancePercent` y `ExtraTrackSections`.
 Consulta su alcance y configuración en

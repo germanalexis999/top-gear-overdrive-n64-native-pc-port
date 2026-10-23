@@ -80,7 +80,7 @@ struct GPURaster::Impl {
         Com<ID3D11UnorderedAccessView> uav;
         Com<ID3D11ShaderResourceView> srv;
         uint64_t frame=0,used=0,revision=0;
-        bool dirty=false;
+        bool dirty=false,written=false;
     };
     std::map<uint64_t,std::unique_ptr<Surface>> surfaces;
     Surface* color=nullptr;Surface* depth=nullptr;
@@ -146,7 +146,7 @@ struct GPURaster::Impl {
             d.ByteWidth=64;
             checked(device->CreateBuffer(&d,nullptr,present_constants.out()),"Create presentation constants");
             ready=true;
-            std::cout<<"[HD GPU] Direct3D 11 hardware: "<<name<<". Native SP/DP path unchanged.\n";
+            std::cout<<"[HD GPU] Direct3D 11 hardware: "<<name<<".\n";
         } catch(const std::exception& e){std::cerr<<"[HD GPU] "<<e.what()<<"; using software HD fallback.\n";}
     }
     Surface* surface(F3DEX2Interpreter& r,uint32_t address) {
@@ -170,7 +170,14 @@ struct GPURaster::Impl {
         }
         auto cpu=r.render_buffer(address);
         if(!cpu.pixels)return nullptr;
-        if(cpu.scale<=1)throw std::runtime_error("Unsupported GPU framebuffer width");
+        if(r.color_image_width!=320 && r.color_image_width!=640)
+            throw std::runtime_error("Unsupported GPU framebuffer width");
+        if(r.render_surfaces.height()==0) {
+            const uint64_t end=uint64_t(address)+uint64_t(cpu.width)*cpu.height*2;
+            for(const auto& [other_key,other]:surfaces)if(other_key!=key&&other->frame==frame_id&&
+                address<uint64_t(other->address)+uint64_t(other->native_width)*other->native_height*2&&end>other->address)
+                throw std::runtime_error("Overlapping native targets require CPU reference rendering");
+        }
         upload_scratch.resize(size_t(cpu.width)*cpu.height);
         std::copy(cpu.pixels,cpu.pixels+upload_scratch.size(),upload_scratch.begin());
         if(it==surfaces.end()) {
@@ -190,7 +197,7 @@ struct GPURaster::Impl {
         // Allocation reuse never implies content reuse: each private snapshot
         // imports the native contents again before its first draw/read.
         context->UpdateSubresource(result->buffer.p,0,nullptr,upload_scratch.data(),0,0);
-        result->frame=frame_id;result->used=++use_clock;result->dirty=false;result->revision=++content_clock;
+        result->frame=frame_id;result->used=++use_clock;result->dirty=false;result->written=false;result->revision=++content_clock;
         return result;
     }
     void upload(const void* bytes,uint32_t count,Input& input) {
@@ -232,8 +239,8 @@ struct GPURaster::Impl {
         context->Dispatch((color->width+7)/8,(color->height+7)/8,1);++stats.dispatches;
         ID3D11UnorderedAccessView* empty[2]{};context->CSSetUnorderedAccessViews(0,2,empty,nullptr);
         ID3D11ShaderResourceView* no_srvs[4]{};context->CSSetShaderResources(0,4,no_srvs);
-        color->dirty=true;color->revision=++content_clock;
-        if(depth){depth->dirty=true;depth->revision=++content_clock;}
+        color->dirty=true;color->written=true;color->revision=++content_clock;
+        if(depth){depth->dirty=true;depth->written=true;depth->revision=++content_clock;}
         commands.clear();texture_words.clear();have_tmem=false;
     }
     void release_presentation() {
@@ -347,6 +354,18 @@ void GPURaster::finish(F3DEX2Interpreter& r){
     // Otherwise the end query itself can remain batched until the next task.
     impl->end_timing();
     if(!impl->keep_on_gpu){++impl->stats.final_readbacks;readback(r,0,8*1024*1024);}
+}
+void GPURaster::commit_native_results(const F3DEX2Interpreter& r,uint8_t* destination) {
+    if(!destination||!r.rdram||r.render_surfaces.height()!=0||impl->keep_on_gpu||
+       !impl->commands.empty()||impl->active_timing>=0)
+        throw std::runtime_error("Native commit requires completed native-resolution readbacks");
+    for(const auto& [key,s]:impl->surfaces)if(s->frame==impl->frame_id&&s->written) {
+        if(s->dirty||s->width!=s->native_width||s->height!=s->native_height||
+           uint64_t(s->address)+uint64_t(s->native_width)*s->native_height*2>8*1024*1024)
+            throw std::runtime_error("Incomplete or invalid native GPU target");
+    }
+    for(const auto& [key,s]:impl->surfaces)if(s->frame==impl->frame_id&&s->written)
+        std::memcpy(destination+s->address,r.rdram+s->address,size_t(s->native_width)*s->native_height*2);
 }
 void GPURaster::triangle(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,const Vertex3D& c) {
     const auto target=r.render_buffer(r.color_image_addr,false);

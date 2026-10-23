@@ -6,8 +6,9 @@
 class F3DEX2Interpreter;
 struct Vertex3D;
 
-// Attached only to the private HD interpreter. No device calls on the native
-// SP/DP event path. The software renderer remains the reference implementation.
+// The software renderer remains the reference implementation. A native GPU
+// task uses private RDRAM and commits its targets before SP/DP completion;
+// the independent HD interpreter never commits to the game's RDRAM.
 class RasterBackend {
 public:
     virtual ~RasterBackend() = default;
@@ -35,6 +36,7 @@ public:
     };
     Statistics statistics() const;
     void begin_frame(bool keep_on_gpu=false);
+    void commit_native_results(const F3DEX2Interpreter&,uint8_t* destination);
     bool has_target(uint32_t address,uint32_t native_width) const;
     // All methods, including presentation, belong to the one GPU worker thread.
     bool present_target(void* window,uint32_t address,uint32_t native_width,

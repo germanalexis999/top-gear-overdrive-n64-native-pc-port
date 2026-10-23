@@ -85,6 +85,56 @@ static void presentation_checks(GPURaster& gpu) {
     gpu.release_presentation();DestroyWindow(window);
     std::cout<<"PASS: DXGI conversion, resize, 4:3, zero/minimized window, native/720p/1080p/4K, filters, resource reuse and feedback; presents "<<stats.presents<<", resizes "<<stats.resize_count<<".\n";
 }
+static void native_commit_checks(GPURaster& gpu) {
+    for(const auto dimensions:{std::pair{320u,240u},{640u,120u},{640u,240u},{640u,480u}}) {
+        const auto [width,height]=dimensions;
+        constexpr uint32_t color=0x100000,depth=0x240000;
+        std::vector<uint8_t> reference(8*1024*1024,0x5A),input=reference,live=reference;
+        F3DEX2Interpreter cpu(reference.data()),hw(input.data());
+        for(auto* r:{&cpu,&hw}) {
+            r->diagnostics_enabled=false;r->set_framebuffer_layout(width,height);
+            r->color_image_width=width;r->color_image_addr=color;r->depth_image_addr=depth;
+            r->scissor_xl=width;r->scissor_yl=height;r->texture_enabled=false;r->geometry_mode=1;r->other_mode_l=0x30;
+        }
+        auto draw=[](F3DEX2Interpreter& r) {
+            auto z=r.render_buffer(r.depth_image_addr);std::fill(z.pixels,z.pixels+size_t(z.width)*z.height,65535);
+            Vertex3D a,b,c;a.screen_x=20.125f;a.screen_y=20.125f;b.screen_x=107.3f;b.screen_y=20.125f;c.screen_x=20.125f;c.screen_y=103.7f;
+            a.screen_z=b.screen_z=c.screen_z=300;a.r=b.r=c.r=200;a.g=b.g=c.g=100;a.b=b.b=c.b=40;
+            r.rasterize_triangle_screen(a,b,c);
+            a.screen_z=b.screen_z=c.screen_z=100;a.a=b.a=c.a=128;
+            r.other_mode_l=0x00404030;r.rasterize_triangle_screen(a,b,c);
+        };
+        draw(cpu);gpu.begin_frame(false);hw.raster_backend=&gpu;draw(hw);
+        // CPU/audio writes outside render targets must survive a native commit.
+        live[0x100]=0xAB;const auto before=live;
+        bool refused=false;try{gpu.commit_native_results(hw,live.data());}catch(const std::exception&){refused=true;}
+        require(refused&&live==before,"Incomplete native task committed to live RDRAM");
+        gpu.finish(hw);gpu.commit_native_results(hw,live.data());
+        const size_t bytes=size_t(width)*height*2;
+        for(size_t i=0;i<live.size();++i) {
+            const bool target=(i>=color&&i<color+bytes)||(i>=depth&&i<depth+bytes);
+            require(target||live[i]==before[i],"Native commit overwrote unrelated game/audio RAM");
+        }
+        for(size_t offset=0;offset<bytes;offset+=2) {
+            uint16_t a,b;std::memcpy(&a,reference.data()+color+offset,2);std::memcpy(&b,live.data()+color+offset,2);
+            for(int shift:{1,6,11})if(std::abs(int((a>>shift)&31)-int((b>>shift)&31))>1) {
+                std::cout<<"Native mismatch "<<width<<"x"<<height<<" at "<<offset/2%width<<","<<offset/2/width<<" CPU "<<a<<" GPU "<<b<<"\n";
+                throw std::runtime_error("Native GPU color parity");
+            }
+            std::memcpy(&a,reference.data()+depth+offset,2);std::memcpy(&b,live.data()+depth+offset,2);
+            require(std::abs(int(a)-int(b))<=1,"Native GPU depth parity");
+        }
+    }
+    std::vector<uint8_t> aliased(8*1024*1024);
+    F3DEX2Interpreter r(aliased.data());r.set_framebuffer_layout(640,480);
+    r.color_image_width=640;r.color_image_addr=0x100000;r.depth_image_addr=0x180000;
+    r.scissor_xl=640;r.scissor_yl=480;r.texture_enabled=false;r.geometry_mode=1;
+    Vertex3D a,b,c;a.screen_x=20;a.screen_y=20;b.screen_x=100;b.screen_y=20;c.screen_x=20;c.screen_y=100;
+    gpu.begin_frame(false);r.raster_backend=&gpu;
+    bool rejected=false;try{r.rasterize_triangle_screen(a,b,c);}catch(const std::exception&){rejected=true;}
+    require(rejected,"Partially overlapping native buffers must request CPU fallback");
+    std::cout<<"PASS: native GPU 320x240/640x120/640x240/640x480, completed readback, target-only commit, unrelated RAM preservation and overlap rejection.\n";
+}
 int main(){
     std::cout<<std::unitbuf; GPURaster gpu;if(!gpu.available())return 77;
     for(uint32_t height:{720u,1080u}){
@@ -182,6 +232,7 @@ int main(){
         });
     }
     std::cout<<"PASS: hardware GPU parity checks.\n";
+    native_commit_checks(gpu);
     presentation_checks(gpu);
 }
 

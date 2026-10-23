@@ -300,3 +300,33 @@ las diez siguientes produzcan la misma memoria. Para comparar optimizaciones,
 conservar el benchmark anterior y ejecutar ambos con la misma captura compatible;
 comparar los archivos de salida completos además de los tiempos. Resultados y
 límites actuales en `docs/DETAIL-AND-DRAW-DISTANCE.md`.
+
+### Dibujo nativo acelerado por GPU (preview.12)
+
+`[Graphics] NativeRasterizer=gpu` es el valor inicial del perfil mejorado.
+`cpu` conserva la referencia anterior; `LegacyVersion=true` fuerza CPU.
+Reiniciar al cambiar. El backend GPU usa una copia privada de RDRAM a escala
+1 y devuelve únicamente sus targets completos antes de liberar SP/DP. No se
+reduce la resolución interna que consulta el juego ni se elimina su espera VI.
+No hay igualdad binaria general con CPU: existen diferencias de cuantización
+documentadas. Si falla, se reintenta la entrada original en CPU y se desactiva
+la aceleración nativa durante esa sesión.
+
+Para comparar sin editar el INI: `--native-rasterizer cpu` o
+`--native-rasterizer gpu`. `--hd-priority normal|below-normal` permite medir el
+efecto de la prioridad del trabajador HD; normal es el valor inicial. Las
+comparaciones `--resolution-check` siempre conservan CPU como referencia.
+El título muestra `Native task` (tiempo de pared, incluyendo readback si usa
+GPU) y `HD GPU` por separado. `--performance-check` registra también el
+presupuesto VI leído de `0x80051EC4` y el ajuste original efectivo.
+
+La herramienta GPU nativa opcional usa las mismas capturas privadas del benchmark:
+
+```powershell
+cmake --build build --target tgod_native_gpu_benchmark
+.\build\tgod_native_gpu_benchmark.exe "ruta\cpu_task_60.bin" "build\salida-gpu.rdram"
+```
+
+Devuelve código 77 si no hay hardware D3D11 compatible. Sus resultados deben
+compararse con CPU por regiones de color/profundidad y tolerancias, además de
+comprobar que el resto de RDRAM no cambia. No publicar esas capturas o buffers.

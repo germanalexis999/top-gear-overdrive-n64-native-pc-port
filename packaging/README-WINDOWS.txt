@@ -32,6 +32,11 @@ Se dibuja en un hilo separado; el juego conserva el avance nativo. Si la GPU
 no esta disponible se informa en consola y se usa CPU, que es lenta en HD.
 No hace falta instalar un compilador de shaders. Legacy usa nativo; el perfil
 mejorado usa 1080p si no existe otra preferencia guardada.
+NativeRasterizer=gpu en [Graphics] acelera tambien el dibujo a resolucion
+original y devuelve sus buffers antes de completar SP/DP. Es el valor inicial
+del perfil mejorado. NativeRasterizer=cpu vuelve a la referencia anterior;
+legacy fuerza CPU. Reiniciar al cambiar. GPU puede tener pequenas diferencias
+de cuantizacion frente a CPU. Si no esta disponible o falla, vuelve a CPU.
 HD presenta directamente con DXGI y reutiliza recursos de GPU. Si falla la
 presentacion, vuelve a la ruta de lectura/GDI. Se mantienen los efectos que
 necesitan leer el framebuffer y la sincronizacion nativa del juego.

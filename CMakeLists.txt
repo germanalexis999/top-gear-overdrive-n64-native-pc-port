@@ -109,6 +109,10 @@ endif()
 # Small ROM-independent checks for the renderer and cooperative thread queues.
 add_executable(tgod_cpu_benchmark EXCLUDE_FROM_ALL tools/cpu_raster_benchmark.cpp src/f3dex2.cpp)
 target_include_directories(tgod_cpu_benchmark PRIVATE include)
+add_executable(tgod_native_gpu_benchmark EXCLUDE_FROM_ALL tools/cpu_raster_benchmark.cpp src/f3dex2.cpp src/gpu_raster.cpp "${TGOD_GPU_SHADER}")
+target_compile_definitions(tgod_native_gpu_benchmark PRIVATE TGOD_BENCH_GPU)
+target_include_directories(tgod_native_gpu_benchmark PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/gpu-generated")
+target_link_libraries(tgod_native_gpu_benchmark PRIVATE d3d11 dxgi)
 
 add_executable(tgod_regression_checks EXCLUDE_FROM_ALL
     tools/renderer_regression_checks.cpp

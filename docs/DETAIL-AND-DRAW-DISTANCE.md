@@ -331,6 +331,141 @@ sin publicar. Evidencia en `build/performance-check/cpu-capture`,
 `cpu-optimized-native` y `cpu-optimized-4k`; herramienta pública propia
 `tools/cpu_raster_benchmark.cpp` (capturas y buffers siempre privados).
 
+### Revisión del diagnóstico aportado: GPU nativa y esperas VI
+
+Estado: cambio local posterior a preview.11, sin publicar. Se revisó el análisis
+del usuario contra el código del host, el C generado local y mediciones A/B.
+
+| Afirmación | Resultado |
+| --- | --- |
+| VI Hz no son FPS | Confirmado; el título ya los separaba. |
+| GFX/s es exactamente el framerate del motor | Cuenta tareas nativas completadas, no entradas ni imágenes visibles. En esta ruta se aproxima al ritmo gráfico, pero no acredita FPS de simulación/pantalla. |
+| CPU y GPU dibujan la escena | Confirmado. La pasada nativa proporciona buffers y conserva el contrato de finalización; borrarla sin sustitución es incorrecto. |
+| Se copian dos veces 8 MiB en submit/queue_screen | Incorrecto en preview.11: submit copia 8 MiB una vez, queue_screen copia ancho×alto×2 del scanout. |
+| Prioridad baja añade siempre 15–33 ms | No demostrado. La prioridad afecta la selección de hilos listos, no define una penalización temporal fija. |
+| El mutex se mantiene durante Present | No: las llamadas DXGI se realizan fuera del mutex de cola. Había destrucción de objetos reemplazados bajo el mutex; se movió fuera. |
+| Full impone por sí solo 2–3 VIs | No confirmado. El presupuesto observado es 2 VIs tanto con Full como con Off; hay espera original en la lógica de tareas. |
+| Estas correcciones garantizan menos de 2 ms | No. El tiempo completo incluye interpretación, copias, envío, sincronización GPU y readback. |
+
+Fuentes de Windows: [prioridades de planificación](https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities)
+y [sincronización al acceder a recursos de GPU](https://learn.microsoft.com/en-us/windows/uwp/graphics-concepts/copying-and-accessing-resource-data).
+En D3D11, Map de staging puede esperar a que termine la copia; por ello el
+tiempo de envío no equivale al tiempo de finalización.
+
+#### Cambio de implementación
+
+El backend D3D11 propio ahora admite targets nativos a escala 1. La ruta GPU
+nativa interpreta sobre una copia privada de los 8 MiB. Los readbacks de efectos
+y el readback final completan color/profundidad en esa copia. Después, el commit
+copia solo las regiones de targets escritos a la RDRAM del juego. El aviso SP/DP
+continúa después de ese retorno: no se libera prematuramente ni se espera a HD.
+El trabajador HD y el nativo tienen dispositivos/contextos separados, cada uno
+usado por su hilo propietario; no comparten un immediate context entre hilos.
+
+El dibujo nativo y el HD siguen siendo dos pasadas necesarias en esta estrategia,
+pero la nativa ya no recorre todos los píxeles en CPU. La referencia CPU continúa
+disponible con `[Graphics] NativeRasterizer=cpu`, y legacy siempre la selecciona.
+El perfil mejorado inicia con `gpu` si falta la clave. F6 sigue siendo independiente
+y las comparaciones de resolución conservan CPU como referencia.
+
+Si el dispositivo no está disponible, se usa CPU. Si falla una tarea, se restaura
+el estado inicial del intérprete y se reintenta en CPU; la RDRAM viva aún no recibió
+sus escrituras parciales. Se desactiva esa ruta GPU durante el resto de la sesión.
+Se rechazan targets nativos parcialmente superpuestos o anchuras no soportadas.
+El commit valida todas las regiones antes de copiar, exige readbacks terminados
+y no restaura los 8 MiB completos: así preserva escrituras concurrentes de audio
+y del juego fuera de sus buffers. La nueva ruta nativa sí requiere otra copia
+de 8 MiB para ese aislamiento; no se presenta como eliminación de todas las copias.
+
+El trabajador HD usa prioridad normal. Las colas siguen limitadas al último
+pendiente; swaps de propietarios permiten liberar buffers antiguos fuera del
+mutex. Se mide la copia de snapshot HD: ~0.7–0.8 ms por 8 MiB en estas corridas,
+no ~33 ms. El título cambia CPU raster por Native task: es tiempo de pared de
+la tarea nativa, incluyendo GPU/readback cuando se usa ese backend.
+
+#### Evidencia de ritmo original
+
+La inicialización de eventos VI en `0x80001D44–0x80001D48` pasa frecuencia 1 a
+osViSetEvent. No pide notificaciones cada dos/tres VIs al seleccionar Full.
+La tarea de gráficos original lee el float `0x80051EC4` en `0x800019CC–0x800019FC`
+y consume mensajes adicionales en `0x80001A10–0x80001A54`. Ese campo puede
+configurarse mediante mensajes, por ejemplo `0x8000102C–0x80001078`, donde la
+opción por defecto vale 2. No se publica el cuerpo generado ni se parchean estos
+puntos. El diagnóstico solo lee el presupuesto y la opción `0x80102344`.
+
+Con GPU nativa, Full y Off dieron `VI_budget=2` durante la carrera, y el render
+nativo sin HD llegó a ~29.9 tareas/s. Esto respalda una cadencia original cercana
+a 30 tareas/s en este caso. No demuestra todos los modos, ni que toda caída a
+20 tareas/s sea un limitador de Full. Forzar 60 requiere estudiar la separación
+entre actualización, dibujo y temporización; no se hizo un parche arbitrario.
+
+#### Comparaciones y límites
+
+Tres tareas idénticas capturadas, diez repeticiones tras calentamiento:
+
+| Tarea | CPU optimizada ms | GPU nativa con readback ms |
+| --- | ---: | ---: |
+| 16 | 34.54 | 2.53 |
+| 60 | 34.03 | 2.51 |
+| 120 | 30.80 | 1.96 |
+
+No son buffers binariamente idénticos entre CPU y GPU. En toda RDRAM, las
+diferencias se limitaron a las páginas de color/profundidad: 84/399/1021 píxeles
+de color diferentes y 45/54/32 de profundidad. Máximo RGB: 1/2/2 niveles de
+5 bits, con 0/1/5 píxeles de error mayor que un nivel; alfa sin cambios.
+Profundidad: máximo 1 unidad. Son diferencias de cuantización observadas, no
+una promesa de equivalencia completa en todos los efectos.
+
+A/B con el mismo ejecutable, Full/4K/alto/200%/dos sectores y muestras T=15–23:
+
+| Nativo | Prioridad HD | Tareas/s | Tiempo nativo ms | HD GPU ms | Edad ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CPU | Normal | 22.71 | 33.38 | 6.69 | 27.33 |
+| GPU | Normal | 26.78 | 3.18 | 6.65 | 23.88 |
+| GPU | Inferior | 27.93 | 3.22 | 6.64 | 15.56 |
+
+La variación entre carreras no demuestra que subir prioridad reduzca latencia;
+de hecho, no mejoró estas medias. La mejora nativa procede de sustituir el
+rasterizado software pesado. No se atribuye el salto a un quantum fijo de Windows.
+
+Corridas con guardas de commit/alias y presupuesto instrumentado:
+
+| Render | Original | Duración | VI Hz | Tareas/s | Nativo ms | Presupuesto VI |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4K | Full | 40 s | 60.02 | 28.20 | 3.29 | 2 |
+| 4K | Off | 24 s | 59.96 | 28.24 | 3.08 | 2 |
+| Nativo | Full | 24 s | 60.00 | 29.86 | 3.30 | 2 |
+
+Las medias corresponden a T=15–23, no a toda la duración. Las tres salieron con
+código 0; tareas GPU completadas 1316/837/879, sin reintentos por fallo, y audio
+con desbordes/entradas silenciosas descartadas/cuadros pendientes reemplazados
+0/0/0. No son replays deterministas ni mediciones de latencia entrada-a-fotón.
+
+Pasaron las regresiones CPU, GPU y presentación. Se añadieron casos nativos
+320×240 y 640×120/240/480 con lectura completa, rechazo de commit prematuro,
+escrituras exclusivamente en targets, preservación de RDRAM ajena y rechazo de
+superposición parcial. Una primera fixture falló porque sus buffers de color y
+profundidad de 640×480 se superponían; se corrigió su distribución y se añadió
+la guarda de alias. Las corridas reales anteriores no encontraron ese caso.
+La captura automática inicial se tomó durante negro de transición: se ajustó
+para esperar 60 tareas de carrera y una salida compatible visible. La captura
+estable nativa se revisó y mostró pista, auto y HUD.
+
+Comprobaciones finales tras ajustar la captura: perfil mejorado con INI sin
+NativeRasterizer explícito (20 s, 706 tareas GPU), cambios de resolución/ventana/
+filtro y F11 con frenado/derrape (30 s, 1075 tareas GPU), y legacy con override
+CLI GPU (4 s: CPU forzada, cero tareas GPU). Las tres salieron con código 0,
+sin fallos GPU ni desbordes/descartes de audio; las dos alternancias F11 y la
+supresión de repetición dieron PASS. La captura DXGI corregida se abrió y mostró
+pista, auto y HUD. Logs en `gpu-default-ini`, `gpu-switches` y `gpu-legacy`
+bajo `build/performance-check`. No equivalen a validación de toda la física.
+
+Logs privados: `build/performance-check/{gpu-native-normal,cpu-native-normal,gpu-native-below,gpu-full-final,gpu-off-final,gpu-native-final}/run.log`.
+Regresiones en `build/native-{gpu,cpu}-regression.log`. Quedan conducción manual,
+todos los circuitos, modos y confirmación del tambaleo del usuario. No se cambia
+la física, el presupuesto VI ni la preferencia de resolución original para
+obtener estas cifras. El ZIP preview.11 ya publicado conserva la versión previa.
+
 Fuentes: inspección del código generado localmente de USA v0 en las funciones
 y direcciones indicadas; no se copian cuerpos generados ni datos de la ROM al
 árbol público. Implementación propia en `src/graphics_enhancements.cpp` y hooks

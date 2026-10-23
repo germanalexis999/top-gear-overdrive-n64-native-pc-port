@@ -28,11 +28,18 @@ int main(int argc,char** argv) {
         std::cerr<<"Truncated or oversized capture.\n";return 2;
     }
     initial.diagnostics_enabled=false;initial.raster_backend=nullptr;
+#ifdef TGOD_BENCH_GPU
+    GPURaster gpu;
+    if(!gpu.available())return 77;
+#endif
     double total_ms=0;
     for(int iteration=0;iteration<11;++iteration) {
         ram=input;
         auto renderer=initial;renderer.rdram=ram.data();
         const auto start=std::chrono::steady_clock::now();
+#ifdef TGOD_BENCH_GPU
+        gpu.begin_frame(false);renderer.raster_backend=&gpu;
+#endif
         renderer.process_display_list(header[3],header[4],header[5]);
         const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(iteration==0)expected=ram;
@@ -46,5 +53,5 @@ int main(int argc,char** argv) {
         output.write(reinterpret_cast<const char*>(expected.data()),expected.size());
         if(!output)return 2;
     }
-    std::cout<<"Mean CPU replay (10 repetitions, warmup excluded): "<<total_ms/10<<" ms\n";
+    std::cout<<"Mean native replay (10 repetitions, warmup excluded): "<<total_ms/10<<" ms\n";
 }
