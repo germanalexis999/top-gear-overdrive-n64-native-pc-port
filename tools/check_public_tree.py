@@ -30,6 +30,7 @@ EXACT.update({"LICENSE", "include/rom_loader.hpp", "src/rom_loader.cpp",
               "docs/RELEASES.md", "docs/RELEASE-NOTES.md",
               "docs/DIAGNOSTICS-2026-10-21.md",
               "docs/RENDERER-ARCHITECTURE.md", "docs/CONTROLLER-MAPPING-RESEARCH.md", "docs/PHYSICS-INVESTIGATION-2026-10-22.md",
+              "docs/EXPANSION-PAK-RESEARCH.md",
               "packaging/README-WINDOWS.txt", "packaging/Jugar.cmd"})
 EXACT.update("LICENSES/" + name + ".txt" for name in (
     "miniz", "o1heap", "xxHash", "fmt", "rabbitizer", "ELFIO", "tomlplusplus",

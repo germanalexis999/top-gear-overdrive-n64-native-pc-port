@@ -89,7 +89,7 @@ struct GPURaster::Impl {
     std::array<uint8_t,4096> last_tmem{};
     bool have_tmem=false;
     uint32_t tmem_offset=0;
-    float scale=1;
+    float scale=1, scale_y=1;
     std::string name="unavailable";
     bool ready=false;
     void poll_timings() {
@@ -140,7 +140,7 @@ struct GPURaster::Impl {
             DXGI_ADAPTER_DESC description{};checked(adapter->GetDesc(&description),"Get GPU description");
             char utf8[512]{};WideCharToMultiByte(CP_UTF8,0,description.Description,-1,utf8,sizeof(utf8),nullptr,nullptr);name=utf8;
             checked(device->CreateComputeShader(tgod_gpu_shader,sizeof(tgod_gpu_shader),nullptr,shader.out()),"Create compute shader");
-            D3D11_BUFFER_DESC d{};d.ByteWidth=16;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_BUFFER_DESC d{};d.ByteWidth=32;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
             checked(device->CreateBuffer(&d,nullptr,constants.out()),"Create GPU constants");
             checked(device->CreateComputeShader(tgod_present_shader,sizeof(tgod_present_shader),nullptr,present_shader.out()),"Create presentation shader");
             d.ByteWidth=64;
@@ -157,6 +157,9 @@ struct GPURaster::Impl {
         }
         const uint64_t key=(uint64_t(address)<<32)|r.color_image_width;
         auto it=surfaces.find(key);
+        if(it!=surfaces.end() && it->second->native_height!=r.framebuffer_height()) {
+            flush();color=nullptr;depth=nullptr;surfaces.erase(it);it=surfaces.end();
+        }
         if(it!=surfaces.end()&&it->second->frame==frame_id)return it->second.get();
         if(it==surfaces.end()&&surfaces.size()>=8) {
             auto oldest=surfaces.end();
@@ -220,7 +223,7 @@ struct GPURaster::Impl {
         upload(texture_words.data(),uint32_t(texture_words.size()),inputs[1]);
         upload(spans.data(),uint32_t(spans.size()),inputs[2]);
         upload(refs.data(),uint32_t(refs.size()),inputs[3]);
-        struct Constants{uint32_t width,height,bins;float scale;} c{color->width,color->height,bx,scale};
+        struct Constants{uint32_t width,height,bins;float scale,scale_y,padding[3];} c{color->width,color->height,bx,scale,scale_y,{}};
         context->UpdateSubresource(constants.p,0,nullptr,&c,0,0);
         ID3D11ShaderResourceView* srvs[]={inputs[0].view.p,inputs[1].view.p,inputs[2].view.p,inputs[3].view.p};
         ID3D11UnorderedAccessView* uavs[]={color->uav.p,depth ? depth->uav.p : nullptr};
@@ -242,13 +245,16 @@ struct GPURaster::Impl {
         window=nullptr;output_width=output_height=0;last_present_valid=false;context->Flush();
     }
     bool present(HWND hwnd,ID3D11ShaderResourceView* source,uint32_t sw,uint32_t sh,
-                 uint32_t ox,uint32_t oy,uint32_t vw,uint32_t vh,bool smooth,uint64_t content) {
+                 uint32_t ox,uint32_t oy,uint32_t vw,uint32_t vh,bool smooth,uint64_t content,float aspect=4.0f/3.0f) {
         if(!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)){last_present_valid=false;return false;}
         RECT client{};if(!GetClientRect(hwnd,&client))return false;
         const uint32_t w=std::max(0l,client.right-client.left),h=std::max(0l,client.bottom-client.top);
         if(!w || !h || !sw || !sh || !vw || !vh || !source){last_present_valid=false;return false;}
         uint32_t dw=w,dh=std::max(1u,w*3/4);
         if(dh>h){dh=h;dw=std::max(1u,h*4/3);}
+        // Half is a reduced area inside the original 4:3 canvas, including
+        // when the window/monitor is wider than that canvas.
+        if(aspect>2.0f)dh=std::max(1u,dh/2);
         const std::array<uint32_t,16> c={sw,sh,std::min(ox,sw-1),std::min(oy,sh-1),
             vw,vh,w,h,(w-dw)/2,(h-dh)/2,dw,dh,smooth ? 1u:0u,0,0,0};
         if(window==hwnd&&last_present_valid&&last_present_content==content&&last_present_parameters==c)return true;
@@ -303,7 +309,7 @@ struct GPURaster::Impl {
         // splitting the batch at every HUD primitive. A change of color target is a barrier.
         if(next!=color || (nz && nz!=depth) || commands.size()>=8192){flush();color=next;depth=nz==next ? nullptr:nz;}
         if(!color)return {};
-        scale=float(color->width)/r.color_image_width;
+        scale=float(color->width)/r.color_image_width;scale_y=float(color->height)/r.framebuffer_height();
         Command c{};c[0]=kind;c[2]=std::clamp(left,0,int(color->width));c[3]=std::clamp(top,0,int(color->height));c[4]=std::clamp(right,0,int(color->width));c[5]=std::clamp(bottom,0,int(color->height));
         c[6]=nz ? (nz==next ? 2:1):0;c[7]=r.texture_tile&7;c[8]=r.other_mode_h;c[9]=r.other_mode_l;c[10]=r.geometry_mode;
         c[11]=r.prim_color;c[12]=r.env_color;c[13]=r.blend_color;c[14]=r.fog_color;c[15]=r.combine_mode_w0;c[16]=r.combine_mode_w1;
@@ -343,28 +349,31 @@ void GPURaster::finish(F3DEX2Interpreter& r){
     if(!impl->keep_on_gpu){++impl->stats.final_readbacks;readback(r,0,8*1024*1024);}
 }
 void GPURaster::triangle(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,const Vertex3D& c) {
-    const float s=float(r.render_surfaces.height())/(r.color_image_width==640 ? 480:240);
+    const auto target=r.render_buffer(r.color_image_addr,false);
+    const float s=target.scale, sy=target.scale_y;
     auto cmd=impl->state(r,0,int(std::floor(std::max({0.f,float(r.scissor_xh),std::min({a.screen_x,b.screen_x,c.screen_x})})*s)),
-        int(std::floor(std::max({0.f,float(r.scissor_yh),std::min({a.screen_y,b.screen_y,c.screen_y})})*s)),
+        int(std::floor(std::max({0.f,float(r.scissor_yh),std::min({a.screen_y,b.screen_y,c.screen_y})})*sy)),
         int(std::ceil(std::min({float(r.color_image_width),float(r.scissor_xl),std::max({a.screen_x,b.screen_x,c.screen_x})})*s)),
-        int(std::ceil(std::min({float(r.framebuffer_height()),float(r.scissor_yl),std::max({a.screen_y,b.screen_y,c.screen_y})})*s)),(r.geometry_mode&1)&&r.depth_image_addr);
+        int(std::ceil(std::min({float(r.framebuffer_height()),float(r.scissor_yl),std::max({a.screen_y,b.screen_y,c.screen_y})})*sy)),(r.geometry_mode&1)&&r.depth_image_addr);
     const bool perspective=r.other_mode_h&(1<<19);vertex(cmd,32,a,perspective);vertex(cmd,40,b,perspective);vertex(cmd,48,c,perspective);
     impl->push(cmd);
 }
 void GPURaster::line(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,const Vertex3D& flat,float thickness) {
-    const float s=float(r.render_surfaces.height())/(r.color_image_width==640 ? 480:240),radius=thickness/2;
+    const auto target=r.render_buffer(r.color_image_addr,false);
+    const float s=target.scale, sy=target.scale_y, radius=thickness/2;
     auto c=impl->state(r,3,int(std::floor(std::max({0.f,float(r.scissor_xh),std::min(a.screen_x,b.screen_x)-radius})*s)),
-        int(std::floor(std::max({0.f,float(r.scissor_yh),std::min(a.screen_y,b.screen_y)-radius})*s)),
+        int(std::floor(std::max({0.f,float(r.scissor_yh),std::min(a.screen_y,b.screen_y)-radius})*sy)),
         int(std::ceil(std::min({float(r.color_image_width),float(r.scissor_xl),std::max(a.screen_x,b.screen_x)+radius})*s)),
-        int(std::ceil(std::min({float(r.framebuffer_height()),float(r.scissor_yl),std::max(a.screen_y,b.screen_y)+radius})*s)),(r.geometry_mode&1)&&r.depth_image_addr);
+        int(std::ceil(std::min({float(r.framebuffer_height()),float(r.scissor_yl),std::max(a.screen_y,b.screen_y)+radius})*sy)),(r.geometry_mode&1)&&r.depth_image_addr);
     vertex(c,32,a,false);vertex(c,40,b,false);vertex(c,48,flat,false);put_float(c,56,thickness);impl->push(c);
 }
 void GPURaster::rectangle(F3DEX2Interpreter& r,int xl,int yl,int xh,int yh,bool fill,uint32_t tile,float u,float v,float ds,float dt,bool flip) {
     const bool copy=((r.other_mode_h>>20)&3)==2;
-    const float s=float(r.render_surfaces.height())/(r.color_image_width==640 ? 480:240);
-    auto c=impl->state(r,fill ? 1:2,int(std::ceil(std::max({0,xl,r.scissor_xh})*s)),int(std::ceil(std::max({0,yl,r.scissor_yh})*s)),
+    const auto target=r.render_buffer(r.color_image_addr,false);
+    const float s=target.scale, sy=target.scale_y;
+    auto c=impl->state(r,fill ? 1:2,int(std::ceil(std::max({0,xl,r.scissor_xh})*s)),int(std::ceil(std::max({0,yl,r.scissor_yh})*sy)),
         int(std::ceil(std::min({int(r.color_image_width),xh+(!fill&&copy ? 1:0),r.scissor_xl})*s)),
-        int(std::ceil(std::min({int(r.framebuffer_height()),yh+(!fill&&copy ? 1:0),r.scissor_yl})*s)),!fill&&!copy&&r.depth_image_addr);
+        int(std::ceil(std::min({int(r.framebuffer_height()),yh+(!fill&&copy ? 1:0),r.scissor_yl})*sy)),!fill&&!copy&&r.depth_image_addr);
     c[7]=tile;put_float(c,32,float(xl));put_float(c,33,float(yl));put_float(c,34,u);put_float(c,35,v);put_float(c,36,ds);put_float(c,37,dt);c[38]=flip;impl->push(c);
 }
 void GPURaster::readback(F3DEX2Interpreter& r,uint64_t address,uint64_t bytes) {
@@ -399,11 +408,11 @@ bool GPURaster::present_target(void* hwnd,uint32_t address,uint32_t native_width
     auto it=impl->surfaces.find((uint64_t(address)<<32)|native_width);
     if(it==impl->surfaces.end()||it->second->frame!=impl->frame_id)return false;
     impl->flush();const auto& s=*it->second;
-    const float scale=float(s.width)/native_width;
+    const float scale=float(s.width)/native_width, scale_y=float(s.height)/s.native_height;
     const uint32_t pixels=offset/2;
     return impl->present(static_cast<HWND>(hwnd),s.srv.p,s.width,s.height,
-        uint32_t((pixels%native_width)*scale),uint32_t((pixels/native_width)*scale),
-        s.width,uint32_t((visible_height ? visible_height:s.native_height)*scale),smooth,s.revision);
+        uint32_t((pixels%native_width)*scale),uint32_t((pixels/native_width)*scale_y),
+        s.width,uint32_t((visible_height ? visible_height:s.native_height)*scale_y),smooth,s.revision,s.native_height==120 ? 8.0f/3.0f : 4.0f/3.0f);
 }
 bool GPURaster::present_native(void* hwnd,const std::vector<uint16_t>& pixels,uint32_t width,uint32_t height,bool smooth) {
     if(!width||!height||pixels.size()!=uint64_t(width)*height)return false;
@@ -413,7 +422,7 @@ bool GPURaster::present_native(void* hwnd,const std::vector<uint16_t>& pixels,ui
         impl->native_cache=pixels;impl->native_width=width;impl->native_height=height;
         impl->native_version=++impl->content_clock;
     }
-    return impl->present(static_cast<HWND>(hwnd),impl->native_input.view.p,width,height,0,0,width,height,smooth,impl->native_version);
+    return impl->present(static_cast<HWND>(hwnd),impl->native_input.view.p,width,height,0,0,width,height,smooth,impl->native_version,(width==640 && height>=116 && height<=124) ? 8.0f/3.0f : 4.0f/3.0f);
 }
 bool GPURaster::capture_output(std::vector<uint32_t>& rgba,uint32_t& width,uint32_t& height) {
     if(!impl->output.p)return false;

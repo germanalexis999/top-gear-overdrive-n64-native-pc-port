@@ -27,6 +27,13 @@ en `tgod.ini`. Desde preview.7 se acelera HD con GPU y conservan
 la sincronización nativa. Si no hay hardware compatible se usa la salida por CPU,
 que es lenta en HD. Consulta los requisitos y la comparación de cuadros
 en [BUILDING.md](docs/BUILDING.md#resolución-interna-y-configuración-gráfica).
+
+El Expansion Pak ya está disponible mediante 8 MiB de memoria. El ajuste original
+se puede elegir al iniciar con `OriginalResolution=game|off|half|full` en
+`[Graphics]` de `tgod.ini`, o `--original-resolution full`. El valor inicial es
+`game`; F6 controla HD por separado. El usuario confirmó el buen funcionamiento
+general de preview.10; continúa la comparación de todos los modos y multijugador.
+
 La presentación HD se realiza directamente con DXGI, reutilizando recursos de GPU
 y conservando las lecturas de framebuffer que necesitan los efectos del juego.
 

@@ -37,6 +37,14 @@ necesitan leer el framebuffer y la sincronizacion nativa del juego.
 HD sirve para comparar contornos y detalle. Las texturas son las
 originales. F1-F4/F5 solo cambian la ventana y el filtro de presentacion.
 
+Expansion Pak: el juego ya recibe 8 MiB. En tgod.ini, seccion [Graphics],
+OriginalResolution=game deja la seleccion original (valor inicial).
+Puedes elegir off, half o full, o iniciar con --original-resolution full.
+La preferencia se aplica una vez al arrancar; luego Setup sigue disponible.
+F6 elige HD por separado. Half conserva su area reducida con bandas.
+Preview.10: buen funcionamiento general confirmado por el usuario;
+comparacion exhaustiva de modos y multijugador pendiente.
+
 Esta version recupera numeros del HUD y el titulo del showroom, y corrige
 mezcla, profundidad y filtrado de particulas. HUD y humo confirmados como
 corregidos en las pruebas del usuario. Sigue la revision de fidelidad RDP/VI

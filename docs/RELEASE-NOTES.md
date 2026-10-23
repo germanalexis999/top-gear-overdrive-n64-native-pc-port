@@ -1,3 +1,17 @@
+## v0.1.0-preview.10 — Expansion Pak y escalado original
+
+- Escalado separado por eje para los modos originales 640×120/240 y la intro
+  640×480. Dimensiones capturadas por tarea, LOD/readbacks/scanout adaptados y
+  recreación de cachés al cambiar altura. Half conserva sus bandas.
+- Preferencia de arranque `OriginalResolution=game|off|half|full` en tgod.ini o
+  `--original-resolution`, aplicada una vez tras cargar los ajustes originales.
+  `game` por defecto; siguen disponibles Setup y la selección HD con F6.
+- Compilado con los shaders actualizados. El usuario confirmó que funciona muy
+  bien y autorizó su publicación. Sigue pendiente una comparación exhaustiva
+  de todos los modos y multijugador; no se confirmó mejora de física.
+- ZIP Windows x64 con EXE, SDL3.dll, DLL MinGW y licencias. Requiere una ROM
+  propia USA v0; no incluye ROM, datos extraídos, capturas ni guardados.
+
 ## v0.1.0-preview.9 — SDL3 y sincronización gráfica
 
 - Entrada SDL3 3.4.18: gamepads reconocidos y joysticks genéricos, con nombres de

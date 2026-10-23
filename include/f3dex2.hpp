@@ -30,7 +30,18 @@ public:
     bool diagnostics_enabled = true;
     RasterBackend* raster_backend = nullptr;
     tgod::RenderSurfaces render_surfaces;
-    uint32_t framebuffer_height() const { return color_image_width==640 ? 480 : 240; }
+    // Latched from the verified game's layout at task submission. Scissor is
+    // only a drawing clip (HUD/split screen can change it), not allocation size.
+    uint32_t layout_width=0, layout_height=0;
+    void set_framebuffer_layout(uint32_t width,uint32_t height) {
+        if ((width==320 && height==240) || (width==640 &&
+            (height==120 || height==240 || height==480))) {
+            layout_width=width;layout_height=height;
+        } else { layout_width=layout_height=0; }
+    }
+    uint32_t framebuffer_height() const {
+        return color_image_width==layout_width ? layout_height : color_image_width==640 ? 480 : 240;
+    }
     tgod::RenderSurfaces::Buffer render_buffer(uint32_t address,bool dirty=true) {
         return render_surfaces.acquire(rdram,address,color_image_width,framebuffer_height(),dirty);
     }

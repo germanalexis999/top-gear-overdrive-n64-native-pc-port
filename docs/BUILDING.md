@@ -99,6 +99,38 @@ laterales. F1–F4 cambian el tamaño de ventana; F5 cambia el filtro de present
 Esos controles no reemplazan la resolución interna de F6. Los modos 2D/VI
 pueden tener recortes propios del juego.
 
+### Ajuste original de Expansion Pak
+
+El port siempre proporciona 8 MiB de RDRAM. El ajuste original y la resolución
+HD de F6 se eligen por separado. Con el juego cerrado, en `tgod.ini`:
+
+```ini
+[Graphics]
+RenderHeight=1080
+OriginalResolution=full
+```
+
+`OriginalResolution` admite `game` (predeterminado, deja los ajustes originales),
+`off`, `half` o `full`. Se aplica una sola vez tras inicializar/cargar los ajustes
+del juego; después puedes cambiarlo desde Setup. Para desactivar la preferencia
+de arranque, vuelve a `game`. El menú puede guardar elecciones en el guardado
+original, igual que antes; `game` no borra esas elecciones.
+
+Para seleccionar solo durante una sesión:
+
+```powershell
+.\build\tgod_native.exe --original-resolution full --render-height 1080
+```
+
+Off normalmente dibuja 320×240; Full usa 640×240 cuando el juego lo permite.
+Half conserva el área reducida de 640×120 con bandas arriba y abajo. El juego
+mantiene sus restricciones de escena/multijugador. El escalado usa dimensiones
+de la escena y ejes separados: a 1080p Full tiene superficie 1440×1080 y Half
+1440×540 centrada; la intro de 640×480 usa su escala propia. El área VI visible
+puede recortar márgenes. No se fuerza Full por defecto. Esta implementación está
+compilada y pendiente de comparación visual e interactiva de todos esos modos.
+Evidencia en [EXPANSION-PAK-RESEARCH.md](EXPANSION-PAK-RESEARCH.md).
+
 **Las fuentes posteriores a preview.6 usan GPU Direct3D 11 para 720p/1080p/4K.**
 Se requiere un adaptador con feature level 11.0; no se usa WARP/software como si
 fuera hardware. Si no está disponible, o falla el dispositivo, se informa en la

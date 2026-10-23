@@ -40,3 +40,10 @@ ignored = [
     "tgod_poll_si",
     "func_8004A580"
 ]
+
+# Apply the optional host startup preference after game defaults/save loading.
+# The callback runs once and leaves subsequent Setup choices to the game.
+[[patches.hook]]
+func = "func_8002C930"
+before_vram = 0x8002CBA0
+text = "{ extern void tgod_apply_original_resolution(uint8_t*); tgod_apply_original_resolution(rdram); }"

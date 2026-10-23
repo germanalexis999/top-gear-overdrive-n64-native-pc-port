@@ -51,6 +51,8 @@ def main() -> None:
         config_path.write_text(config, encoding="utf-8")
         subprocess.run([str(args.recompiler.resolve()), str(config_path)], cwd=ROOT, check=True)
         sources = {p: p.read_text(encoding="utf-8") for p in generated.glob("funcs_*.c")}
+        if sum(text.count("tgod_apply_original_resolution(rdram);") for text in sources.values()) != 1:
+            raise SystemExit("Original-resolution startup hook missing or duplicated in generator output.")
         for label in POLL_LABELS:
             marker = f"L_{label}:\n"
             owners = [p for p, text in sources.items() if marker in text]
@@ -67,7 +69,9 @@ def main() -> None:
             if stale.name not in names:
                 stale.unlink()
         for path in files:
-            shutil.copyfile(path, output / path.name)
+            destination = output / path.name
+            if not destination.exists() or destination.read_bytes() != path.read_bytes():
+                shutil.copyfile(path, destination)
         print(f"Generated {len(sources)} C files; installed {len(POLL_LABELS)} cooperative polling hooks.")
 
 

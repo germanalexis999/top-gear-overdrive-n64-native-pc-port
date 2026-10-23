@@ -66,6 +66,7 @@ F3DEX2Interpreter::F3DEX2Interpreter(uint8_t* rdram_in) : rdram(rdram_in) {
 
 void F3DEX2Interpreter::reset() {
     render_surfaces.clear();
+    layout_width=layout_height=0;
     std::memset(segments, 0, sizeof(segments));
     std::memset(tmem, 0, sizeof(tmem));
     std::memset(tiles, 0, sizeof(tiles));
@@ -640,7 +641,7 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     if (color_image_size != 2 || !rdram) return;
     auto target = render_buffer(color_image_addr);
     if (!target.pixels) return;
-    const float scale=target.scale;
+    const float scale=target.scale, scale_y=target.scale_y;
 
     float min_x = std::min({ v0.screen_x, v1.screen_x, v2.screen_x });
     float max_x = std::max({ v0.screen_x, v1.screen_x, v2.screen_x });
@@ -649,8 +650,8 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
 
     int32_t i_min_x = int32_t(std::floor(std::max({min_x,float(scissor_xh),0.0f})*scale));
     int32_t i_max_x = int32_t(std::ceil(std::min({max_x,float(scissor_xl),float(color_image_width)})*scale))-1;
-    int32_t i_min_y = int32_t(std::floor(std::max({min_y,float(scissor_yh),0.0f})*scale));
-    int32_t i_max_y = int32_t(std::ceil(std::min({max_y,float(scissor_yl),float(framebuffer_height())})*scale))-1;
+    int32_t i_min_y = int32_t(std::floor(std::max({min_y,float(scissor_yh),0.0f})*scale_y));
+    int32_t i_max_y = int32_t(std::ceil(std::min({max_y,float(scissor_yl),float(framebuffer_height())})*scale_y))-1;
 
     if (i_min_x > i_max_x || i_min_y > i_max_y) return;
 
@@ -747,12 +748,12 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
 
     auto depth_target = (geometry_mode&G_ZBUFFER) && depth_image_addr ?
         render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
-    const bool has_depth = depth_target.pixels && depth_target.scale==scale;
+    const bool has_depth = depth_target.pixels && depth_target.scale==scale && depth_target.scale_y==scale_y;
 
     for (int32_t py = i_min_y; py <= i_max_y; ++py) {
         uint16_t* row = target.pixels+size_t(py)*target.width;
         uint16_t* depth_row = has_depth ? depth_target.pixels+size_t(py)*depth_target.width : nullptr;
-        float p_y = (float(py) + 0.5f)/scale;
+        float p_y = (float(py) + 0.5f)/scale_y;
 
         for (int32_t px = i_min_x; px <= i_max_x; ++px) {
             float p_x = (float(px) + 0.5f)/scale;
@@ -805,10 +806,10 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
                     uint8_t sampled[4]{};
                     const bool linear = ((other_mode_h >> 12) & 3) >= 2 && ((other_mode_h >> 20) & 3) != 2;
                     TextureLOD lod;
-                    const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum),
-                        std::abs((uy-tu*wy)*inv_sum), std::abs((vx-tv*wx)*inv_sum),
-                        std::abs((vy-tv*wy)*inv_sum)});
-                    lod = select_texture_lod(footprint/scale);
+                    const float footprint = std::max({std::abs((ux-tu*wx)*inv_sum)/scale,
+                        std::abs((uy-tu*wy)*inv_sum)/scale_y, std::abs((vx-tv*wx)*inv_sum)/scale,
+                        std::abs((vy-tv*wy)*inv_sum)/scale_y});
+                    lod = select_texture_lod(footprint);
                     lod_fraction = int32_t(lod.fraction * 255.0f);
                     const Tile& first = lod.first ? tiles[(cur_tile + lod.first) & 7] : tile;
                     texel_valid = sample_tile(first, tu, tv, linear, sampled);
@@ -878,7 +879,7 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
     if (!rdram || color_image_size != 2 || !color_image_width || thickness <= 0) return;
     auto target=render_buffer(color_image_addr);
     if (!target.pixels) return;
-    const float scale=target.scale;
+    const float scale=target.scale, scale_y=target.scale_y;
     Vertex3D a = v0, b = v1;
     if (!a.is_screen_space && !b.is_screen_space) {
         // Clip the center segment before the perspective divide, including lines
@@ -937,13 +938,13 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
     }
     auto depth_target=(geometry_mode&1) && depth_image_addr ?
         render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
-    const bool has_depth=depth_target.pixels && depth_target.scale==scale;
+    const bool has_depth=depth_target.pixels && depth_target.scale==scale && depth_target.scale_y==scale_y;
     const uint8_t white[4] = {255,255,255,255};
-    for (int y=int(std::floor(top*scale)); y<int(std::ceil(bottom*scale)); ++y) {
+    for (int y=int(std::floor(top*scale_y)); y<int(std::ceil(bottom*scale_y)); ++y) {
         auto* row = target.pixels+size_t(y)*target.width;
         auto* depth = has_depth ? depth_target.pixels+size_t(y)*depth_target.width : nullptr;
         for (int x=int(std::floor(left*scale)); x<int(std::ceil(right*scale)); ++x) {
-            const float px=(x+0.5f)/scale-a.screen_x, py=(y+0.5f)/scale-a.screen_y;
+            const float px=(x+0.5f)/scale-a.screen_x, py=(y+0.5f)/scale_y-a.screen_y;
             const float t=(px*dx+py*dy)/length_squared;
             // Butt caps; evaluate each pixel once, avoiding a blended quad seam.
             if (t<0 || t>=1 || std::abs(px*dy-py*dx)>=radius*length) continue;
@@ -964,7 +965,7 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
             uint8_t color[4]{};
             const uint8_t alpha = combine_colors(white,white,shade,255,color);
             uint16_t pixel;
-            if (!blend_colors(color,shade[3],alpha,row[x],int(x/scale),int(y/scale),pixel)) continue;
+            if (!blend_colors(color,shade[3],alpha,row[x],int(x/scale),int(y/scale_y),pixel)) continue;
             row[x]=pixel;
             if (depth && (other_mode_l&0x20)) depth[x]=z_value;
             ++pixels_written; ++line_pixels_written;
@@ -1347,7 +1348,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 auto target=color_image_size==2 ? render_buffer(color_image_addr) : tgod::RenderSurfaces::Buffer{};
                 if (target.pixels) {
                     uint16_t col16 = (fill_color & 0xFFFF);
-                    for (int32_t y = int(std::ceil(yl*target.scale)); y < int(std::ceil(yh*target.scale)); ++y) {
+                    for (int32_t y = int(std::ceil(yl*target.scale_y)); y < int(std::ceil(yh*target.scale_y)); ++y) {
                         uint16_t* row = target.pixels+size_t(y)*target.width;
                         for (int32_t x = int(std::ceil(xl*target.scale)); x < int(std::ceil(xh*target.scale)); ++x) {
                             row[x] = col16;
@@ -1510,17 +1511,17 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                 auto target=color_image_size==2 ? render_buffer(color_image_addr) : tgod::RenderSurfaces::Buffer{};
                 auto depth_target=!copy_cycle && depth_image_addr ?
                     render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
-                const bool rect_depth=depth_target.pixels && depth_target.scale==target.scale;
+                const bool rect_depth=depth_target.pixels && depth_target.scale==target.scale && depth_target.scale_y==target.scale_y;
                 const uint16_t rect_z = (other_mode_l & 4) ? primitive_depth & 0x7FFF : 0;
                 if (target.pixels) {
-                    const float scale=target.scale;
-                    for (int32_t y = int(std::ceil(top*scale)); y < int(std::ceil(end_y*scale)); ++y) {
+                    const float scale=target.scale, scale_y=target.scale_y;
+                    for (int32_t y = int(std::ceil(top*scale_y)); y < int(std::ceil(end_y*scale_y)); ++y) {
                         auto* row = target.pixels+size_t(y)*target.width;
                         auto* depth = rect_depth ? depth_target.pixels+size_t(y)*depth_target.width : nullptr;
                         for (int32_t x = int(std::ceil(left*scale)); x < int(std::ceil(end_x*scale)); ++x) {
                             if (depth && (other_mode_l & 0x10) && rect_z > depth[x]) continue;
-                            const float u = s0 / 32.0f + (op == 0xE5 ? y/scale-yl : x/scale-xl)*step_s;
-                            const float v = t0 / 32.0f + (op == 0xE5 ? x/scale-xl : y/scale-yl)*step_t;
+                            const float u = s0 / 32.0f + (op == 0xE5 ? y/scale_y-yl : x/scale-xl)*step_s;
+                            const float v = t0 / 32.0f + (op == 0xE5 ? x/scale-xl : y/scale_y-yl)*step_t;
                             uint8_t color[4]{};
                             uint8_t texel[4]{}, next_texel[4]{};
                             if (!sample_tile(tile, u, v, filtered, texel)) continue;
@@ -1531,7 +1532,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                             const uint8_t shade[4] = {shade_value,shade_value,shade_value,shade_value};
                             const uint8_t compare_alpha = combine_colors(texel, next_texel, shade, 255, color);
                             uint16_t pixel = 0;
-                            if (blend_colors(color, shade[3], compare_alpha, row[x], int(x/scale), int(y/scale), pixel)) {
+                            if (blend_colors(color, shade[3], compare_alpha, row[x], int(x/scale), int(y/scale_y), pixel)) {
                                 row[x] = pixel;
                                 if (depth && (other_mode_l & 0x20)) depth[x] = rect_z;
                             }

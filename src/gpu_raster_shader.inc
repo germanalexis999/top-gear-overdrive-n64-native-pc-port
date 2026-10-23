@@ -7,7 +7,7 @@ StructuredBuffer<uint> Spans : register(t2);
 StructuredBuffer<uint> References : register(t3);
 RWStructuredBuffer<uint> Color : register(u0);
 RWStructuredBuffer<uint> Depth : register(u1);
-cbuffer Frame : register(b0) {uint Width;uint Height;uint BinsX;float Scale;};
+cbuffer Frame : register(b0) {uint Width;uint Height;uint BinsX;float ScaleX;float ScaleY;float3 FramePadding;};
 uint C(uint b,uint i){return Commands[b+i];}
 float F(uint b,uint i){return asfloat(C(b,i));}
 int4 unpack(uint c){return int4(c>>24,(c>>16)&255,(c>>8)&255,c&255);}
@@ -141,7 +141,7 @@ void main(uint3 id:SV_DispatchThreadID){
     uint start=Spans[bin*2],count=Spans[bin*2+1];
     if(count==0)return;
     uint pixel=Color[at],z=0;bool depthLoaded=false,depthChanged=false;
-    float2 p=(float2(id.xy)+0.5)/Scale;
+    float2 p=(float2(id.xy)+0.5)/float2(ScaleX,ScaleY);
     [loop]for(uint ri=0;ri<count;++ri){uint b=References[start+ri];
         if(id.x<C(b,2)||id.y<C(b,3)||id.x>=C(b,4)||id.y>=C(b,5))continue;
         uint kind=C(b,0),mode=C(b,9),type=(C(b,8)>>20)&3;
@@ -166,13 +166,13 @@ void main(uint3 id:SV_DispatchThreadID){
                 float2 ux=dx.x*uvAt(b,32)+dx.y*uvAt(b,40)+dx.z*uvAt(b,48);
                 float2 uy=dy.x*uvAt(b,32)+dy.y*uvAt(b,40)+dy.z*uvAt(b,48);
                 float2 fx=abs((ux-uv*wx)*invSum),fy=abs((uy-uv*wy)*invSum);
-                uint2 levels=lodTiles(b,max(max(fx.x,fx.y),max(fy.x,fy.y))/Scale,lod);
+                uint2 levels=lodTiles(b,max(max(fx.x,fx.y)/ScaleX,max(fy.x,fy.y)/ScaleY),lod);
                 uint first=levels.x!=0 ? (tile+levels.x)&7:base;
                 if(!sampleTile(b,first,uv,filtered,tex0))continue;
                 tex1=tex0;if(secondTexture(b))sampleTile(b,(tile+levels.y)&7,uv,filtered,tex1);
             }
         }else if(kind==2){
-            float2 delta=float2(id.xy)/Scale-float2(F(b,32),F(b,33));if(C(b,38)!=0)delta=delta.yx;
+            float2 delta=float2(id.xy)/float2(ScaleX,ScaleY)-float2(F(b,32),F(b,33));if(C(b,38)!=0)delta=delta.yx;
             float2 uv=float2(F(b,34),F(b,35))+delta*float2(F(b,36),F(b,37));
             if(!sampleTile(b,tile,uv,filtered,tex0))continue;
             tex1=tex0;if(type==1&&(C(b,8)&65536)==0)sampleTile(b,(tile+1)&7,uv,filtered,tex1);
@@ -191,7 +191,7 @@ void main(uint3 id:SV_DispatchThreadID){
             if((mode&16)!=0&&zValue>z)continue;
         }
         int4 color;int compare=combine(b,tex0,tex1,shade,lod,color);uint outPixel;
-        if(!blend(b,color,shade.a,compare,pixel,int2(float2(id.xy)/Scale),outPixel))continue;
+        if(!blend(b,color,shade.a,compare,pixel,int2(float2(id.xy)/float2(ScaleX,ScaleY)),outPixel))continue;
         pixel=outPixel;if(C(b,6)==1&&(mode&32)!=0){z=zValue;depthChanged=true;}
     }
     Color[at]=pixel;if(depthChanged)Depth[at]=z;

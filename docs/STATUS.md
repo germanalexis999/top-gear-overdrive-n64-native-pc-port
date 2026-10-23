@@ -1,4 +1,16 @@
-# Estado del port — 2026-10-22
+# Estado del port — 2026-10-23
+
+Expansion Pak: se conservan los 8 MiB y se incorporó una preferencia reversible
+de arranque `OriginalResolution=game|off|half|full`, separada de F6, con `game`
+por defecto. Hook explícito tras la inicialización, sin escrituras continuas.
+El renderer recibe las dimensiones originales y usa escalas X/Y separadas en
+CPU, GPU, LOD, readbacks y scanout; Half conserva el área visible reducida.
+Se recrean superficies al cambiar su altura y se distinguen modos en los frames
+HD para evitar reutilizar la imagen de otra resolución. Compilación correcta;
+pendiente de comparación visual, cambios de modo y multijugador. Evidencia y
+límites en [EXPANSION-PAK-RESEARCH.md](EXPANSION-PAK-RESEARCH.md).
+Preview.10: el usuario confirmó el buen funcionamiento general y autorizó la
+publicación. Esto no equivale a completar la comparación de todos los modos.
 
 Cambios de preview.9: SDL3 3.4.18 incorporado para gamepads y
 joysticks genéricos, con captura manual de botones/ejes/crucetas sin mapping.

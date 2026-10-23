@@ -12,7 +12,7 @@ namespace tgod {
 class RenderSurfaces {
     struct Surface {
         uint32_t address, native_width, native_height, width, height;
-        float scale;
+        float scale, scale_y;
         uint64_t used = 0;
         bool dirty = false;
         std::vector<uint16_t> pixels, mirror;
@@ -25,7 +25,7 @@ class RenderSurfaces {
     void import(Surface& s) {
         std::memcpy(s.mirror.data(), ram+s.address, s.mirror.size()*2);
         for (uint32_t y=0; y<s.height; ++y) {
-            const auto sy=std::min(uint32_t(y/s.scale),s.native_height-1);
+            const auto sy=std::min(uint32_t(y/s.scale_y),s.native_height-1);
             for (uint32_t x=0; x<s.width; ++x)
                 s.pixels[size_t(y)*s.width+x]=s.mirror[size_t(sy)*s.native_width+
                     std::min(uint32_t(x/s.scale),s.native_width-1)];
@@ -35,7 +35,7 @@ class RenderSurfaces {
     void sync(Surface& s) {
         if (!s.dirty) return;
         for (uint32_t y=0; y<s.native_height; ++y) {
-            const auto sy=std::min(uint32_t((y+0.5f)*s.scale),s.height-1);
+            const auto sy=std::min(uint32_t((y+0.5f)*s.scale_y),s.height-1);
             for (uint32_t x=0; x<s.native_width; ++x)
                 s.mirror[size_t(y)*s.native_width+x]=s.pixels[size_t(sy)*s.width+
                     std::min(uint32_t((x+0.5f)*s.scale),s.width-1)];
@@ -47,7 +47,7 @@ public:
     struct Buffer {
         uint16_t* pixels = nullptr;
         uint32_t width = 0, height = 0;
-        float scale = 1;
+        float scale = 1, scale_y = 1;
     };
     uint32_t height() const { return render_height; }
     bool set_height(uint32_t height) {
@@ -70,6 +70,9 @@ public:
             return {reinterpret_cast<uint16_t*>(ram+address),width,height,1};
         const uint64_t key=(uint64_t(address)<<32)|width;
         auto it=surfaces.find(key);
+        if (it!=surfaces.end() && it->second.native_height!=height) {
+            sync(it->second);surfaces.erase(it);it=surfaces.end();
+        }
         if (it==surfaces.end()) {
             if (surfaces.size()>=8) {
                 auto oldest=std::min_element(surfaces.begin(),surfaces.end(),
@@ -77,12 +80,15 @@ public:
                 sync(oldest->second); surfaces.erase(oldest);
             }
             const float scale=float(render_height)/(width==320 ? 240.0f : 480.0f);
-            Surface s{address,width,height,uint32_t(width*scale),uint32_t(height*scale),scale};
+            // 640x240/120 have twice as many horizontal samples per displayed
+            // pixel as 320x240. Half mode retains its half-height letterbox.
+            const float scale_y=float(render_height)/(height==480 ? 480.0f : 240.0f);
+            Surface s{address,width,height,uint32_t(width*scale),uint32_t(height*scale_y),scale,scale_y};
             s.pixels.resize(size_t(s.width)*s.height);s.mirror.resize(size_t(width)*height);
             import(s);it=surfaces.emplace(key,std::move(s)).first;
         }
         Surface& s=it->second;s.used=++clock;s.dirty|=dirty;
-        return {s.pixels.data(),s.width,s.height,s.scale};
+        return {s.pixels.data(),s.width,s.height,s.scale,s.scale_y};
     }
     void sync_all() { if (ram) for (auto& [key,s] : surfaces) sync(s); }
     void sync_range(uint64_t address,uint64_t bytes) {
@@ -98,8 +104,8 @@ public:
         if (!found) return false;
         const auto& s=*found;
         const uint32_t offset=(origin-s.address)/2;
-        const uint32_t ox=uint32_t((offset%width)*s.scale),oy=uint32_t((offset/width)*s.scale);
-        output_width=uint32_t(width*s.scale);output_height=uint32_t(height*s.scale);
+        const uint32_t ox=uint32_t((offset%width)*s.scale),oy=uint32_t((offset/width)*s.scale_y);
+        output_width=uint32_t(width*s.scale);output_height=uint32_t(height*s.scale_y);
         if (!output_width || !output_height || uint64_t(output_width)*output_height>4096ull*4096) return false;
         pixels.resize(size_t(output_width)*output_height);
         for (uint32_t y=0;y<output_height;++y) {

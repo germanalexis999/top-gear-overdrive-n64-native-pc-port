@@ -54,6 +54,29 @@ static bool g_resolution_check = false;
 static std::atomic<bool> g_resolution_check_done{false};
 static std::atomic<uint64_t> g_native_render_us{0},g_native_render_count{0},g_native_render_max_us{0};
 static std::filesystem::path g_graphics_config;
+static int g_original_resolution = -1; // -1: game, 0: off, 1: half, 2: full
+static bool g_original_resolution_applied = false;
+
+static int original_resolution_value(const std::wstring& value) {
+    if(value==L"game")return -1;
+    if(value==L"off")return 0;
+    if(value==L"half")return 1;
+    if(value==L"full")return 2;
+    return -2;
+}
+
+// Called on the game thread by the explicit USA v0 generation hook, after
+// defaults/save loading. No repeated writes and no video reconfiguration here.
+extern "C" void tgod_apply_original_resolution(uint8_t* rdram) {
+    if(g_original_resolution_applied)return;
+    g_original_resolution_applied=true;
+    if(g_original_resolution>=0 && g_original_resolution<=2) {
+        MEM_B(0x80102344,0)=uint8_t(g_original_resolution);
+        std::cout<<"[Graphics] Original startup mode: "
+            <<(g_original_resolution==2 ? "Full":g_original_resolution==1 ? "Half":"Off")
+            <<"; subsequent Setup choices remain available.\n";
+    }
+}
 static HWND g_hwnd = nullptr;
 static std::atomic<bool> g_gpu_window_owned{false};
 static std::atomic<bool> g_filter_smooth{true};
@@ -406,8 +429,11 @@ static Win32AudioBackend g_audio_backend;
 
 static uint32_t graphics_scene(const uint8_t* ram) {
     uint32_t mode=0;std::memcpy(&mode,ram+0x117DA4,4);
+    uint32_t width=0,height=0;
+    std::memcpy(&width,ram+0x117D14,4);std::memcpy(&height,ram+0x11D55C,4);
     return (mode&255)|(uint32_t(ram[0xE97C2^3])<<8)|
-        (mode==0 ? uint32_t(ram[0x53650^3])<<16 : 0);
+        (mode==0 ? uint32_t(ram[0x53650^3])<<16 : 0)|
+        (uint32_t(width==640)<<24)|(uint32_t(height==120)<<25)|(uint32_t(height==480)<<26);
 }
 
 static void save_fb_to_bmp(const char*,const uint8_t*,uint32_t,uint32_t,uint32_t,size_t = 8*1024*1024);
@@ -501,7 +527,8 @@ class AsyncHDRenderer {
                     }
                     r.raster_backend=nullptr;
                 } else r.process_display_list(job->dl,job->data,job->data_size);
-                const bool matching=job->scanout_width==r.color_image_width&&job->scanout_height;
+                const bool matching=job->scanout_width==r.color_image_width&&job->scanout_height&&
+                    job->scanout_height<=r.framebuffer_height()&&job->scanout_height+8>=r.framebuffer_height();
                 Frame frame;
                 frame.captured=job->captured;frame.scene=job->scene;
                 frame.requested_height=job->height;frame.generation=job->generation;
@@ -708,10 +735,12 @@ class PresentedFrame {
     std::mutex mutex;
     std::vector<uint8_t> pixels;
     uint32_t width = 0, height = 0;
+    float display_aspect = 4.0f/3.0f;
 public:
     void update(F3DEX2Interpreter& interpreter,const uint8_t* ram, uint32_t origin, uint32_t w, uint32_t h) {
         if (!origin || origin + uint64_t(w)*h*2 > 8*1024*1024) return;
         std::lock_guard lock(mutex);
+        display_aspect=(w==640 && h>=116 && h<=124) ? 8.0f/3.0f : 4.0f/3.0f;
         std::vector<uint16_t> rendered;
         if (g_hd_renderer.copy_frame(graphics_scene(ram),g_render_height.load(),rendered,width,height) ||
             interpreter.render_surfaces.copy_scanout(origin,w,h,rendered,width,height)) {
@@ -722,9 +751,9 @@ public:
             pixels.assign(ram + origin, ram + origin + size_t(w)*h*2);
         }
     }
-    void rgba(std::vector<uint32_t>& output,uint32_t& w,uint32_t& h) {
+    void rgba(std::vector<uint32_t>& output,uint32_t& w,uint32_t& h,float* aspect=nullptr) {
         std::lock_guard lock(mutex);
-        w=width;h=height;output.resize(size_t(w)*h);
+        w=width;h=height;if(aspect)*aspect=display_aspect;output.resize(size_t(w)*h);
         const auto* source=reinterpret_cast<const uint16_t*>(pixels.data());
         for (size_t i=0;i<output.size();++i) {
             const uint16_t px=source[i];
@@ -744,6 +773,10 @@ static PresentedFrame g_presented_frame;
 
 static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* task) {
     if (!task || !task->t.data_ptr) return;
+    uint32_t native_width=0,native_height=0;
+    std::memcpy(&native_width,interpreter.rdram+0x117D14,4);
+    std::memcpy(&native_height,interpreter.rdram+0x11D55C,4);
+    interpreter.set_framebuffer_layout(native_width,native_height);
     interpreter.raster_backend=nullptr;
     interpreter.render_surfaces.set_height(0);
     g_hd_renderer.submit(interpreter,task,g_render_height.load());
@@ -866,7 +899,7 @@ public:
 static bool g_fullscreen = false;
 static WINDOWPLACEMENT g_prev_wp = { sizeof(WINDOWPLACEMENT) };
 
-static void render_frame_to_dc(HDC hdc, HWND hwnd, const uint32_t* rgba, const BITMAPINFO* bmi, uint32_t width, uint32_t height) {
+static void render_frame_to_dc(HDC hdc, HWND hwnd, const uint32_t* rgba, const BITMAPINFO* bmi, uint32_t width, uint32_t height, float aspect=4.0f/3.0f) {
     if (!hdc || !hwnd || !rgba || !bmi) return;
     RECT client_rect;
     GetClientRect(hwnd, &client_rect);
@@ -874,13 +907,16 @@ static void render_frame_to_dc(HDC hdc, HWND hwnd, const uint32_t* rgba, const B
     int client_h = client_rect.bottom - client_rect.top;
     if (client_w <= 0 || client_h <= 0) return;
 
-    // Maintain 4:3 aspect ratio with clean letterbox / pillarbox
+    // Preserve the original Half mode letterbox within the normal 4:3 canvas.
     int target_w = client_w;
-    int target_h = (client_w * 3) / 4;
+    int target_h = std::max(1,(client_w*3)/4);
     if (target_h > client_h) {
         target_h = client_h;
-        target_w = (client_h * 4) / 3;
+        target_w = std::max(1,(client_h*4)/3);
     }
+    // First fit the same 4:3 canvas as Full, then reduce its visible height.
+    // Fitting 8:3 directly would incorrectly widen Half on a 16:9 monitor.
+    if(aspect>2.0f)target_h=std::max(1,target_h/2);
     int off_x = (client_w - target_w) / 2;
     int off_y = (client_h - target_h) / 2;
 
@@ -960,6 +996,7 @@ public:
     std::atomic<uint32_t> screen_update_count{0};
     std::vector<uint32_t> rgba_pixels;
     std::mutex presentation_mutex;
+    float display_aspect=4.0f/3.0f;
     BITMAPINFO bmi{};
     F3DEX2Interpreter interpreter;
 
@@ -1034,13 +1071,13 @@ public:
             std::lock_guard lock(presentation_mutex);
             g_presented_frame.update(interpreter,rdram, origin, width, height);
             uint32_t rendered_width=0,rendered_height=0;
-            g_presented_frame.rgba(rgba_pixels,rendered_width,rendered_height);
+            g_presented_frame.rgba(rgba_pixels,rendered_width,rendered_height,&display_aspect);
             bmi.bmiHeader.biWidth = rendered_width;
             bmi.bmiHeader.biHeight = -int32_t(rendered_height);
 
             HDC hdc = GetDC(hwnd);
             if (hdc) {
-                render_frame_to_dc(hdc, hwnd, rgba_pixels.data(), &bmi, rendered_width, rendered_height);
+                render_frame_to_dc(hdc, hwnd, rgba_pixels.data(), &bmi, rendered_width, rendered_height,display_aspect);
                 ReleaseDC(hwnd, hdc);
             }
         }
@@ -1173,7 +1210,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_renderer_win32 && !g_gpu_window_owned.load()) {
                 std::lock_guard lock(g_renderer_win32->presentation_mutex);
                 render_frame_to_dc(hdc, hwnd, g_renderer_win32->rgba_pixels.data(), &g_renderer_win32->bmi,
-                    g_renderer_win32->bmi.bmiHeader.biWidth, -g_renderer_win32->bmi.bmiHeader.biHeight);
+                    g_renderer_win32->bmi.bmiHeader.biWidth, -g_renderer_win32->bmi.bmiHeader.biHeight,g_renderer_win32->display_aspect);
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -1197,6 +1234,7 @@ int main(int argc, char** argv) {
     bool explicit_rom = false;
     int headless_seconds = 4;
     int render_height_override = -1;
+    int original_resolution_override = -2;
     std::filesystem::path rom_path = "top_gear_rom/normalized/Top Gear Overdrive (USA).z64";
 
     // The Unicode command line preserves non-ASCII ROM paths and drag-and-drop.
@@ -1226,6 +1264,11 @@ int main(int argc, char** argv) {
             else if (value==L"1080") render_height_override=1080;
             else if (value==L"2160" || value==L"4k" || value==L"4K") render_height_override=2160;
             else {std::cerr << "--render-height expects native, 720, 1080 or 2160 (4k).\n";return 2;}
+        } else if (arg == L"--original-resolution" && i+1<arguments.size()) {
+            original_resolution_override=original_resolution_value(arguments[++i]);
+            if(original_resolution_override==-2) {
+                std::cerr<<"--original-resolution expects game, off, half or full.\n";return 2;
+            }
         } else if (arg == L"--verify-rom") {
             verify_only = true;
         } else if (arg == L"--seconds" && i + 1 < arguments.size()) {
@@ -1234,7 +1277,7 @@ int main(int argc, char** argv) {
             rom_path = arguments[++i];
             explicit_rom = true;
         } else if (arg == L"--help") {
-            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
+            std::cout << "Usage: tgod_native.exe [--rom] <own ROM.z64|v64|n64> [--render-height native|720|1080|2160|4k] [--original-resolution game|off|half|full] [--headless --seconds N [--graphics-check | --intro-check] [--resolution-check | --presentation-check]] [--verify-rom]\n";
             return 0;
         } else if (arg.rfind(L"--", 0) != 0) {
             rom_path = arg;
@@ -1285,8 +1328,17 @@ int main(int argc, char** argv) {
     if (selected_height!=720 && selected_height!=1080 && selected_height!=2160) selected_height=0;
     if (render_height_override>=0) selected_height=uint32_t(render_height_override);
     g_render_height.store(selected_height);
+    wchar_t original_mode[32]{};
+    GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"game",original_mode,32,g_graphics_config.c_str());
+    g_original_resolution=headless ? -1 : original_resolution_value(original_mode);
+    if(g_original_resolution==-2) {
+        std::cerr<<"[Graphics] Invalid OriginalResolution; using game.\n";g_original_resolution=-1;
+    }
+    if(original_resolution_override!=-2)g_original_resolution=original_resolution_override;
     if (!headless && !std::filesystem::exists(g_graphics_config))
         WritePrivateProfileStringW(L"Graphics",L"RenderHeight",L"0",g_graphics_config.c_str());
+    if(!headless && GetPrivateProfileStringW(L"Graphics",L"OriginalResolution",L"",original_mode,32,g_graphics_config.c_str())==0)
+        WritePrivateProfileStringW(L"Graphics",L"OriginalResolution",L"game",g_graphics_config.c_str());
     std::cout << "[Graphics] Internal resolution: " << (selected_height ? std::to_string(selected_height)+"p (4:3)" : "native")
               << "; F6 cycles native/720p/1080p/4K. Native timing plus hardware HD.\n";
     if (!program_directory.empty()) {
