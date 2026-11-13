@@ -1,3 +1,25 @@
+## v0.1.0-preview.13 — optimización de renderizado, audio y empaquetado
+
+- Compactación de comandos GPU y caché de TMEM/superficies: empaqueta los 8
+  tiles de 20 a 4 palabras (`Command` de 256 a 96 `uint32_t`), omite muestras
+  bilineales con peso cero en el shader, sustituye la comparación completa de
+  4 KiB de TMEM por contador de versión (`tmem_version`) y reemplaza `std::map`
+  por almacenamiento compacto en `GPURaster` y `RenderSurfaces`.
+- Ruta de combiner y superficies HD/nativo: añade caché de decodificación del
+  combiner (`decoded_combine()`), consulta escalas sin ensuciar superficies CPU
+  cuando el backend GPU está activo y evita marcar superficies como sucias al
+  importar snapshots desde GPU residente.
+- Audio Win32 (`Win32AudioBackend`) y host: reemplaza `vector::erase` y
+  asignaciones por fragmento por un índice de lectura y búfer en pila; unifica
+  `Win32RendererContext` con soporte headless/ventana y elimina código muerto.
+- Empaquetado Windows (`release_windows.ps1`): corrige la compilación del
+  target `N64RecompCLI` para generar `N64Recomp.exe` desde una copia limpia.
+- Verificado localmente: `tgod_regression_checks.exe` aprobado,
+  `tgod_gpu_checks.exe` aprobado en RTX 3080 Ti (paridad GPU, commit nativo y
+  presentación DXGI) y corrida `--headless --seconds 16` de `tgod_native.exe`
+  con salida `0`. Siguen pendientes pruebas interactivas de conducción, todos
+  los circuitos y multijugador.
+
 ## v0.1.0-preview.12 — GPU nativa y ritmo VI
 
 - Nuevo `NativeRasterizer=gpu|cpu`: GPU por defecto en el perfil mejorado,

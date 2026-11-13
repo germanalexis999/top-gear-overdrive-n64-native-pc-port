@@ -1,4 +1,18 @@
-# Estado del port — 2026-10-23
+# Estado del port — 2026-11-13
+
+Revisión preparada para `v0.1.0-preview.13`: optimizaciones en CPU/GPU/audio y
+limpieza del host (`RenderSurfaces`, caché de combiner, `Command` de 256 a 96
+palabras con tiles empaquetados, muestreo bilineal sin lecturas de peso cero,
+versionado de TMEM, audio sin `vector::erase` en cabecera y unificación de
+`Win32RendererContext`). También corrige el target `N64RecompCLI` en
+`tools/release_windows.ps1` y `docs/BUILDING.md`.
+
+Compilado localmente con ROM USA v0 verificada; ejecutados y aprobados
+`tgod_regression_checks.exe`, `tgod_gpu_checks.exe` (RTX 3080 Ti) y
+`tgod_native.exe --headless --seconds 16`. Quedan pendientes validación
+interactiva de conducción, todos los circuitos y multijugador.
+
+## Estado anterior — 2026-10-23
 
 Revisión preparada para preview.12: rasterizado nativo acelerado por GPU,
 con copia privada, readbacks completos y commit de targets antes de SP/DP.

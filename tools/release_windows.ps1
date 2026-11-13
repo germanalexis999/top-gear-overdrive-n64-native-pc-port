@@ -84,7 +84,7 @@ try {
         $recompilerDirectory = Join-Path $dependencyDirectory 'N64Recomp'
         $recompilerBuild = Join-Path $recompilerDirectory 'build'
         Invoke-Checked cmake @('-S', $recompilerDirectory, '-B', $recompilerBuild, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release')
-        Invoke-Checked cmake @('--build', $recompilerBuild, '--target', 'N64Recomp', '--parallel', "$Jobs")
+        Invoke-Checked cmake @('--build', $recompilerBuild, '--target', 'N64RecompCLI', '--parallel', "$Jobs")
         Write-Host '[3/7] Regenerate local game C and build the native executable.'
         Invoke-Checked $python @('tools/prepare_recomp.py', '--rom', $normalizedRom,
             '--recompiler', (Join-Path $recompilerBuild 'N64Recomp.exe'))

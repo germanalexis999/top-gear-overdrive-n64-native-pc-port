@@ -19,30 +19,34 @@ int coord(int v,int extent,uint cl,uint mi,uint mask){
     return v;
 }
 bool fetch(uint b,uint ti,int x,int y,out int4 col){
-    uint t=b+64+ti*20;
-    int tw=int(Commands[t+15])-int(Commands[t+13])+1,th=int(Commands[t+16])-int(Commands[t+14])+1;
+    uint t=b+64+ti*4;
+    uint w0=Commands[t],w1=Commands[t+1],w2=Commands[t+2],w3=Commands[t+3];
+    uint uls=w2&65535,ult=w2>>16,lrs=w3&65535,lrt=w3>>16;
+    int tw=int(lrs)-int(uls)+1,th=int(lrt)-int(ult)+1;
     col=0;if(tw<=0||th<=0||tw>1024||th>1024)return false;
-    uint fmt=Commands[t],sz=Commands[t+1],tm=Commands[t+3];
+    uint fmt=w0&7,sz=(w0>>3)&3,tm=w1&65535,tline=(w0>>5)&511,pal=(w0>>14)&15;
     uint ps=fmt==0&&sz==3 ? 2:sz;
-    uint stride=Commands[t+2]!=0 ? Commands[t+2]*8 : ((uint(tw)<<ps)+1)/2;
-    x=coord(x,tw,Commands[t+5],Commands[t+6],Commands[t+7]);
-    y=coord(y,th,Commands[t+9],Commands[t+10],Commands[t+11]);
+    uint stride=tline!=0 ? tline*8 : ((uint(tw)<<ps)+1)/2;
+    x=coord(x,tw,(w0>>18)&1,(w0>>19)&1,(w0>>20)&15);
+    y=coord(y,th,(w0>>28)&1,(w0>>29)&1,(w1>>16)&15);
     uint odd=(y&1)!=0 ? 4:0;
     if(fmt==0&&sz==3){uint a=((tm+y*stride+x*2)^odd)&2047;col=int4(texbyte(b,a),texbyte(b,(a+1)&2047),texbyte(b,a|2048),texbyte(b,((a+1)&2047)|2048));return true;}
     if(fmt==3&&sz==2){uint a=(tm+y*stride+x*2)^odd;uint i=texbyte(b,a);col=int4(i,i,i,texbyte(b,a+1));return true;}
     bool small=(fmt==2||fmt==3||fmt==4)&&sz<=1;
     uint a=(tm+y*stride+(small ? (sz==0 ? (x>>1):x):x*2))^odd;
     uint raw=texbyte(b,a);uint nib=(x&1)!=0 ? raw&15:raw>>4;
-    if(fmt==2&&(sz==0||sz==1)){uint idx=sz==0 ? Commands[t+4]*16+nib:raw;uint p=C(b,25)+idx*2;col=unpack16((texbyte(b,p)<<8)|texbyte(b,p+1));return true;}
+    if(fmt==2&&(sz==0||sz==1)){uint idx=sz==0 ? pal*16+nib:raw;uint p=C(b,25)+idx*2;col=unpack16((texbyte(b,p)<<8)|texbyte(b,p+1));return true;}
     if(fmt==3&&sz==1){uint i=(raw>>4)*17;col=int4(i,i,i,(raw&15)*17);return true;}
     if(fmt==3&&sz==0){uint i=(nib>>1)*255/7;col=int4(i,i,i,(nib&1)*255);return true;}
     if(fmt==4&&(sz==0||sz==1)){uint i=sz==0 ? nib*17:raw;col=int4(i,i,i,i);return true;}
     col=unpack16((raw<<8)|texbyte(b,a+1));if(fmt!=0||sz!=2)col.a=255;return true;
 }
 bool sampleTile(uint b,uint ti,float2 uv,bool filtered,out int4 col){
-    uint t=b+64+ti*20;uint ss=Commands[t+8],st=Commands[t+12];
+    uint t=b+64+ti*4;
+    uint w0=Commands[t],w1=Commands[t+1],w2=Commands[t+2];
+    uint ss=(w0>>24)&15,st=(w1>>20)&15;
     uv*=float2(exp2(ss<=10 ? -int(ss):16-int(ss)),exp2(st<=10 ? -int(st):16-int(st)));
-    uv-=float2(Commands[t+13],Commands[t+14])+float2(Commands[t+17],Commands[t+18])/4;
+    uv-=float2(w2&65535,w2>>16)+float2(w0>>30,(w1>>24)&3)/4;
     col=0;if(!all(isfinite(uv))||any(abs(uv)>10000000))return false;
     int2 xy=int2(floor(uv));if(!filtered)return fetch(b,ti,xy.x,xy.y,col);
     float2 f=floor(frac(uv)*32)/32;float4 weights=0;
@@ -50,7 +54,7 @@ bool sampleTile(uint b,uint ti,float2 uv,bool filtered,out int4 col){
     else if(f.x+f.y<1)weights=float4(1-f.x-f.y,f.x,f.y,0);
     else weights=float4(0,1-f.y,1-f.x,f.x+f.y-1);
     float4 result=0;
-    [unroll]for(int i=0;i<4;++i){int4 s;if(!fetch(b,ti,xy.x+(i&1),xy.y+(i>>1),s))return false;result+=s*weights[i];}
+    [unroll]for(int i=0;i<4;++i){if(weights[i]==0)continue;int4 s;if(!fetch(b,ti,xy.x+(i&1),xy.y+(i>>1),s))return false;result+=s*weights[i];}
     col=int4(clamp(result,0,255));return true;
 }
 int colorMux(uint b,uint mux,uint channel,uint operand,int4 combined,int4 t0,int4 t1,int4 shade,int lod){
@@ -133,7 +137,7 @@ bool secondTexture(uint b){
         if(any(colors==tex)||colors.z==tex+7||any(alphas==tex))return true;
     }return false;
 }
-bool validTile(uint b,uint ti){uint t=b+64+ti*20;int w=int(Commands[t+15])-int(Commands[t+13])+1,h=int(Commands[t+16])-int(Commands[t+14])+1;return w>0&&h>0&&w<=1024&&h<=1024;}
+bool validTile(uint b,uint ti){uint t=b+64+ti*4;uint w2=Commands[t+2],w3=Commands[t+3];int w=int(w3&65535)-int(w2&65535)+1,h=int(w3>>16)-int(w2>>16)+1;return w>0&&h>0&&w<=1024&&h<=1024;}
 [numthreads(8,8,1)]
 void main(uint3 id:SV_DispatchThreadID){
     if(id.x>=Width||id.y>=Height)return;

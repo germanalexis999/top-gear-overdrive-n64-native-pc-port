@@ -115,7 +115,6 @@ public:
         bool non_silent = false;
     };
 
-    HWAVEOUT h_wave_out = nullptr;
     HANDLE h_event = nullptr;
     std::atomic<uint32_t> current_freq{22050};
     std::atomic<bool> running{true};
@@ -131,8 +130,8 @@ public:
 
     std::mutex queue_mutex;
     std::vector<int16_t> pending_samples;
+    size_t pending_read_offset = 0;
     std::thread worker_thread;
-    bool enabled = true;
     std::atomic<uint64_t> audio_latency_overruns{0};
     std::atomic<uint64_t> silent_audio_inputs_discarded{0};
     std::atomic<uint64_t> pending_audio_frames_replaced{0};
@@ -163,10 +162,6 @@ public:
         }
     }
 
-    int32_t buffers_in_flight() {
-        return (int32_t)in_flight_blocks.load(std::memory_order_relaxed);
-    }
-
     void set_frequency(uint32_t freq) {
         if (freq == 0) freq = 22050;
         current_freq.store(freq);
@@ -174,7 +169,7 @@ public:
     }
 
     void queue_samples(const int16_t* samples, size_t sample_count) {
-        if (!enabled || !samples || sample_count == 0) return;
+        if (!samples || sample_count == 0) return;
         bool has_nonzero = false;
         for (size_t s = 0; s < sample_count; ++s) {
             if (samples[s] != 0) { has_nonzero = true; break; }
@@ -188,7 +183,8 @@ public:
             // stale silence when playback has fallen more than 400 ms behind.
             // This game can submit many silent AI blocks while initializing;
             // dropping all later blocks would then strand the actual music.
-            const size_t queued_frames = pending_samples.size() / 2 +
+            const size_t active_samples = pending_samples.size() - pending_read_offset;
+            const size_t queued_frames = active_samples / 2 +
                 in_flight_blocks.load(std::memory_order_relaxed) * (BUFFER_CHUNK_SAMPLES / 2);
             const size_t max_queued_frames = static_cast<size_t>(current_freq.load()) * 2 / 5;
             if (queued_frames > max_queued_frames) {
@@ -204,12 +200,17 @@ public:
                 // Prefer new music over stale queued silence. WaveOut buffers
                 // already submitted remain in order; only the software queue
                 // is replaced, keeping latency bounded.
-                const size_t discarded_frames = pending_samples.size() / 2;
+                const size_t discarded_frames = active_samples / 2;
                 pending_samples.clear();
+                pending_read_offset = 0;
                 if (discarded_frames != 0) {
                     ai_frames_pending.fetch_sub(discarded_frames, std::memory_order_relaxed);
                     pending_audio_frames_replaced.fetch_add(discarded_frames, std::memory_order_relaxed);
                 }
+            }
+            if (pending_read_offset == pending_samples.size()) {
+                pending_samples.clear();
+                pending_read_offset = 0;
             }
             size_t old_sz = pending_samples.size();
             pending_samples.resize(old_sz + sample_count);
@@ -232,7 +233,7 @@ public:
 
     size_t get_frames_remaining() {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        size_t pending_frames = pending_samples.size() / 2;
+        size_t pending_frames = (pending_samples.size() - pending_read_offset) / 2;
         size_t in_flight_frames = in_flight_blocks.load(std::memory_order_relaxed) * (BUFFER_CHUNK_SAMPLES / 2);
         return pending_frames + in_flight_frames;
     }
@@ -361,25 +362,34 @@ public:
                 }
             }
 
-            std::vector<int16_t> chunk;
+            int16_t chunk[BUFFER_CHUNK_SAMPLES];
+            bool has_chunk = false;
             {
                 std::lock_guard<std::mutex> lock(queue_mutex);
                 if (!running.load()) break;
 
-                if (pending_samples.size() >= BUFFER_CHUNK_SAMPLES) {
-                    chunk.assign(pending_samples.begin(), pending_samples.begin() + BUFFER_CHUNK_SAMPLES);
-                    pending_samples.erase(pending_samples.begin(), pending_samples.begin() + BUFFER_CHUNK_SAMPLES);
+                if (pending_samples.size() - pending_read_offset >= BUFFER_CHUNK_SAMPLES) {
+                    std::memcpy(chunk, pending_samples.data() + pending_read_offset, BUFFER_CHUNK_SAMPLES * sizeof(int16_t));
+                    pending_read_offset += BUFFER_CHUNK_SAMPLES;
+                    if (pending_read_offset == pending_samples.size()) {
+                        pending_samples.clear();
+                        pending_read_offset = 0;
+                    } else if (pending_read_offset >= 8192) {
+                        pending_samples.erase(pending_samples.begin(), pending_samples.begin() + pending_read_offset);
+                        pending_read_offset = 0;
+                    }
+                    has_chunk = true;
                 }
             }
 
-            if (chunk.empty()) {
+            if (!has_chunk) {
                 // Wake for either new PCM or WOM_DONE, so the game's AI wait
                 // resumes as soon as a DMA block ends instead of polling at 20 ms.
                 WaitForSingleObject(h_event, 20);
                 continue;
             }
 
-            if (!chunk.empty() && hwo) {
+            if (hwo) {
                 Block& b = blocks[block_idx];
                 block_idx = (block_idx + 1) % NUM_BUFFERS;
 
@@ -390,7 +400,7 @@ public:
                     waveOutUnprepareHeader(hwo, &b.hdr, sizeof(WAVEHDR));
                     if (in_flight_blocks > 0) in_flight_blocks.fetch_sub(1, std::memory_order_relaxed);
                 }
-                std::memcpy(b.pcm, chunk.data(), BUFFER_CHUNK_SAMPLES * sizeof(int16_t));
+                std::memcpy(b.pcm, chunk, BUFFER_CHUNK_SAMPLES * sizeof(int16_t));
                 b.non_silent = false;
                 for (int16_t sample : b.pcm) {
                     if (sample != 0) { b.non_silent = true; break; }
@@ -420,10 +430,10 @@ public:
                     b.ai_frames = 0;
                     ultramodern::send_ai_message();
                 }
-            } else if (!chunk.empty()) {
+            } else {
                 // The device could not be opened; drain the host queue and
                 // wake any N64 thread waiting for an AI completion.
-                ai_frames_pending.fetch_sub(chunk.size() / 2, std::memory_order_relaxed);
+                ai_frames_pending.fetch_sub(BUFFER_CHUNK_SAMPLES / 2, std::memory_order_relaxed);
                 ultramodern::send_ai_message();
             }
         }
@@ -925,60 +935,7 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
     } else render_native();
 }
 
-// Minimal Null Renderer Context for headless execution & verification
-class NullRendererContext : public ultramodern::renderer::RendererContext {
-public:
-    uint8_t* rdram = nullptr;
-    std::atomic<uint32_t> dl_count{0};
-    std::atomic<uint32_t> screen_update_count{0};
-    F3DEX2Interpreter interpreter;
-
-    NullRendererContext(uint8_t* rdram_in = nullptr) : rdram(rdram_in), interpreter(rdram_in) {
-        setup_result = ultramodern::renderer::SetupResult::Success;
-        chosen_api = ultramodern::renderer::GraphicsApi::Auto;
-    }
-    bool valid() override { return true; }
-    bool update_config(const ultramodern::renderer::GraphicsConfig&, const ultramodern::renderer::GraphicsConfig&) override { return true; }
-    void enable_instant_present() override {}
-    void send_dl(const OSTask* task) override {
-        uint32_t count = dl_count++;
-        if (task && task->t.data_ptr) {
-            process_graphics_task(interpreter,task);
-        }
-        if (count < 3 && task) {
-            std::cout << "[GFX DL #" << count << "] Type: " << task->t.type
-                      << ", Flags: 0x" << std::hex << task->t.flags
-                      << ", ucode: 0x" << (uintptr_t)task->t.ucode
-                      << ", ucode_data: 0x" << (uintptr_t)task->t.ucode_data
-                      << ", data_ptr: 0x" << (uintptr_t)task->t.data_ptr
-                      << ", data_size: 0x" << task->t.data_size << std::dec << "\n";
-        }
-    }
-    void send_dummy_workload(uint32_t) override {}
-    void update_screen() override {
-        uint32_t count = screen_update_count++;
-        auto vi = ultramodern::renderer::get_vi_regs();
-        if (vi) {
-            const auto frame = tgod::vi_frame_layout(*vi);
-            if (frame.visible) g_presented_frame.update(interpreter,rdram, frame.origin, frame.width, frame.height);
-            else g_presented_frame.blank();
-        }
-        if (count < 3) {
-            if (vi) {
-                std::cout << "[Screen Update #" << count << "] FB Origin: 0x" << std::hex << vi->VI_ORIGIN_REG
-                          << ", Width: " << std::dec << vi->VI_WIDTH_REG
-                          << ", Status: 0x" << std::hex << vi->VI_STATUS_REG << std::dec << "\n";
-            }
-        }
-    }
-    void shutdown() override {}
-    uint32_t get_display_framerate() const override { return 60; }
-    float get_resolution_scale() const override {
-        const auto height=interpreter.render_surfaces.height();
-        return height ? float(height)/interpreter.framebuffer_height() : 1.0f;
-    }
-};
-
+// Interactive & Headless Host Renderer Context (DIB presentation when hwnd != nullptr)
 static bool g_fullscreen = false;
 static WINDOWPLACEMENT g_prev_wp = { sizeof(WINDOWPLACEMENT) };
 
@@ -1070,7 +1027,6 @@ static void resize_window_scale(HWND hwnd, int scale) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-// Interactive Win32 Renderer Context using DIB presentation
 class Win32RendererContext : public ultramodern::renderer::RendererContext {
 public:
     uint8_t* rdram = nullptr;
@@ -1083,17 +1039,19 @@ public:
     BITMAPINFO bmi{};
     F3DEX2Interpreter interpreter;
 
-    Win32RendererContext(uint8_t* rdram_in, HWND hwnd_in) : rdram(rdram_in), hwnd(hwnd_in), interpreter(rdram_in) {
+    Win32RendererContext(uint8_t* rdram_in, HWND hwnd_in = nullptr) : rdram(rdram_in), hwnd(hwnd_in), interpreter(rdram_in) {
         setup_result = ultramodern::renderer::SetupResult::Success;
         chosen_api = ultramodern::renderer::GraphicsApi::Auto;
-        rgba_pixels.resize(320 * 240, 0);
+        if (hwnd) {
+            rgba_pixels.resize(320 * 240, 0);
 
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = 320;
-        bmi.bmiHeader.biHeight = -240; // top-down
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = 320;
+            bmi.bmiHeader.biHeight = -240; // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+        }
     }
 
     bool valid() override { return true; }
@@ -1119,9 +1077,23 @@ public:
 
     void update_screen() override {
         uint32_t count = screen_update_count++;
-        if (!hwnd || !rdram) return;
+        if (!rdram) return;
 
         auto vi = ultramodern::renderer::get_vi_regs();
+        if (!hwnd) {
+            if (vi) {
+                const auto frame = tgod::vi_frame_layout(*vi);
+                if (frame.visible) g_presented_frame.update(interpreter, rdram, frame.origin, frame.width, frame.height);
+                else g_presented_frame.blank();
+                if (count < 3) {
+                    std::cout << "[Screen Update #" << count << "] FB Origin: 0x" << std::hex << vi->VI_ORIGIN_REG
+                              << ", Width: " << std::dec << vi->VI_WIDTH_REG
+                              << ", Status: 0x" << std::hex << vi->VI_STATUS_REG << std::dec << "\n";
+                }
+            }
+            return;
+        }
+
         uint32_t origin = vi ? (vi->VI_ORIGIN_REG & 0x1FFFFFFF) : 0;
         if (count < 5 || count % 60 == 0) {
             std::cout << "[update_screen #" << count << "] VI origin=0x" << std::hex << origin
@@ -1174,8 +1146,7 @@ public:
     }
 };
 
-static NullRendererContext* g_renderer_null = nullptr;
-static Win32RendererContext* g_renderer_win32 = nullptr;
+static Win32RendererContext* g_renderer = nullptr;
 
 static inline uint32_t read_rdram_u32(const uint8_t* rdram, uint32_t vram) {
     uint32_t phys = vram & 0x1FFFFFFF;
@@ -1195,20 +1166,6 @@ static inline uint8_t read_rdram_u8(const uint8_t* rdram, uint32_t vram) {
     return *(rdram + phys);
 }
 
-static inline void write_rdram_u32(uint8_t* rdram, uint32_t vram, uint32_t val) {
-    uint32_t phys = vram & 0x1FFFFFFF;
-    if (phys + 4 <= 8 * 1024 * 1024) {
-        *reinterpret_cast<uint32_t*>(rdram + phys) = val;
-    }
-}
-
-static inline void write_rdram_u16(uint8_t* rdram, uint32_t vram, uint16_t val) {
-    uint32_t phys = (vram & 0x1FFFFFFF) ^ 2;
-    if (phys + 2 <= 8 * 1024 * 1024) {
-        *reinterpret_cast<uint16_t*>(rdram + phys) = val;
-    }
-}
-
 static inline void write_rdram_u8(uint8_t* rdram, uint32_t vram, uint8_t val) {
     uint32_t phys = (vram & 0x1FFFFFFF) ^ 3;
     if (phys < 8 * 1024 * 1024) {
@@ -1216,11 +1173,8 @@ static inline void write_rdram_u8(uint8_t* rdram, uint32_t vram, uint8_t val) {
     }
 }
 
-static std::atomic<uint32_t> g_si_poll_count{0};
-
 // Hook for Top Gear Overdrive SI polling function (0x800470A0)
 extern "C" void tgod_poll_si(uint8_t* rdram, recomp_context* ctx) {
-    g_si_poll_count.fetch_add(1, std::memory_order_relaxed);
     update_key_input();
     tgod::input::Snapshot snapshot;
     {
@@ -1294,10 +1248,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             std::lock_guard output_lock(g_window_output_mutex);
-            if (g_renderer_win32 && !g_gpu_window_owned.load()) {
-                std::lock_guard lock(g_renderer_win32->presentation_mutex);
-                render_frame_to_dc(hdc, hwnd, g_renderer_win32->rgba_pixels.data(), &g_renderer_win32->bmi,
-                    g_renderer_win32->bmi.bmiHeader.biWidth, -g_renderer_win32->bmi.bmiHeader.biHeight,g_renderer_win32->display_aspect);
+            if (g_renderer && g_renderer->hwnd && !g_gpu_window_owned.load()) {
+                std::lock_guard lock(g_renderer->presentation_mutex);
+                render_frame_to_dc(hdc, hwnd, g_renderer->rgba_pixels.data(), &g_renderer->bmi,
+                    g_renderer->bmi.bmiHeader.biWidth, -g_renderer->bmi.bmiHeader.biHeight,g_renderer->display_aspect);
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -1528,22 +1482,15 @@ int main(int argc, char** argv) {
         if(!g_presentation_check){ShowWindow(g_hwnd, SW_SHOW);UpdateWindow(g_hwnd);}
         std::cout << "[Host] Created native Win32 window (HWND: 0x" << std::hex << (uintptr_t)g_hwnd << std::dec << ", 640x480 client area)\n";
     } else {
-        g_audio_backend.enabled = true;
         std::cout << "[Host] Running in headless test mode (audio enabled for diagnostics).\n";
     }
 
     // 3. Register renderer callbacks
     ultramodern::renderer::callbacks_t render_cbs{};
     render_cbs.create_render_context = [](uint8_t* rdram_in, ultramodern::renderer::WindowHandle wh, bool) -> std::unique_ptr<ultramodern::renderer::RendererContext> {
-        if (wh.window != nullptr) {
-            auto ctx = std::make_unique<Win32RendererContext>(rdram_in, wh.window);
-            g_renderer_win32 = ctx.get();
-            return ctx;
-        } else {
-            auto ctx = std::make_unique<NullRendererContext>(rdram_in);
-            g_renderer_null = ctx.get();
-            return ctx;
-        }
+        auto ctx = std::make_unique<Win32RendererContext>(rdram_in, wh.window);
+        g_renderer = ctx.get();
+        return ctx;
     };
     ultramodern::renderer::set_callbacks(render_cbs);
 
@@ -1747,8 +1694,8 @@ int main(int argc, char** argv) {
                               << " | VI: " << std::fixed << std::setprecision(1) << fps<<" Hz"
                               << " | GFX: "<<gfx_rate<<" tasks/s | Native task: "<<native_ms<<" ms | HD GPU: "<<gpu_time
                               << " | HD snapshot age: "<<(g_render_height.load() ? g_hd_renderer.snapshot_age_ms():0)<<" ms"
-                              << " | DLs: " << (g_renderer_win32 ? g_renderer_win32->dl_count.load() : 0)
-                              << " | Screens: " << (g_renderer_win32 ? g_renderer_win32->screen_update_count.load() : 0)
+                              << " | DLs: " << (g_renderer ? g_renderer->dl_count.load() : 0)
+                              << " | Screens: " << (g_renderer ? g_renderer->screen_update_count.load() : 0)
                               << " | RSP_Busy: " << rsp_busy
                               << " | Th7: " << th7
                               << " | Stage: " << (int)stage << " (T=" << itimer << ")\n";
@@ -1845,7 +1792,7 @@ int main(int argc, char** argv) {
 
                 if (race_ticks == 10 && origin != 0) {
                     g_presented_frame.save("framebuffer_race_start.bmp");
-                    const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
+                    const auto& interp = g_renderer->interpreter;
                     save_fb_to_bmp("framebuffer_rdp_target.bmp", rdram, interp.color_image_addr, 320, 240);
                     std::cout << "[Framebuffer Pair] VI origin=0x" << std::hex << origin
                               << ", RDP target=0x" << interp.color_image_addr
@@ -1880,7 +1827,7 @@ int main(int argc, char** argv) {
 
                 if (showroom_ticks == 15 && origin != 0) {
                     g_presented_frame.save("framebuffer_car_showroom.bmp");
-                    const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
+                    const auto& interp = g_renderer->interpreter;
                     save_fb_to_bmp("framebuffer_rdp_target.bmp", rdram, interp.color_image_addr, 320, 240);
                 }
                 if (showroom_ticks >= 25) {
@@ -1917,9 +1864,9 @@ int main(int argc, char** argv) {
                 uint16_t deb_btns = read_rdram_u16(rdram, 0x800FF61C);
                 uint32_t intro_timer = read_rdram_u32(rdram, 0x80053654);
                 uint8_t intro_stage = read_rdram_u8(rdram, 0x80053650);
-                uint32_t dls = g_renderer_win32 ? g_renderer_win32->dl_count.load() : g_renderer_null ? g_renderer_null->dl_count.load() : 0;
-                uint32_t rects = g_renderer_win32 ? g_renderer_win32->interpreter.rects_drawn : g_renderer_null ? g_renderer_null->interpreter.rects_drawn : 0;
-                uint32_t tris = g_renderer_win32 ? g_renderer_win32->interpreter.triangles_drawn : g_renderer_null ? g_renderer_null->interpreter.triangles_drawn : 0;
+                uint32_t dls = g_renderer ? g_renderer->dl_count.load() : 0;
+                uint32_t rects = g_renderer ? g_renderer->interpreter.rects_drawn : 0;
+                uint32_t tris = g_renderer ? g_renderer->interpreter.triangles_drawn : 0;
                 std::cout << "[T+" << std::fixed << std::setprecision(1) << sec << "s] "
                           << "Mode: " << mode
                           << " | Submenu: " << (int)(int8_t)submenu
@@ -1979,14 +1926,14 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "\n[Host] Result: " << loaded_count << " / 4 catalogues verified in RDRAM.\n";
-    uint32_t dls = g_renderer_win32 ? g_renderer_win32->dl_count.load() : (g_renderer_null ? g_renderer_null->dl_count.load() : 0);
-    uint32_t screens = g_renderer_win32 ? g_renderer_win32->screen_update_count.load() : (g_renderer_null ? g_renderer_null->screen_update_count.load() : 0);
+    uint32_t dls = g_renderer ? g_renderer->dl_count.load() : 0;
+    uint32_t screens = g_renderer ? g_renderer->screen_update_count.load() : 0;
     std::cout << "[Host] Graphics display lists submitted: " << dls << "\n";
     std::cout << "[Host] Screen updates processed: " << screens << "\n";
     std::cout << "[Host] Total VI frames simulated: " << total_vis << "\n";
-    uint32_t rects = g_renderer_win32 ? g_renderer_win32->interpreter.rects_drawn : (g_renderer_null ? g_renderer_null->interpreter.rects_drawn : 0);
+    uint32_t rects = g_renderer ? g_renderer->interpreter.rects_drawn : 0;
     std::cout << "[Host] 2D Textured rects rasterized: " << rects << "\n";
-    const auto& interp = g_renderer_win32 ? g_renderer_win32->interpreter : g_renderer_null->interpreter;
+    const auto& interp = g_renderer->interpreter;
     const float authoritative_scale=interp.render_surfaces.height() ?
         float(interp.render_surfaces.height())/interp.framebuffer_height() : 1.0f;
     std::cout << "[Host] F3DEX2 Opcodes Encountered:\n";

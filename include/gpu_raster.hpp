@@ -27,7 +27,6 @@ public:
     GPURaster();
     ~GPURaster();
     bool available() const;
-    const char* adapter_name() const;
     struct Statistics {
         uint64_t surface_allocations=0,input_allocations=0,readback_bytes=0;
         uint64_t final_readbacks=0,dispatches=0,presents=0,resize_count=0,occluded=0,present_skipped=0;

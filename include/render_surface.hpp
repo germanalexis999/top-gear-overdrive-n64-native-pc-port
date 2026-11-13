@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <map>
 #include <utility>
 #include <vector>
 
@@ -17,7 +16,8 @@ class RenderSurfaces {
         bool dirty = false;
         std::vector<uint16_t> pixels, mirror;
     };
-    std::map<uint64_t, Surface> surfaces;
+    std::vector<std::pair<uint64_t, Surface>> surfaces;
+    std::vector<uint32_t> source_x;
     uint32_t render_height = 0;
     uint64_t clock = 0;
     uint8_t* ram = nullptr;
@@ -27,7 +27,7 @@ class RenderSurfaces {
         // Every scaled row uses the same horizontal mapping. Compute it once,
         // then copy rows that sample the same native row (common at HD/4K).
         // Keep the original float division and truncation at sample boundaries.
-        std::vector<uint32_t> source_x(s.width);
+        source_x.resize(s.width);
         for(uint32_t x=0;x<s.width;++x)
             source_x[x]=std::min(uint32_t(x/s.scale),s.native_width-1);
         uint32_t previous_sy=s.native_height;
@@ -75,29 +75,48 @@ public:
         for (auto& [key,s] : surfaces)
             if (std::memcmp(ram+s.address,s.mirror.data(),s.mirror.size()*2)) import(s);
     }
+    void erase_surface(std::vector<std::pair<uint64_t, Surface>>::iterator it) {
+        sync(it->second);
+        if (&*it != &surfaces.back()) *it = std::move(surfaces.back());
+        surfaces.pop_back();
+    }
+
+    static bool valid_target(const uint8_t* rdram, uint32_t address, uint32_t width, uint32_t height) {
+        return rdram && width && height && uint64_t(address) + uint64_t(width) * height * 2 <= 8 * 1024 * 1024;
+    }
+
+    std::pair<float, float> scales(uint32_t width, uint32_t height) const {
+        if (!render_height || (width!=320 && width!=640)) return {1.0f, 1.0f};
+        const float scale=float(render_height)/(width==320 ? 240.0f : 480.0f);
+        // 640x240/120 have twice as many horizontal samples per displayed
+        // pixel as 320x240. Half mode retains its half-height letterbox.
+        const float scale_y=float(render_height)/(height==480 ? 480.0f : 240.0f);
+        return {scale, scale_y};
+    }
     Buffer acquire(uint8_t* rdram, uint32_t address, uint32_t width, uint32_t height, bool dirty=true) {
-        if (!rdram || !width || !height || uint64_t(address)+uint64_t(width)*height*2>8*1024*1024) return {};
+        if (!valid_target(rdram, address, width, height)) return {};
         if (ram!=rdram) { clear(); ram=rdram; }
         if (!render_height || (width!=320 && width!=640))
             return {reinterpret_cast<uint16_t*>(ram+address),width,height,1};
         const uint64_t key=(uint64_t(address)<<32)|width;
-        auto it=surfaces.find(key);
+        auto it=std::find_if(surfaces.begin(),surfaces.end(),[key](const auto& entry){return entry.first==key;});
         if (it!=surfaces.end() && it->second.native_height!=height) {
-            sync(it->second);surfaces.erase(it);it=surfaces.end();
+            erase_surface(it);
+            it=surfaces.end();
         }
         if (it==surfaces.end()) {
             if (surfaces.size()>=8) {
                 auto oldest=std::min_element(surfaces.begin(),surfaces.end(),
                     [](const auto& a,const auto& b) {return a.second.used<b.second.used;});
-                sync(oldest->second); surfaces.erase(oldest);
+                erase_surface(oldest);
             }
-            const float scale=float(render_height)/(width==320 ? 240.0f : 480.0f);
-            // 640x240/120 have twice as many horizontal samples per displayed
-            // pixel as 320x240. Half mode retains its half-height letterbox.
-            const float scale_y=float(render_height)/(height==480 ? 480.0f : 240.0f);
+            if (surfaces.empty()) surfaces.reserve(8);
+            const auto [scale, scale_y]=scales(width,height);
             Surface s{address,width,height,uint32_t(width*scale),uint32_t(height*scale_y),scale,scale_y};
             s.pixels.resize(size_t(s.width)*s.height);s.mirror.resize(size_t(width)*height);
-            import(s);it=surfaces.emplace(key,std::move(s)).first;
+            import(s);
+            surfaces.emplace_back(key,std::move(s));
+            it=std::prev(surfaces.end());
         }
         Surface& s=it->second;s.used=++clock;s.dirty|=dirty;
         return {s.pixels.data(),s.width,s.height,s.scale,s.scale_y};

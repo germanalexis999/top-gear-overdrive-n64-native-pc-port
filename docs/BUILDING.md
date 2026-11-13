@@ -11,7 +11,7 @@ Desde la raíz del proyecto:
 ```powershell
 .\tools\bootstrap.ps1
 cmake -S tools/N64Recomp -B tools/N64Recomp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build tools/N64Recomp/build --target N64Recomp --parallel 4
+cmake --build tools/N64Recomp/build --target N64RecompCLI --parallel 4
 ```
 
 `bootstrap.ps1` descarga las revisiones exactas de `dependencies.lock.json`,

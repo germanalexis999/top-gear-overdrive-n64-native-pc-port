@@ -7,7 +7,8 @@
 #include "gpu_shader.hpp"
 #include <array>
 #include <vector>
-#include <map>
+#include <memory>
+#include <utility>
 #include <string>
 #include <cstring>
 #include <cmath>
@@ -29,7 +30,8 @@ template<class T> struct Com {
 void checked(HRESULT hr,const char* operation) {
     if(FAILED(hr)) throw std::runtime_error(std::string(operation)+" (HRESULT "+std::to_string(uint32_t(hr))+")");
 }
-using Command=std::array<uint32_t,256>;
+static constexpr uint32_t COMMAND_WORDS=96;
+using Command=std::array<uint32_t,COMMAND_WORDS>;
 void put_float(Command& c,int i,float value){std::memcpy(&c[i],&value,4);}
 uint32_t rgba(const Vertex3D& v){return uint32_t(v.r)<<24|uint32_t(v.g)<<16|uint32_t(v.b)<<8|v.a;}
 void vertex(Command& c,int at,const Vertex3D& v,bool perspective) {
@@ -82,11 +84,11 @@ struct GPURaster::Impl {
         uint64_t frame=0,used=0,revision=0;
         bool dirty=false,written=false;
     };
-    std::map<uint64_t,std::unique_ptr<Surface>> surfaces;
+    std::vector<std::pair<uint64_t,std::unique_ptr<Surface>>> surfaces;
     Surface* color=nullptr;Surface* depth=nullptr;
     std::vector<Command> commands;
     std::vector<uint32_t> texture_words;
-    std::array<uint8_t,4096> last_tmem{};
+    uint64_t last_tmem_version=0;
     bool have_tmem=false;
     uint32_t tmem_offset=0;
     float scale=1, scale_y=1;
@@ -149,6 +151,16 @@ struct GPURaster::Impl {
             std::cout<<"[HD GPU] Direct3D 11 hardware: "<<name<<".\n";
         } catch(const std::exception& e){std::cerr<<"[HD GPU] "<<e.what()<<"; using software HD fallback.\n";}
     }
+    auto find_surface(uint64_t key) {
+        return std::find_if(surfaces.begin(),surfaces.end(),[key](const auto& entry){return entry.first==key;});
+    }
+    auto find_surface(uint64_t key) const {
+        return std::find_if(surfaces.begin(),surfaces.end(),[key](const auto& entry){return entry.first==key;});
+    }
+    void erase_surface(std::vector<std::pair<uint64_t,std::unique_ptr<Surface>>>::iterator it) {
+        if(&*it!=&surfaces.back())*it=std::move(surfaces.back());
+        surfaces.pop_back();
+    }
     Surface* surface(F3DEX2Interpreter& r,uint32_t address) {
         if(r.color_image_size!=2)return nullptr;
         if(cache_height!=r.render_surfaces.height()) {
@@ -156,9 +168,9 @@ struct GPURaster::Impl {
             cache_height=r.render_surfaces.height();
         }
         const uint64_t key=(uint64_t(address)<<32)|r.color_image_width;
-        auto it=surfaces.find(key);
+        auto it=find_surface(key);
         if(it!=surfaces.end() && it->second->native_height!=r.framebuffer_height()) {
-            flush();color=nullptr;depth=nullptr;surfaces.erase(it);it=surfaces.end();
+            flush();color=nullptr;depth=nullptr;erase_surface(it);it=surfaces.end();
         }
         if(it!=surfaces.end()&&it->second->frame==frame_id)return it->second.get();
         if(it==surfaces.end()&&surfaces.size()>=8) {
@@ -166,9 +178,9 @@ struct GPURaster::Impl {
             for(auto candidate=surfaces.begin();candidate!=surfaces.end();++candidate)
                 if(candidate->second->frame!=frame_id&&(oldest==surfaces.end()||candidate->second->used<oldest->second->used))oldest=candidate;
             if(oldest==surfaces.end())throw std::runtime_error("GPU surface cache limit reached");
-            surfaces.erase(oldest);
+            erase_surface(oldest);it=surfaces.end();
         }
-        auto cpu=r.render_buffer(address);
+        auto cpu=r.render_buffer(address,false);
         if(!cpu.pixels)return nullptr;
         if(r.color_image_width!=320 && r.color_image_width!=640)
             throw std::runtime_error("Unsupported GPU framebuffer width");
@@ -191,7 +203,8 @@ struct GPURaster::Impl {
             checked(device->CreateUnorderedAccessView(s->buffer.p,&view,s->uav.out()),"Create surface UAV");
             D3D11_SHADER_RESOURCE_VIEW_DESC srv{};srv.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;srv.Buffer.NumElements=UINT(upload_scratch.size());
             checked(device->CreateShaderResourceView(s->buffer.p,&srv,s->srv.out()),"Create surface SRV");
-            it=surfaces.emplace(key,std::move(s)).first;++stats.surface_allocations;
+            if(surfaces.empty())surfaces.reserve(8);
+            surfaces.emplace_back(key,std::move(s));it=std::prev(surfaces.end());++stats.surface_allocations;
         }
         auto* result=it->second.get();
         // Allocation reuse never implies content reuse: each private snapshot
@@ -220,13 +233,13 @@ struct GPURaster::Impl {
         bins.resize(size_t(bx)*by);for(auto& bin:bins)bin.clear();
         for(uint32_t i=0;i<commands.size();++i){const auto& c=commands[i];
             for(uint32_t y=c[3]/32;y<=(c[5]-1)/32;++y)
-                for(uint32_t x=c[2]/32;x<=(c[4]-1)/32;++x)bins[size_t(y)*bx+x].push_back(i*256);
+                for(uint32_t x=c[2]/32;x<=(c[4]-1)/32;++x)bins[size_t(y)*bx+x].push_back(i*COMMAND_WORDS);
         }
         spans.resize(bins.size()*2);refs.clear();
         for(size_t i=0;i<bins.size();++i){spans[i*2]=uint32_t(refs.size());spans[i*2+1]=uint32_t(bins[i].size());refs.insert(refs.end(),bins[i].begin(),bins[i].end());}
         if(refs.empty()){commands.clear();return;}
         if(texture_words.empty())texture_words.resize(1024);
-        upload(commands.data(),uint32_t(commands.size()*256),inputs[0]);
+        upload(commands.data(),uint32_t(commands.size()*COMMAND_WORDS),inputs[0]);
         upload(texture_words.data(),uint32_t(texture_words.size()),inputs[1]);
         upload(spans.data(),uint32_t(spans.size()),inputs[2]);
         upload(refs.data(),uint32_t(refs.size()),inputs[3]);
@@ -323,16 +336,18 @@ struct GPURaster::Impl {
         c[17]=r.combine_mode_set;c[18]=r.primitive_lod_fraction;c[19]=r.primitive_min_lod;c[20]=r.primitive_depth;
         c[21]=r.fill_color&65535;c[22]=r.texture_max_level;c[23]=r.texture_enabled;c[25]=r.tlut_tmem_addr;
         if(kind!=1){
-            if(!have_tmem || std::memcmp(last_tmem.data(),r.tmem,4096)){
+            if(!have_tmem || r.tmem_version!=last_tmem_version){
                 tmem_offset=uint32_t(texture_words.size());const size_t old=texture_words.size();texture_words.resize(old+1024);
-                std::memcpy(texture_words.data()+old,r.tmem,4096);std::memcpy(last_tmem.data(),r.tmem,4096);have_tmem=true;
+                std::memcpy(texture_words.data()+old,r.tmem,4096);last_tmem_version=r.tmem_version;have_tmem=true;
             }c[1]=tmem_offset;
         }
-        for(int i=0;i<8;++i){const auto& t=r.tiles[i];auto* p=c.data()+64+i*20;
-            p[0]=t.format;p[1]=t.size;p[2]=t.line;p[3]=t.tmem_addr;p[4]=t.palette;
-            p[5]=t.clamp_s;p[6]=t.mirror_s;p[7]=t.mask_s;p[8]=t.shift_s;
-            p[9]=t.clamp_t;p[10]=t.mirror_t;p[11]=t.mask_t;p[12]=t.shift_t;
-            p[13]=t.uls;p[14]=t.ult;p[15]=t.lrs;p[16]=t.lrt;p[17]=t.uls_fraction;p[18]=t.ult_fraction;
+        for(int i=0;i<8;++i){const auto& t=r.tiles[i];auto* p=c.data()+64+i*4;
+            p[0]=(t.format&7u)|((t.size&3u)<<3)|((t.line&0x1FFu)<<5)|((t.palette&0xFu)<<14)|
+                ((t.clamp_s&1u)<<18)|((t.mirror_s&1u)<<19)|((t.mask_s&0xFu)<<20)|((t.shift_s&0xFu)<<24)|
+                ((t.clamp_t&1u)<<28)|((t.mirror_t&1u)<<29)|((uint32_t(t.uls_fraction)&3u)<<30);
+            p[1]=(t.tmem_addr&0xFFFFu)|((t.mask_t&0xFu)<<16)|((t.shift_t&0xFu)<<20)|((uint32_t(t.ult_fraction)&3u)<<24);
+            p[2]=(t.uls&0xFFFFu)|((t.ult&0xFFFFu)<<16);
+            p[3]=(t.lrs&0xFFFFu)|((t.lrt&0xFFFFu)<<16);
         }
         return c;
     }
@@ -341,7 +356,6 @@ struct GPURaster::Impl {
 GPURaster::GPURaster():impl(std::make_unique<Impl>()){}
 GPURaster::~GPURaster(){if(impl->ready)impl->release_presentation();}
 bool GPURaster::available()const{return impl->ready;}
-const char* GPURaster::adapter_name()const{return impl->name.c_str();}
 GPURaster::Statistics GPURaster::statistics()const{impl->poll_timings();return impl->stats;}
 void GPURaster::begin_frame(bool keep_on_gpu){
     impl->commands.clear();impl->color=nullptr;impl->depth=nullptr;
@@ -368,8 +382,7 @@ void GPURaster::commit_native_results(const F3DEX2Interpreter& r,uint8_t* destin
         std::memcpy(destination+s->address,r.rdram+s->address,size_t(s->native_width)*s->native_height*2);
 }
 void GPURaster::triangle(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,const Vertex3D& c) {
-    const auto target=r.render_buffer(r.color_image_addr,false);
-    const float s=target.scale, sy=target.scale_y;
+    const auto [s, sy]=r.render_surfaces.scales(r.color_image_width,r.framebuffer_height());
     auto cmd=impl->state(r,0,int(std::floor(std::max({0.f,float(r.scissor_xh),std::min({a.screen_x,b.screen_x,c.screen_x})})*s)),
         int(std::floor(std::max({0.f,float(r.scissor_yh),std::min({a.screen_y,b.screen_y,c.screen_y})})*sy)),
         int(std::ceil(std::min({float(r.color_image_width),float(r.scissor_xl),std::max({a.screen_x,b.screen_x,c.screen_x})})*s)),
@@ -378,8 +391,8 @@ void GPURaster::triangle(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& 
     impl->push(cmd);
 }
 void GPURaster::line(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,const Vertex3D& flat,float thickness) {
-    const auto target=r.render_buffer(r.color_image_addr,false);
-    const float s=target.scale, sy=target.scale_y, radius=thickness/2;
+    const auto [s, sy]=r.render_surfaces.scales(r.color_image_width,r.framebuffer_height());
+    const float radius=thickness/2;
     auto c=impl->state(r,3,int(std::floor(std::max({0.f,float(r.scissor_xh),std::min(a.screen_x,b.screen_x)-radius})*s)),
         int(std::floor(std::max({0.f,float(r.scissor_yh),std::min(a.screen_y,b.screen_y)-radius})*sy)),
         int(std::ceil(std::min({float(r.color_image_width),float(r.scissor_xl),std::max(a.screen_x,b.screen_x)+radius})*s)),
@@ -388,8 +401,7 @@ void GPURaster::line(F3DEX2Interpreter& r,const Vertex3D& a,const Vertex3D& b,co
 }
 void GPURaster::rectangle(F3DEX2Interpreter& r,int xl,int yl,int xh,int yh,bool fill,uint32_t tile,float u,float v,float ds,float dt,bool flip) {
     const bool copy=((r.other_mode_h>>20)&3)==2;
-    const auto target=r.render_buffer(r.color_image_addr,false);
-    const float s=target.scale, sy=target.scale_y;
+    const auto [s, sy]=r.render_surfaces.scales(r.color_image_width,r.framebuffer_height());
     auto c=impl->state(r,fill ? 1:2,int(std::ceil(std::max({0,xl,r.scissor_xh})*s)),int(std::ceil(std::max({0,yl,r.scissor_yh})*sy)),
         int(std::ceil(std::min({int(r.color_image_width),xh+(!fill&&copy ? 1:0),r.scissor_xl})*s)),
         int(std::ceil(std::min({int(r.framebuffer_height()),yh+(!fill&&copy ? 1:0),r.scissor_yl})*sy)),!fill&&!copy&&r.depth_image_addr);
@@ -420,11 +432,11 @@ void GPURaster::readback(F3DEX2Interpreter& r,uint64_t address,uint64_t bytes) {
 
 void GPURaster::release_presentation(){if(impl->ready)impl->release_presentation();}
 bool GPURaster::has_target(uint32_t address,uint32_t width)const{
-    auto it=impl->surfaces.find((uint64_t(address)<<32)|width);
+    auto it=impl->find_surface((uint64_t(address)<<32)|width);
     return it!=impl->surfaces.end()&&it->second->frame==impl->frame_id;
 }
 bool GPURaster::present_target(void* hwnd,uint32_t address,uint32_t native_width,uint32_t visible_height,uint32_t offset,bool smooth) {
-    auto it=impl->surfaces.find((uint64_t(address)<<32)|native_width);
+    auto it=impl->find_surface((uint64_t(address)<<32)|native_width);
     if(it==impl->surfaces.end()||it->second->frame!=impl->frame_id)return false;
     impl->flush();const auto& s=*it->second;
     const float scale=float(s.width)/native_width, scale_y=float(s.height)/s.native_height;

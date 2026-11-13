@@ -87,6 +87,9 @@ void F3DEX2Interpreter::reset() {
     combine_mode_w1 = 0;
     combine_mode_set = false;
     combine_mode_updates = 0;
+    cached_combine_w0 = 0xFFFFFFFFu;
+    cached_combine_w1 = 0xFFFFFFFFu;
+    tmem_version = 0;
     primitive_depth = 0;
     primitive_depth_delta = 0;
     texture_image_addr = 0;
@@ -566,6 +569,7 @@ uint8_t F3DEX2Interpreter::combine_colors(const uint8_t (&texel0)[4], const uint
         }
     };
     uint8_t compare_alpha = 0;
+    const CombinerCycle* cycles = decoded_combine();
     const uint32_t first_cycle = cycle_type == 1 ? 0 : 1;
     const uint32_t cycle_count = cycle_type == 1 ? 2 : 1;
     for (uint32_t cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset) {
@@ -573,25 +577,18 @@ uint8_t F3DEX2Interpreter::combine_colors(const uint8_t (&texel0)[4], const uint
         const bool swap_textures = cycle_type == 1 && cycle == 1;
         mux_texel0 = swap_textures ? texel1 : texel0;
         mux_texel1 = swap_textures ? texel0 : texel1;
-        const uint32_t mux_a = cycle ? ((combine_mode_w0 >> 5) & 0xF) : ((combine_mode_w0 >> 20) & 0xF);
-        const uint32_t mux_b = cycle ? ((combine_mode_w1 >> 24) & 0xF) : ((combine_mode_w1 >> 28) & 0xF);
-        const uint32_t mux_c = cycle ? (combine_mode_w0 & 0x1F) : ((combine_mode_w0 >> 15) & 0x1F);
-        const uint32_t mux_d = cycle ? ((combine_mode_w1 >> 6) & 0x7) : ((combine_mode_w1 >> 15) & 0x7);
-        const uint32_t alpha_a = cycle ? ((combine_mode_w1 >> 21) & 0x7) : ((combine_mode_w0 >> 12) & 0x7);
-        const uint32_t alpha_b = cycle ? ((combine_mode_w1 >> 3) & 0x7) : ((combine_mode_w1 >> 12) & 0x7);
-        const uint32_t alpha_c = cycle ? ((combine_mode_w1 >> 18) & 0x7) : ((combine_mode_w0 >> 9) & 0x7);
-        const uint32_t alpha_d = cycle ? (combine_mode_w1 & 0x7) : ((combine_mode_w1 >> 9) & 0x7);
+        const CombinerCycle& cc = cycles[cycle];
         for (uint32_t channel = 0; channel < 3; ++channel) {
-            const int32_t a = channel_from_color_mux(mux_a, channel, 0);
-            const int32_t b = channel_from_color_mux(mux_b, channel, 1);
-            const int32_t c = channel_from_color_mux(mux_c, channel, 2);
-            const int32_t d = channel_from_color_mux(mux_d, channel, 3);
+            const int32_t a = channel_from_color_mux(cc.ca, channel, 0);
+            const int32_t b = channel_from_color_mux(cc.cb, channel, 1);
+            const int32_t c = channel_from_color_mux(cc.cc, channel, 2);
+            const int32_t d = channel_from_color_mux(cc.cd, channel, 3);
             combined[channel] = (uint8_t)std::clamp(((a - b) * c + 127) / 255 + d, 0, 255);
         }
-        const int32_t aa = channel_from_alpha_mux(alpha_a, 0);
-        const int32_t ab = channel_from_alpha_mux(alpha_b, 1);
-        const int32_t ac = channel_from_alpha_mux(alpha_c, 2);
-        const int32_t ad = channel_from_alpha_mux(alpha_d, 3);
+        const int32_t aa = channel_from_alpha_mux(cc.aa, 0);
+        const int32_t ab = channel_from_alpha_mux(cc.ab, 1);
+        const int32_t ac = channel_from_alpha_mux(cc.ac, 2);
+        const int32_t ad = channel_from_alpha_mux(cc.ad, 3);
         combined[3] = (uint8_t)std::clamp(((aa - ab) * ac + 127) / 255 + ad, 0, 255);
         if (cycle_offset == 0) compare_alpha = combined[3];
     }
@@ -653,10 +650,9 @@ bool F3DEX2Interpreter::blend_colors(const uint8_t (&color)[4], uint8_t shade_al
 }
 
 void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vertex3D& v1, const Vertex3D& v2) {
-    if (color_image_size != 2 || !rdram) return;
-    auto target = render_buffer(color_image_addr);
-    if (!target.pixels) return;
-    const float scale=target.scale, scale_y=target.scale_y;
+    const uint32_t fb_height = framebuffer_height();
+    if (color_image_size != 2 || !tgod::RenderSurfaces::valid_target(rdram, color_image_addr, color_image_width, fb_height)) return;
+    const auto [scale, scale_y] = render_surfaces.scales(color_image_width, fb_height);
 
     float min_x = std::min({ v0.screen_x, v1.screen_x, v2.screen_x });
     float max_x = std::max({ v0.screen_x, v1.screen_x, v2.screen_x });
@@ -666,7 +662,7 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     int32_t i_min_x = int32_t(std::floor(std::max({min_x,float(scissor_xh),0.0f})*scale));
     int32_t i_max_x = int32_t(std::ceil(std::min({max_x,float(scissor_xl),float(color_image_width)})*scale))-1;
     int32_t i_min_y = int32_t(std::floor(std::max({min_y,float(scissor_yh),0.0f})*scale_y));
-    int32_t i_max_y = int32_t(std::ceil(std::min({max_y,float(scissor_yl),float(framebuffer_height())})*scale_y))-1;
+    int32_t i_max_y = int32_t(std::ceil(std::min({max_y,float(scissor_yl),float(fb_height)})*scale_y))-1;
 
     if (i_min_x > i_max_x || i_min_y > i_max_y) return;
 
@@ -691,6 +687,9 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
         return;
     }
 
+    auto target = render_buffer(color_image_addr);
+    if (!target.pixels) return;
+
     float inv_area = 1.0f / area;
 
     uint8_t cur_tile = (texture_tile < 8) ? texture_tile : 0;
@@ -700,19 +699,11 @@ void F3DEX2Interpreter::rasterize_triangle_screen(const Vertex3D& v0, const Vert
     const bool two_cycles = ((other_mode_h >> 20) & 3) == 1;
     bool uses_second_texture = false;
     if (combine_mode_set && two_cycles) {
+        const CombinerCycle* cycles = decoded_combine();
         for (uint32_t cycle = 0; cycle < 2; ++cycle) {
-            const uint32_t color_selectors[4] = {
-                cycle ? ((combine_mode_w0 >> 5) & 15) : ((combine_mode_w0 >> 20) & 15),
-                cycle ? ((combine_mode_w1 >> 24) & 15) : ((combine_mode_w1 >> 28) & 15),
-                cycle ? (combine_mode_w0 & 31) : ((combine_mode_w0 >> 15) & 31),
-                cycle ? ((combine_mode_w1 >> 6) & 7) : ((combine_mode_w1 >> 15) & 7)
-            };
-            const uint32_t alpha_selectors[4] = {
-                cycle ? ((combine_mode_w1 >> 21) & 7) : ((combine_mode_w0 >> 12) & 7),
-                cycle ? ((combine_mode_w1 >> 3) & 7) : ((combine_mode_w1 >> 12) & 7),
-                cycle ? ((combine_mode_w1 >> 18) & 7) : ((combine_mode_w0 >> 9) & 7),
-                cycle ? (combine_mode_w1 & 7) : ((combine_mode_w1 >> 9) & 7)
-            };
+            const CombinerCycle& cc = cycles[cycle];
+            const uint32_t color_selectors[4] = { cc.ca, cc.cb, cc.cc, cc.cd };
+            const uint32_t alpha_selectors[4] = { cc.aa, cc.ab, cc.ac, cc.ad };
             const uint32_t texture_selector = cycle ? 1 : 2;
             for (uint32_t operand = 0; operand < 4; ++operand) {
                 uses_second_texture |= color_selectors[operand] == texture_selector;
@@ -894,10 +885,10 @@ bool F3DEX2Interpreter::load_microcode(uint32_t data_address, uint32_t data_size
 void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
     int8_t width, const Vertex3D& flat_color) {
     const float thickness = 1.5f + float(width)*0.5f;
-    if (!rdram || color_image_size != 2 || !color_image_width || thickness <= 0) return;
-    auto target=render_buffer(color_image_addr);
-    if (!target.pixels) return;
-    const float scale=target.scale, scale_y=target.scale_y;
+    const uint32_t fb_height = framebuffer_height();
+    if (color_image_size != 2 || thickness <= 0 ||
+        !tgod::RenderSurfaces::valid_target(rdram, color_image_addr, color_image_width, fb_height)) return;
+    const auto [scale, scale_y] = render_surfaces.scales(color_image_width, fb_height);
     Vertex3D a = v0, b = v1;
     if (!a.is_screen_space && !b.is_screen_space) {
         // Clip the center segment before the perspective divide, including lines
@@ -943,7 +934,7 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
     if (!std::isfinite(length_squared) || length_squared < 1e-8f ||
         !std::isfinite(a.screen_z) || !std::isfinite(b.screen_z)) return;
     const float length = std::sqrt(length_squared), radius = thickness*0.5f;
-    const int height = int(framebuffer_height());
+    const int height = int(fb_height);
     const float left = std::max({0.0f,float(scissor_xh),std::min(a.screen_x,b.screen_x)-radius});
     const float right = std::min({float(color_image_width),float(scissor_xl),std::max(a.screen_x,b.screen_x)+radius});
     const float top = std::max({0.0f,float(scissor_yh),std::min(a.screen_y,b.screen_y)-radius});
@@ -954,6 +945,8 @@ void F3DEX2Interpreter::rasterize_line(const Vertex3D& v0, const Vertex3D& v1,
         raster_backend->line(*this,a,b,flat_color,thickness);
         return;
     }
+    auto target=render_buffer(color_image_addr);
+    if (!target.pixels) return;
     auto depth_target=(geometry_mode&1) && depth_image_addr ?
         render_buffer(depth_image_addr,(other_mode_l&0x20)!=0) : tgod::RenderSurfaces::Buffer{};
     const bool has_depth=depth_target.pixels && depth_target.scale==scale && depth_target.scale_y==scale_y;
@@ -1323,6 +1316,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                     for (uint32_t i = 0; i < bytes_to_copy; i++) {
                         tmem[tmem_dest + i] = rdram[(texture_image_addr + i) ^ 3];
                     }
+                    ++tmem_version;
                 }
                 break;
             }
@@ -1466,6 +1460,7 @@ void F3DEX2Interpreter::process_display_list(uint32_t dl_addr, uint32_t ucode_da
                         tmem_xor_mask ^= 4;
                     }
                 }
+                ++tmem_version;
                 break;
             }
             case 0xE1: { // G_RDPHALF_1

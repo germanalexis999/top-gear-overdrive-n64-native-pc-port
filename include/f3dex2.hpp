@@ -65,6 +65,32 @@ public:
     uint32_t combine_mode_w1 = 0;
     bool combine_mode_set = false;
     uint32_t combine_mode_updates = 0;
+    struct CombinerCycle {
+        uint8_t ca = 0, cb = 0, cc = 0, cd = 0;
+        uint8_t aa = 0, ab = 0, ac = 0, ad = 0;
+    };
+    mutable uint32_t cached_combine_w0 = 0xFFFFFFFFu;
+    mutable uint32_t cached_combine_w1 = 0xFFFFFFFFu;
+    mutable CombinerCycle cached_combine[2]{};
+    const CombinerCycle* decoded_combine() const {
+        if (cached_combine_w0 != combine_mode_w0 || cached_combine_w1 != combine_mode_w1) {
+            cached_combine[0] = {
+                uint8_t((combine_mode_w0 >> 20) & 0xF), uint8_t((combine_mode_w1 >> 28) & 0xF),
+                uint8_t((combine_mode_w0 >> 15) & 0x1F), uint8_t((combine_mode_w1 >> 15) & 0x7),
+                uint8_t((combine_mode_w0 >> 12) & 0x7), uint8_t((combine_mode_w1 >> 12) & 0x7),
+                uint8_t((combine_mode_w0 >> 9) & 0x7), uint8_t((combine_mode_w1 >> 9) & 0x7),
+            };
+            cached_combine[1] = {
+                uint8_t((combine_mode_w0 >> 5) & 0xF), uint8_t((combine_mode_w1 >> 24) & 0xF),
+                uint8_t(combine_mode_w0 & 0x1F), uint8_t((combine_mode_w1 >> 6) & 0x7),
+                uint8_t((combine_mode_w1 >> 21) & 0x7), uint8_t((combine_mode_w1 >> 3) & 0x7),
+                uint8_t((combine_mode_w1 >> 18) & 0x7), uint8_t(combine_mode_w1 & 0x7),
+            };
+            cached_combine_w0 = combine_mode_w0;
+            cached_combine_w1 = combine_mode_w1;
+        }
+        return cached_combine;
+    }
     uint16_t primitive_depth = 0;
     uint16_t primitive_depth_delta = 0;
 
@@ -79,6 +105,7 @@ public:
     uint32_t texture_scale_s = 0x10000;
     uint32_t texture_scale_t = 0x10000;
     uint32_t tlut_tmem_addr = 2048;
+    uint64_t tmem_version = 0;
 
     // Tiles (0..7)
     struct Tile {
