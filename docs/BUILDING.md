@@ -285,8 +285,9 @@ que se quieren medir:
 Este modo navega hasta la primera carrera y guarda métricas, capturas y tres
 entradas `cpu_task_16.bin`, `cpu_task_60.bin`, `cpu_task_120.bin` junto al EXE.
 Esas entradas contienen memoria del juego y solo sirven para diagnóstico local;
-no deben publicarse ni incluirse en ZIP. El formato depende del ABI y de la
-disposición de estado del renderer de esta revisión; no es un save-state portable.
+no deben publicarse ni incluirse en ZIP. La versión 2 guarda campos explícitos
+con formato versionado; la versión 1 anterior depende del ABI del renderer.
+Ninguna es un save-state portable ni un formato público del juego.
 
 Compilar la herramienta opcional y reproducir una captura desde el checkout:
 
@@ -294,6 +295,32 @@ Compilar la herramienta opcional y reproducir una captura desde el checkout:
 cmake --build build --target tgod_cpu_benchmark
 .\build\tgod_cpu_benchmark.exe "ruta\cpu_task_60.bin" "build\salida.rdram"
 ```
+
+Se puede aumentar el número de repeticiones medidas y mostrar percentiles:
+
+```powershell
+.\build\tgod_cpu_benchmark.exe "ruta\cpu_task_60.bin" --iterations 30
+```
+
+Se admite entre 1 y 10000 repeticiones. La salida opcional `.rdram` y
+`--iterations` también se pueden combinar; la primera ejecución es calentamiento.
+El benchmark GPU admite además reproducción HD con lectura final o modo residente:
+
+```powershell
+.\build\tgod_native_gpu_benchmark.exe "ruta\cpu_task_60.bin" --height 1080 --resident --iterations 30
+```
+
+En modo residente el primer tiempo corresponde al envío de CPU; la lectura de
+control y comparación de la superficie se realizan fuera de ese intervalo.
+El span GPU se informa aparte con queries completadas y percentiles de muestras
+resueltas individualmente; puede incluir huecos de envío y no es un kernel
+aislado. Sin `--resident`, el tiempo CPU incluye
+el readback final. Las capturas anteriores de versión 1 siguen dependiendo del
+ABI del ejecutable; se pueden convertir a versión 2 con `--export-v2 ruta.bin`.
+El contador de uploads mide buffers de entrada, no todas las importaciones de
+superficies. Los totales de preparación y `Map` cubren también el readback de verificación;
+en modo residente ese readback queda fuera del tiempo de envío y no representa
+una descarga final habitual de la presentación HD directa.
 
 La herramienta excluye la primera repetición del tiempo medio y verifica que
 las diez siguientes produzcan la misma memoria. Para comparar optimizaciones,
@@ -330,3 +357,29 @@ cmake --build build --target tgod_native_gpu_benchmark
 Devuelve código 77 si no hay hardware D3D11 compatible. Sus resultados deben
 compararse con CPU por regiones de color/profundidad y tolerancias, además de
 comprobar que el resto de RDRAM no cambia. No publicar esas capturas o buffers.
+
+### IPO y PGO experimentales
+
+Ambas opciones están desactivadas por defecto. IPO se habilita con
+`-DTGOD_ENABLE_IPO=ON`; CMake comprueba si el toolchain lo soporta.
+PGO requiere GCC, un build Release y `TGOD_ENABLE_IPO=OFF`. Usar un directorio
+de build aislado y la misma versión del compilador, fuentes y ruta en ambas fases:
+
+```powershell
+cmake -S . -B build-pgo -G Ninja -DCMAKE_BUILD_TYPE=Release -DTGOD_PGO_MODE=GENERATE
+cmake --build build-pgo --target tgod_native --parallel 4
+# Entrenar build-pgo/tgod_native.exe con ROM propia en distintas escenas y modos.
+cmake -S . -B build-pgo -G Ninja -DCMAKE_BUILD_TYPE=Release -DTGOD_PGO_MODE=USE
+cmake --build build-pgo --target tgod_native --parallel 4
+```
+
+Entrenar en copias aisladas del ejecutable con sus DLL para no alterar la
+configuración ni guardados personales. Los datos de perfil se guardan en
+`build-pgo/pgo-profile`; son privados y no deben publicarse. El build GENERATE
+usa contadores atómicos y los escribe al cerrar, incluso con `quick_exit`. USE
+rechaza perfiles ausentes y usa `-fprofile-correction` para inconsistencias de
+contadores concurrentes. El perfil puede ser incompleto aunque la compilación
+pase: verificar cobertura de intro, menús, circuitos, efectos y multijugador,
+compatibilidad y rendimiento antes de considerar cualquier distribución. No
+publicar el ejecutable instrumentado de GENERATE ni activar PGO por defecto sin
+esa evidencia. Referencia: [opciones de instrumentación de GCC](https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html).

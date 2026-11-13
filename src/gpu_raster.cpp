@@ -1,4 +1,5 @@
 #include "gpu_raster.hpp"
+#include "gpu_bins.hpp"
 #include "f3dex2.hpp"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <iostream>
+#include <chrono>
 
 namespace {
 template<class T> struct Com {
@@ -30,8 +32,19 @@ template<class T> struct Com {
 void checked(HRESULT hr,const char* operation) {
     if(FAILED(hr)) throw std::runtime_error(std::string(operation)+" (HRESULT "+std::to_string(uint32_t(hr))+")");
 }
-static constexpr uint32_t COMMAND_WORDS=96;
-using Command=std::array<uint32_t,COMMAND_WORDS>;
+struct MappedRead {
+    ID3D11DeviceContext* context;
+    ID3D11Resource* resource;
+    D3D11_MAPPED_SUBRESOURCE data{};
+    MappedRead(ID3D11DeviceContext* ctx,ID3D11Resource* res,const char* operation):context(ctx),resource(res) {
+        checked(context->Map(resource,0,D3D11_MAP_READ,0,&data),operation);
+    }
+    ~MappedRead(){context->Unmap(resource,0);}
+    MappedRead(const MappedRead&)=delete;
+    MappedRead& operator=(const MappedRead&)=delete;
+};
+static constexpr uint32_t COMMAND_WORDS=tgod::gpu_bins::command_words;
+using Command=tgod::gpu_bins::Command;
 void put_float(Command& c,int i,float value){std::memcpy(&c[i],&value,4);}
 uint32_t rgba(const Vertex3D& v){return uint32_t(v.r)<<24|uint32_t(v.g)<<16|uint32_t(v.b)<<8|v.a;}
 void vertex(Command& c,int at,const Vertex3D& v,bool perspective) {
@@ -39,12 +52,31 @@ void vertex(Command& c,int at,const Vertex3D& v,bool perspective) {
     put_float(c,at+3,perspective ? 1.0f/(std::abs(v.clip_w)>0.0001f ? std::abs(v.clip_w):1.0f) : 1.0f);
     put_float(c,at+4,v.u);put_float(c,at+5,v.v);c[at+6]=rgba(v);
 }
+// Command word 24 caches the shader's second-texture predicate. Keep the
+// selector decoding identical to the two RDP combiner cycles.
+bool uses_second_texture(const F3DEX2Interpreter& r) {
+    if(!r.combine_mode_set||((r.other_mode_h>>20)&3)!=1 ||
+       ((r.other_mode_h&65536)!=0&&r.texture_max_level==0))return false;
+    const auto w0=r.combine_mode_w0,w1=r.combine_mode_w1;
+    for(unsigned cycle=0;cycle<2;++cycle) {
+        const uint32_t tex=cycle ? 1:2;
+        const std::array<uint32_t,4> colors=cycle ?
+            std::array<uint32_t,4>{(w0>>5)&15,(w1>>24)&15,w0&31,(w1>>6)&7}:
+            std::array<uint32_t,4>{(w0>>20)&15,(w1>>28)&15,(w0>>15)&31,(w1>>15)&7};
+        const std::array<uint32_t,4> alpha=cycle ?
+            std::array<uint32_t,4>{(w1>>21)&7,(w1>>3)&7,(w1>>18)&7,w1&7}:
+            std::array<uint32_t,4>{(w0>>12)&7,(w1>>12)&7,(w0>>9)&7,(w1>>9)&7};
+        if(std::find(colors.begin(),colors.end(),tex)!=colors.end()||colors[2]==tex+7||
+           std::find(alpha.begin(),alpha.end(),tex)!=alpha.end())return true;
+    }
+    return false;
+}
 }
 
 struct GPURaster::Impl {
     Com<ID3D11Device> device;
     Com<ID3D11DeviceContext> context;
-    Com<ID3D11ComputeShader> shader;
+    Com<ID3D11ComputeShader> shader,import_shader;
     Com<ID3D11Buffer> constants,present_constants;
     Com<ID3D11ComputeShader> present_shader;
     Statistics stats;
@@ -67,9 +99,8 @@ struct GPURaster::Impl {
         Com<ID3D11Buffer> buffer;
         Com<ID3D11ShaderResourceView> view;
         uint32_t capacity=0;
-    } inputs[4],native_input;
-    std::vector<uint32_t> upload_scratch,spans,refs;
-    std::vector<std::vector<uint32_t>> bins;
+    } inputs[4],native_input,import_input;
+    std::vector<uint32_t> upload_scratch,spans,refs,bin_cursors;
     Com<IDXGISwapChain1> swapchain;
     Com<ID3D11Texture2D> output,output_staging;
     Com<ID3D11UnorderedAccessView> output_view;
@@ -142,6 +173,7 @@ struct GPURaster::Impl {
             DXGI_ADAPTER_DESC description{};checked(adapter->GetDesc(&description),"Get GPU description");
             char utf8[512]{};WideCharToMultiByte(CP_UTF8,0,description.Description,-1,utf8,sizeof(utf8),nullptr,nullptr);name=utf8;
             checked(device->CreateComputeShader(tgod_gpu_shader,sizeof(tgod_gpu_shader),nullptr,shader.out()),"Create compute shader");
+            checked(device->CreateComputeShader(tgod_import_shader,sizeof(tgod_import_shader),nullptr,import_shader.out()),"Create import shader");
             D3D11_BUFFER_DESC d{};d.ByteWidth=32;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
             checked(device->CreateBuffer(&d,nullptr,constants.out()),"Create GPU constants");
             checked(device->CreateComputeShader(tgod_present_shader,sizeof(tgod_present_shader),nullptr,present_shader.out()),"Create presentation shader");
@@ -180,28 +212,30 @@ struct GPURaster::Impl {
             if(oldest==surfaces.end())throw std::runtime_error("GPU surface cache limit reached");
             erase_surface(oldest);it=surfaces.end();
         }
-        auto cpu=r.render_buffer(address,false);
-        if(!cpu.pixels)return nullptr;
         if(r.color_image_width!=320 && r.color_image_width!=640)
             throw std::runtime_error("Unsupported GPU framebuffer width");
+        const uint32_t nw=r.color_image_width,nh=r.framebuffer_height();
+        if(!tgod::RenderSurfaces::valid_target(r.rdram,address,nw,nh))return nullptr;
+        const auto [sx,sy]=r.render_surfaces.scales(nw,nh);
+        const uint32_t width=uint32_t(nw*sx),height=uint32_t(nh*sy);
+        if(!width||!height)throw std::runtime_error("Invalid GPU surface dimensions");
         if(r.render_surfaces.height()==0) {
-            const uint64_t end=uint64_t(address)+uint64_t(cpu.width)*cpu.height*2;
+            const uint64_t end=uint64_t(address)+uint64_t(width)*height*2;
             for(const auto& [other_key,other]:surfaces)if(other_key!=key&&other->frame==frame_id&&
                 address<uint64_t(other->address)+uint64_t(other->native_width)*other->native_height*2&&end>other->address)
                 throw std::runtime_error("Overlapping native targets require CPU reference rendering");
         }
-        upload_scratch.resize(size_t(cpu.width)*cpu.height);
-        std::copy(cpu.pixels,cpu.pixels+upload_scratch.size(),upload_scratch.begin());
+        const size_t pixels=size_t(width)*height;
         if(it==surfaces.end()) {
             auto s=std::make_unique<Surface>();s->address=address;s->native_width=r.color_image_width;
-            s->native_height=r.framebuffer_height();s->width=cpu.width;s->height=cpu.height;
-            D3D11_BUFFER_DESC d{};d.ByteWidth=UINT(upload_scratch.size()*4);d.Usage=D3D11_USAGE_DEFAULT;
+            s->native_height=nh;s->width=width;s->height=height;
+            D3D11_BUFFER_DESC d{};d.ByteWidth=UINT(pixels*4);d.Usage=D3D11_USAGE_DEFAULT;
             d.BindFlags=D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_SHADER_RESOURCE;
             d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;d.StructureByteStride=4;
             checked(device->CreateBuffer(&d,nullptr,s->buffer.out()),"Create GPU surface");
-            D3D11_UNORDERED_ACCESS_VIEW_DESC view{};view.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;view.Buffer.NumElements=UINT(upload_scratch.size());
+            D3D11_UNORDERED_ACCESS_VIEW_DESC view{};view.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;view.Buffer.NumElements=UINT(pixels);
             checked(device->CreateUnorderedAccessView(s->buffer.p,&view,s->uav.out()),"Create surface UAV");
-            D3D11_SHADER_RESOURCE_VIEW_DESC srv{};srv.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;srv.Buffer.NumElements=UINT(upload_scratch.size());
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv{};srv.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;srv.Buffer.NumElements=UINT(pixels);
             checked(device->CreateShaderResourceView(s->buffer.p,&srv,s->srv.out()),"Create surface SRV");
             if(surfaces.empty())surfaces.reserve(8);
             surfaces.emplace_back(key,std::move(s));it=std::prev(surfaces.end());++stats.surface_allocations;
@@ -209,11 +243,36 @@ struct GPURaster::Impl {
         auto* result=it->second.get();
         // Allocation reuse never implies content reuse: each private snapshot
         // imports the native contents again before its first draw/read.
-        context->UpdateSubresource(result->buffer.p,0,nullptr,upload_scratch.data(),0,0);
+        const auto existing=r.render_surfaces.existing(r.rdram,address,nw,nh);
+        if(r.render_surfaces.height()==0 || existing.pixels) {
+            upload_scratch.resize(pixels);
+            const auto* source=existing.pixels ? existing.pixels : reinterpret_cast<const uint16_t*>(r.rdram+address);
+            std::copy(source,source+pixels,upload_scratch.begin());
+            context->UpdateSubresource(result->buffer.p,0,nullptr,upload_scratch.data(),0,0);
+        } else {
+            // Preserve the CPU's exact float-to-index mapping at scale boundaries.
+            const size_t native_pixels=size_t(nw)*nh;
+            upload_scratch.resize(native_pixels+width+height);
+            const auto* source=reinterpret_cast<const uint16_t*>(r.rdram+address);
+            std::copy(source,source+native_pixels,upload_scratch.begin());
+            for(uint32_t x=0;x<width;++x)upload_scratch[native_pixels+x]=std::min(uint32_t(x/sx),nw-1);
+            for(uint32_t y=0;y<height;++y)upload_scratch[native_pixels+width+y]=std::min(uint32_t(y/sy),nh-1);
+            upload(upload_scratch.data(),uint32_t(upload_scratch.size()),import_input);
+            const uint32_t c[8]={width,height,nw,uint32_t(native_pixels),uint32_t(native_pixels+width),0,0,0};
+            context->UpdateSubresource(constants.p,0,nullptr,c,0,0);
+            context->CSSetShader(import_shader.p,nullptr,0);
+            context->CSSetShaderResources(0,1,&import_input.view.p);
+            context->CSSetConstantBuffers(0,1,&constants.p);
+            context->CSSetUnorderedAccessViews(0,1,&result->uav.p,nullptr);
+            context->Dispatch((width+7)/8,(height+7)/8,1);
+            ID3D11UnorderedAccessView* no_uav=nullptr;ID3D11ShaderResourceView* no_srv=nullptr;
+            context->CSSetUnorderedAccessViews(0,1,&no_uav,nullptr);context->CSSetShaderResources(0,1,&no_srv);
+        }
         result->frame=frame_id;result->used=++use_clock;result->dirty=false;result->written=false;result->revision=++content_clock;
         return result;
     }
     void upload(const void* bytes,uint32_t count,Input& input) {
+        const auto started=std::chrono::steady_clock::now();
         if(!count)throw std::runtime_error("Empty GPU upload");
         if(count>input.capacity) {
             uint32_t capacity=256;while(capacity<count)capacity*=2;
@@ -226,17 +285,18 @@ struct GPURaster::Impl {
         }
         const D3D11_BOX box{0,0,0,count*4,1,1};
         context->UpdateSubresource(input.buffer.p,0,&box,bytes,0,0);
+        stats.upload_bytes+=uint64_t(count)*4;
+        stats.upload_us+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count();
     }
     void flush() {
         if(commands.empty())return;
+        const auto bin_started=std::chrono::steady_clock::now();
         const uint32_t bx=(color->width+31)/32,by=(color->height+31)/32;
-        bins.resize(size_t(bx)*by);for(auto& bin:bins)bin.clear();
-        for(uint32_t i=0;i<commands.size();++i){const auto& c=commands[i];
-            for(uint32_t y=c[3]/32;y<=(c[5]-1)/32;++y)
-                for(uint32_t x=c[2]/32;x<=(c[4]-1)/32;++x)bins[size_t(y)*bx+x].push_back(i*COMMAND_WORDS);
-        }
-        spans.resize(bins.size()*2);refs.clear();
-        for(size_t i=0;i<bins.size();++i){spans[i*2]=uint32_t(refs.size());spans[i*2+1]=uint32_t(bins[i].size());refs.insert(refs.end(),bins[i].begin(),bins[i].end());}
+        const size_t bin_count=size_t(bx)*by;
+        tgod::gpu_bins::build(commands,bx,by,spans,refs,bin_cursors);
+        stats.bin_count+=bin_count;stats.bin_references+=refs.size();
+        for(size_t i=0;i<bin_count;++i)if(!spans[i*2+1])++stats.empty_bins;
+        stats.bin_build_us+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-bin_started).count();
         if(refs.empty()){commands.clear();return;}
         if(texture_words.empty())texture_words.resize(1024);
         upload(commands.data(),uint32_t(commands.size()*COMMAND_WORDS),inputs[0]);
@@ -334,7 +394,8 @@ struct GPURaster::Impl {
         c[6]=nz ? (nz==next ? 2:1):0;c[7]=r.texture_tile&7;c[8]=r.other_mode_h;c[9]=r.other_mode_l;c[10]=r.geometry_mode;
         c[11]=r.prim_color;c[12]=r.env_color;c[13]=r.blend_color;c[14]=r.fog_color;c[15]=r.combine_mode_w0;c[16]=r.combine_mode_w1;
         c[17]=r.combine_mode_set;c[18]=r.primitive_lod_fraction;c[19]=r.primitive_min_lod;c[20]=r.primitive_depth;
-        c[21]=r.fill_color&65535;c[22]=r.texture_max_level;c[23]=r.texture_enabled;c[25]=r.tlut_tmem_addr;
+        c[21]=r.fill_color&65535;c[22]=r.texture_max_level;c[23]=r.texture_enabled;
+        c[24]=kind==0&&uses_second_texture(r);c[25]=r.tlut_tmem_addr;
         if(kind!=1){
             if(!have_tmem || r.tmem_version!=last_tmem_version){
                 tmem_offset=uint32_t(texture_words.size());const size_t old=texture_words.size();texture_words.resize(old+1024);
@@ -412,6 +473,8 @@ void GPURaster::readback(F3DEX2Interpreter& r,uint64_t address,uint64_t bytes) {
     for(const auto& [key,s]:impl->surfaces)if(s->frame==impl->frame_id&&address<uint64_t(s->address)+uint64_t(s->native_width)*s->native_height*2 && address+bytes>s->address){overlap=true;break;}
     if(!overlap)return;
     impl->flush();
+    std::array<Impl::Surface*,8> pending{};
+    size_t pending_count=0;
     for(auto& [key,s]:impl->surfaces){
         if(s->frame!=impl->frame_id || !s->dirty || address>=uint64_t(s->address)+uint64_t(s->native_width)*s->native_height*2 || address+bytes<=s->address)continue;
         if(!s->staging.p){
@@ -421,12 +484,19 @@ void GPURaster::readback(F3DEX2Interpreter& r,uint64_t address,uint64_t bytes) {
         }
         impl->context->CopyResource(s->staging.p,s->buffer.p);
         impl->stats.readback_bytes+=uint64_t(s->width)*s->height*4;
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        checked(impl->context->Map(s->staging.p,0,D3D11_MAP_READ,0,&mapped),"Read GPU framebuffer");
+        pending[pending_count++]=s.get();
+    }
+    // Submit every independent copy before waiting for the first staging map.
+    for(size_t i=0;i<pending_count;++i){
+        auto* s=pending[i];
+        const auto map_started=std::chrono::steady_clock::now();
+        MappedRead mapped(impl->context.p,s->staging.p,"Read GPU framebuffer");
+        impl->stats.map_wait_us+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-map_started).count();
+        ++impl->stats.map_count;
         auto cpu=r.render_surfaces.acquire(r.rdram,s->address,s->native_width,s->native_height);
-        const auto* source=static_cast<const uint32_t*>(mapped.pData);
+        const auto* source=static_cast<const uint32_t*>(mapped.data.pData);
         if(cpu.pixels)std::copy(source,source+size_t(s->width)*s->height,cpu.pixels);
-        impl->context->Unmap(s->staging.p,0);s->dirty=false;
+        s->dirty=false;
     }
 }
 
@@ -463,9 +533,8 @@ bool GPURaster::capture_output(std::vector<uint32_t>& rgba,uint32_t& width,uint3
         checked(impl->device->CreateTexture2D(&d,nullptr,impl->output_staging.out()),"Create output capture");
     }
     impl->context->CopyResource(impl->output_staging.p,impl->output.p);
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    checked(impl->context->Map(impl->output_staging.p,0,D3D11_MAP_READ,0,&mapped),"Capture GPU output");
+    MappedRead mapped(impl->context.p,impl->output_staging.p,"Capture GPU output");
     width=impl->output_width;height=impl->output_height;rgba.resize(size_t(width)*height);
-    for(uint32_t y=0;y<height;++y)std::memcpy(rgba.data()+size_t(y)*width,static_cast<const uint8_t*>(mapped.pData)+size_t(y)*mapped.RowPitch,width*4);
-    impl->context->Unmap(impl->output_staging.p,0);return true;
+    for(uint32_t y=0;y<height;++y)std::memcpy(rgba.data()+size_t(y)*width,static_cast<const uint8_t*>(mapped.data.pData)+size_t(y)*mapped.data.RowPitch,width*4);
+    return true;
 }

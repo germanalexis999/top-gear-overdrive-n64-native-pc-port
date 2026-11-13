@@ -10,12 +10,16 @@ if (WIN32)
 endif()
 
 option(TGOD_BUILD_GAME "Build the game runner (requires local ROM-generated C)" ON)
+option(TGOD_ENABLE_IPO "Enable interprocedural optimization for the game runner when supported" OFF)
+set(TGOD_PGO_MODE "OFF" CACHE STRING "GCC profile-guided optimization: OFF, GENERATE or USE")
+set_property(CACHE TGOD_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(TGOD_PGO_DIR "${CMAKE_CURRENT_BINARY_DIR}/pgo-profile" CACHE PATH "Local GCC profile data directory")
 add_executable(tgod_shader_compiler EXCLUDE_FROM_ALL tools/compile_gpu_shader.cpp)
 target_link_libraries(tgod_shader_compiler PRIVATE d3dcompiler)
 set(TGOD_GPU_SHADER "${CMAKE_CURRENT_BINARY_DIR}/gpu-generated/gpu_shader.hpp")
 add_custom_command(OUTPUT "${TGOD_GPU_SHADER}"
     COMMAND $<TARGET_FILE:tgod_shader_compiler> "${TGOD_GPU_SHADER}"
-    DEPENDS tgod_shader_compiler src/gpu_raster_shader.inc src/gpu_present_shader.inc
+    DEPENDS tgod_shader_compiler src/gpu_raster_shader.inc src/gpu_present_shader.inc src/gpu_import_shader.inc
     VERBATIM)
 set(TGOD_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/N64ModernRuntime" CACHE PATH "N64ModernRuntime checkout")
 set(TGOD_RECOMPILER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/N64Recomp" CACHE PATH "N64Recomp checkout")
@@ -76,6 +80,41 @@ add_executable(tgod_native
     ${RECOMP_SOURCES}
 )
 
+if(TGOD_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT TGOD_IPO_SUPPORTED OUTPUT TGOD_IPO_ERROR LANGUAGES C CXX)
+    if(NOT TGOD_IPO_SUPPORTED)
+        message(FATAL_ERROR "IPO requested but unavailable: ${TGOD_IPO_ERROR}")
+    endif()
+    set_property(TARGET tgod_native PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
+
+if(NOT TGOD_PGO_MODE STREQUAL "OFF")
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "TGOD_PGO_MODE requires GCC for both C and C++")
+    endif()
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Release" OR TGOD_ENABLE_IPO)
+        message(FATAL_ERROR "PGO requires a Release build with TGOD_ENABLE_IPO=OFF")
+    endif()
+    if(TGOD_PGO_MODE STREQUAL "GENERATE")
+        target_compile_definitions(tgod_native PRIVATE TGOD_PGO_GENERATE=1)
+        target_compile_options(tgod_native PRIVATE "-fprofile-generate=${TGOD_PGO_DIR}" -fprofile-update=atomic)
+        target_link_options(tgod_native PRIVATE "-fprofile-generate=${TGOD_PGO_DIR}")
+    elseif(TGOD_PGO_MODE STREQUAL "USE")
+        if(NOT EXISTS "${TGOD_PGO_DIR}")
+            message(FATAL_ERROR "PGO profile directory missing; train the GENERATE build first")
+        endif()
+        target_compile_options(tgod_native PRIVATE "-fprofile-use=${TGOD_PGO_DIR}" -fprofile-correction -Werror=missing-profile)
+        target_link_options(tgod_native PRIVATE "-fprofile-use=${TGOD_PGO_DIR}")
+        # Keep the instrumented and optimized main() control flow identical.
+        # In USE mode no counters are registered, so the final dump is a no-op.
+        target_compile_definitions(tgod_native PRIVATE TGOD_PGO_GENERATE=1)
+        target_link_libraries(tgod_native PRIVATE gcov)
+    else()
+        message(FATAL_ERROR "TGOD_PGO_MODE must be OFF, GENERATE or USE")
+    endif()
+endif()
+
 target_include_directories(tgod_native PRIVATE
     include
     "${CMAKE_CURRENT_BINARY_DIR}/gpu-generated"
@@ -126,4 +165,4 @@ target_link_libraries(tgod_regression_checks PRIVATE ultramodern comdlg32 bcrypt
 add_executable(tgod_gpu_checks EXCLUDE_FROM_ALL
     tools/gpu_regression_checks.cpp src/gpu_raster.cpp src/f3dex2.cpp "${TGOD_GPU_SHADER}")
 target_include_directories(tgod_gpu_checks PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/gpu-generated")
-target_link_libraries(tgod_gpu_checks PRIVATE d3d11 dxgi)
+target_link_libraries(tgod_gpu_checks PRIVATE d3d11 dxgi d3dcompiler)

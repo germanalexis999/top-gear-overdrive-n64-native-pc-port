@@ -1,3 +1,21 @@
+## v0.1.0-preview.14 — optimización de superficies HD y diagnóstico
+
+- Importación HD: sube los píxeles nativos y amplía en GPU con el mismo mapeo
+  que la referencia CPU; conserva el contenido de superficies ya presentes en CPU.
+- Índices de rasterizado contiguos y estables, readbacks agrupados y rechazo
+  temprano de profundidad candidato; conserva el orden, el feedback y SP/DP.
+- Reutiliza buffers de pantalla, reduce trabajo repetido del shader y añade
+  contadores y benchmarks con percentiles y capturas de diagnóstico versionadas.
+- IPO y PGO son experimentales y están desactivados por defecto. El perfil PGO
+  de prueba requirió corregir contadores inconsistentes y no demostró una mejora
+  concluyente de cadencia; no se usa para crear este paquete.
+- Pruebas CPU, GPU y DXGI aprobadas en RTX 3080 Ti. Tres tareas reales conservaron
+  imágenes HD idénticas a 720p/1080p/4K y RDRAM nativa idéntica en comparación
+  con el mismo backend; carreras automáticas y cambios de presentación aprobados.
+- El rechazo temprano y las mejoras quedan pendientes de validación interactiva
+  en todos los circuitos, modos, multijugador y otras GPU. Las mediciones de replay
+  no son FPS de carrera ni garantizan 60 FPS.
+
 ## v0.1.0-preview.13 — optimización de renderizado, audio y empaquetado
 
 - Compactación de comandos GPU y caché de TMEM/superficies: empaqueta los 8

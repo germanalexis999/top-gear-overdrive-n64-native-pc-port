@@ -5,10 +5,96 @@
 #include <functional>
 #include <stdexcept>
 #include <cstring>
+#include <cmath>
+#include <string>
+#include <limits>
+#include <algorithm>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
 
 static void require(bool condition,const char* message){if(!condition)throw std::runtime_error(message);}
+
+static void coordinate_checks() {
+    const char shader_source[]=
+#include "../src/gpu_raster_shader.inc"
+    ;
+    const std::string source(shader_source);
+    const auto begin=source.find("int coord("),end=source.find("bool fetch(",begin);
+    require(begin!=std::string::npos&&end!=std::string::npos,"Find production shader coordinate function");
+    const std::string test=source.substr(begin,end-begin)+R"(
+StructuredBuffer<int4> Input : register(t0);
+RWStructuredBuffer<int> Output : register(u0);
+[numthreads(64,1,1)] void main(uint3 id:SV_DispatchThreadID) {
+    uint n,stride; Input.GetDimensions(n,stride); if(id.x>=n)return;
+    int4 v=Input[id.x]; Output[id.x]=coord(v.x,v.y,uint(v.z&1),uint((v.z>>1)&1),uint(v.w));
+})";
+    struct Case {int32_t value,extent,flags,mask;};
+    std::vector<Case> cases;
+    for(int mask=0;mask<=15;++mask)for(int flags=0;flags<4;++flags){
+        const int p=1<<mask;
+        for(int v:{std::numeric_limits<int>::min(),-100000,-2*p-1,-2*p,-p-1,-p,-1,0,1,p-1,p,p+1,2*p,2*p+1,100000,std::numeric_limits<int>::max()})
+            cases.push_back({v,13,flags,mask});
+    }
+    ID3D11Device* device=nullptr;ID3D11DeviceContext* context=nullptr;ID3DBlob* code=nullptr;ID3DBlob* errors=nullptr;
+    require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Create coordinate test device");
+    const HRESULT hr=D3DCompile(test.data(),test.size(),"coordinate-check",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+    if(errors){std::cerr<<static_cast<const char*>(errors->GetBufferPointer());errors->Release();}
+    require(SUCCEEDED(hr),"Compile production coordinate function");
+    ID3D11ComputeShader* shader=nullptr;ID3D11Buffer *input=nullptr,*output=nullptr,*staging=nullptr;
+    ID3D11ShaderResourceView* srv=nullptr;ID3D11UnorderedAccessView* uav=nullptr;
+    require(SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader)),"Create coordinate shader");code->Release();
+    D3D11_BUFFER_DESC desc{};desc.ByteWidth=UINT(cases.size()*sizeof(Case));desc.Usage=D3D11_USAGE_DEFAULT;
+    desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;desc.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;desc.StructureByteStride=sizeof(Case);
+    D3D11_SUBRESOURCE_DATA init{};init.pSysMem=cases.data();require(SUCCEEDED(device->CreateBuffer(&desc,&init,&input)),"Create coordinate input");
+    require(SUCCEEDED(device->CreateShaderResourceView(input,nullptr,&srv)),"Create coordinate input view");
+    desc.ByteWidth=UINT(cases.size()*sizeof(int32_t));desc.BindFlags=D3D11_BIND_UNORDERED_ACCESS;desc.StructureByteStride=sizeof(int32_t);
+    require(SUCCEEDED(device->CreateBuffer(&desc,nullptr,&output)),"Create coordinate output");
+    require(SUCCEEDED(device->CreateUnorderedAccessView(output,nullptr,&uav)),"Create coordinate output view");
+    desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    require(SUCCEEDED(device->CreateBuffer(&desc,nullptr,&staging)),"Create coordinate staging");
+    context->CSSetShader(shader,nullptr,0);context->CSSetShaderResources(0,1,&srv);context->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
+    context->Dispatch(UINT((cases.size()+63)/64),1,1);context->CopyResource(staging,output);
+    D3D11_MAPPED_SUBRESOURCE mapped{};require(SUCCEEDED(context->Map(staging,0,D3D11_MAP_READ,0,&mapped)),"Map coordinate results");
+    const auto* result=static_cast<const int32_t*>(mapped.pData);
+    for(size_t i=0;i<cases.size();++i){const auto c=cases[i];int v=c.value;
+        if(c.flags&1)v=std::clamp(v,0,c.extent-1);
+        if(c.mask){const int p=1<<c.mask;int phase=v%(p*2);if(phase<0)phase+=p*2;
+            v=(c.flags&2)&&phase>=p ? p*2-1-phase : phase%p;}
+        require(result[i]==v,"GPU coordinate differs from signed modulo reference");
+    }
+    context->Unmap(staging,0);staging->Release();uav->Release();output->Release();srv->Release();input->Release();shader->Release();context->Release();device->Release();
+    std::cout<<"PASS: "<<cases.size()<<" GPU coordinate cases across masks, clamping, mirroring and signed boundaries.\n";
+}
+
+static void import_checks(GPURaster& gpu) {
+    for(const auto [nw,nh]:{std::pair{320u,240u},{640u,120u},{640u,240u},{640u,480u}})
+    for(uint32_t height:{720u,1080u,2160u}) {
+        std::vector<uint8_t> ram(8*1024*1024),reference(ram.size());
+        constexpr uint32_t address=0x100000;
+        auto* native=reinterpret_cast<uint16_t*>(ram.data()+address);
+        for(uint32_t y=0;y<nh;++y)for(uint32_t x=0;x<nw;++x)
+            native[size_t(y)*nw+x]=uint16_t((x*109+y*239+17)&65535);
+        reference=ram;
+        F3DEX2Interpreter cpu(reference.data()),hw(ram.data());
+        for(auto* r:{&cpu,&hw}) {
+            r->set_framebuffer_layout(nw,nh);r->color_image_width=nw;r->color_image_addr=address;
+            r->scissor_xl=nw;r->scissor_yl=nh;r->render_surfaces.set_height(height);r->fill_color=0x1234;
+        }
+        const auto expected=cpu.render_buffer(address,false);
+        gpu.begin_frame(true);gpu.rectangle(hw,0,0,1,1,true,0,0,0,0,0,false);gpu.finish(hw);
+        gpu.readback(hw,address,uint64_t(nw)*nh*2);
+        const auto actual=hw.render_surfaces.existing(hw.rdram,address,nw,nh);
+        require(actual.pixels&&actual.width==expected.width&&actual.height==expected.height,"GPU import dimensions");
+        const auto limit_x=uint32_t(std::ceil(expected.scale)),limit_y=uint32_t(std::ceil(expected.scale_y));
+        for(uint32_t y=0;y<actual.height;++y)for(uint32_t x=0;x<actual.width;++x) {
+            const uint16_t value=x<limit_x&&y<limit_y ? 0x1234 : expected.pixels[size_t(y)*expected.width+x];
+            require(actual.pixels[size_t(y)*actual.width+x]==value,"GPU import differs from CPU mapping");
+        }
+    }
+    std::cout<<"PASS: exact GPU surface import for native layouts at 720p/1080p/4K.\n";
+}
 
 static void presentation_checks(GPURaster& gpu) {
     HWND window=CreateWindowExW(0,L"STATIC",L"GPU regression",WS_POPUP,0,0,128,96,nullptr,nullptr,GetModuleHandle(nullptr),nullptr);
@@ -137,6 +223,8 @@ static void native_commit_checks(GPURaster& gpu) {
 }
 int main(){
     std::cout<<std::unitbuf; GPURaster gpu;if(!gpu.available())return 77;
+    coordinate_checks();
+    import_checks(gpu);
     for(uint32_t height:{720u,1080u}){
         auto compare=[&](const char* name,const std::function<void(F3DEX2Interpreter&)>& draw,uint32_t native_width=320){
             std::vector<uint8_t> a(8*1024*1024),b(a.size());
@@ -155,6 +243,8 @@ int main(){
             cpu.render_surfaces.copy_scanout(cpu.color_image_addr,native_width,cpu.framebuffer_height(),ca,w,h);
             hw.render_surfaces.copy_scanout(hw.color_image_addr,native_width,hw.framebuffer_height(),cb,gw,gh);
             if(w!=gw||h!=gh||ca.empty()||ca.size()!=cb.size())throw std::runtime_error("Missing GPU surface");
+            if(std::strcmp(name,"alpha rejection preserves depth")==0)
+                require(ca[size_t(40*height/240)*w+40*height/240]!=0,"Alpha test did not draw the visible farther triangle");
             size_t differences=0,significant=0;for(size_t i=0;i<ca.size();++i){differences+=ca[i]!=cb[i];bool bad=false;for(int shift:{1,6,11})bad|=std::abs(int((ca[i]>>shift)&31)-int((cb[i]>>shift)&31))>1;significant+=bad;}
             std::cout<<"[GPU check] "<<name<<" "<<height<<"p different pixels: "<<differences<<'/'<<ca.size()<<'\n';
             std::cout<<" significant: "<<significant<<"\n";if(significant){for(size_t i=0,shown=0;i<ca.size() && shown<8;++i)if(std::abs(int((ca[i]>>11)&31)-int((cb[i]>>11)&31))>1){std::cout<<"  pixel "<<i%w<<","<<i/w<<" CPU "<<ca[i]<<" GPU "<<cb[i]<<"\n";++shown;}throw std::runtime_error(name);}
@@ -173,6 +263,22 @@ int main(){
             a.screen_z=b.screen_z=c.screen_z=300;a.a=b.a=c.a=128;r.rasterize_triangle_screen(a,b,c);
             a.r=b.r=c.r=0;a.screen_z=b.screen_z=c.screen_z=500;r.rasterize_triangle_screen(a,b,c);
             a.screen_z=b.screen_z=c.screen_z=100;r.rasterize_triangle_screen(a,b,c);
+        });
+        compare("alpha rejection preserves depth",[](F3DEX2Interpreter& r){
+            auto z=r.render_buffer(r.depth_image_addr);std::fill(z.pixels,z.pixels+size_t(z.width)*z.height,65535);
+            r.texture_enabled=false;r.geometry_mode=1;r.other_mode_l=0x31;r.blend_color=128;
+            Vertex3D a,b,c;a.screen_x=20.125f;a.screen_y=20.125f;b.screen_x=107.3f;b.screen_y=20.125f;c.screen_x=20.125f;c.screen_y=103.7f;
+            a.screen_z=b.screen_z=c.screen_z=100;a.a=b.a=c.a=0;r.rasterize_triangle_screen(a,b,c);
+            a.screen_z=b.screen_z=c.screen_z=300;a.a=b.a=c.a=255;
+            a.r=b.r=c.r=200;a.g=b.g=c.g=100;a.b=b.b=c.b=40;r.rasterize_triangle_screen(a,b,c);
+        });
+        compare("color depth alias",[](F3DEX2Interpreter& r){
+            r.depth_image_addr=r.color_image_addr;
+            auto target=r.render_buffer(r.color_image_addr);std::fill(target.pixels,target.pixels+size_t(target.width)*target.height,65535);
+            r.texture_enabled=false;r.geometry_mode=1;r.other_mode_l=0x30;
+            Vertex3D a,b,c;a.screen_x=20.125f;a.screen_y=20.125f;b.screen_x=107.3f;b.screen_y=20.125f;c.screen_x=20.125f;c.screen_y=103.7f;
+            a.screen_z=b.screen_z=c.screen_z=100;a.r=b.r=c.r=200;r.rasterize_triangle_screen(a,b,c);
+            a.screen_z=b.screen_z=c.screen_z=300;a.r=b.r=c.r=40;r.rasterize_triangle_screen(a,b,c);
         });
         compare("COPY strip mask 15",[](F3DEX2Interpreter& r){
             r.other_mode_h=2<<20;r.tiles[0].size=2;r.tiles[0].line=80;r.tiles[0].lrs=319;r.tiles[0].lrt=5;r.tiles[0].mask_s=r.tiles[0].mask_t=15;
@@ -211,6 +317,16 @@ int main(){
             Vertex3D a,b,c;a.screen_x=20.125f;a.screen_y=20.125f;b.screen_x=107.3f;b.screen_y=20.125f;c.screen_x=20.125f;c.screen_y=103.7f;
             a.u=b.u=c.u=3.37f;a.v=b.v=c.v=4.19f;
             r.rasterize_triangle_screen(a,b,c);
+        });
+        compare("two cycle distinct second texture",[](F3DEX2Interpreter& r){
+            r.other_mode_h=1u<<20;r.texture_enabled=true;r.combine_mode_set=true;
+            // The second cycle's D input reads the swapped second texture.
+            r.combine_mode_w0=0;r.combine_mode_w1=(1u<<6)|6u;
+            for(unsigned i=0;i<2;++i){auto& t=r.tiles[i];t.format=4;t.size=1;t.line=1;
+                t.tmem_addr=i*128;t.lrs=7;t.lrt=7;}
+            std::fill(r.tmem,r.tmem+128,40);std::fill(r.tmem+128,r.tmem+256,200);
+            Vertex3D a,b,c;a.screen_x=20.125f;a.screen_y=20.125f;b.screen_x=107.3f;b.screen_y=20.125f;c.screen_x=20.125f;c.screen_y=103.7f;
+            a.u=b.u=c.u=3.37f;a.v=b.v=c.v=4.19f;r.rasterize_triangle_screen(a,b,c);
         });
         compare("640 pixel target",[](F3DEX2Interpreter& r){
             r.texture_enabled=false;

@@ -93,6 +93,14 @@ public:
         const float scale_y=float(render_height)/(height==480 ? 480.0f : 240.0f);
         return {scale, scale_y};
     }
+    Buffer existing(uint8_t* rdram, uint32_t address, uint32_t width, uint32_t height) {
+        if(ram!=rdram)return {};
+        const uint64_t key=(uint64_t(address)<<32)|width;
+        auto it=std::find_if(surfaces.begin(),surfaces.end(),[key](const auto& entry){return entry.first==key;});
+        if(it==surfaces.end()||it->second.native_height!=height)return {};
+        auto& s=it->second;
+        return {s.pixels.data(),s.width,s.height,s.scale,s.scale_y};
+    }
     Buffer acquire(uint8_t* rdram, uint32_t address, uint32_t width, uint32_t height, bool dirty=true) {
         if (!valid_target(rdram, address, width, height)) return {};
         if (ram!=rdram) { clear(); ram=rdram; }

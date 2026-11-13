@@ -27,11 +27,16 @@
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/input.hpp"
 #include "f3dex2.hpp"
+#include "renderer_capture.hpp"
 #include "rom_loader.hpp"
 #include "vi_scanout.hpp"
 #include "controller_input.hpp"
 #include "controller_mapper.hpp"
 #include "graphics_enhancements.hpp"
+
+#ifdef TGOD_PGO_GENERATE
+extern "C" void __gcov_dump();
+#endif
 
 // Recompiled function headers and overlay definitions
 #include "funcs.h"
@@ -58,6 +63,7 @@ static std::atomic<uint32_t> g_render_height{0};
 static bool g_resolution_check = false;
 static std::atomic<bool> g_resolution_check_done{false};
 static std::atomic<uint64_t> g_native_render_us{0},g_native_render_count{0},g_native_render_max_us{0};
+static std::atomic<uint64_t> g_native_snapshot_us{0},g_native_snapshot_count{0},g_send_dl_us{0},g_send_dl_count{0};
 static std::filesystem::path g_graphics_config;
 static bool g_legacy_version = false;
 static int g_original_resolution = -1; // -1: game, 0: off, 1: half, 2: full
@@ -488,7 +494,7 @@ class AsyncHDRenderer {
     std::mutex mutex;
     std::condition_variable wake;
     std::unique_ptr<Job> pending,spare;
-    std::unique_ptr<Screen> screen_pending;
+    std::unique_ptr<Screen> screen_pending,screen_spare;
     Frame latest;
     std::thread worker;
     bool stopping=false;
@@ -501,6 +507,12 @@ class AsyncHDRenderer {
     std::atomic<uint64_t> snapshot_us{0},snapshot_count{0},screen_bytes{0};
     uint64_t reported_gpu_samples=0,reported_gpu_us=0; // GPU worker only
     GPURaster::Statistics final_stats{};
+    void take_screen_locked(Screen& screen) {
+        if(!screen_pending)return;
+        std::swap(screen,*screen_pending);
+        if(!screen_spare)screen_spare=std::move(screen_pending);
+        else screen_pending.reset();
+    }
     void start_locked() {
         if(!worker.joinable()){worker_done=false;worker=std::thread([this]{run();});}
         wake.notify_one();
@@ -527,7 +539,7 @@ class AsyncHDRenderer {
                 wake.wait(lock,[&]{return stopping||pending||screen_pending;});
                 if(stopping)break;
                 job=std::move(pending);
-                if(screen_pending){screen=std::move(*screen_pending);screen_pending.reset();}
+                take_screen_locked(screen);
             }
             if(job) {
                 if(g_performance_check&&(job->scene&255)==2)++performance_race_jobs;
@@ -576,7 +588,7 @@ class AsyncHDRenderer {
                     } else resident.valid=false;
                     // Use the latest VI/scene after a replay, not the screen
                     // state from before it started computing.
-                    if(screen_pending){screen=std::move(*screen_pending);screen_pending.reset();}
+                    take_screen_locked(screen);
                 }
                 recycle(std::move(job));
             }
@@ -673,7 +685,10 @@ public:
     }
     bool queue_screen(HWND window,const uint8_t* ram,uint32_t origin,uint32_t w,uint32_t h,bool visible) {
         if(!g_render_height.load()&&!g_gpu_window_owned.load())return false;
-        auto next=std::make_unique<Screen>();next->window=window;
+        std::unique_ptr<Screen> next;
+        {std::lock_guard lock(mutex);if(stopping)return false;next=std::move(screen_spare);}
+        if(!next)next=std::make_unique<Screen>();
+        next->window=window;next->width=next->height=1;next->visible=false;
         next->scene=graphics_scene(ram);next->requested_height=g_render_height.load();next->smooth=g_filter_smooth.load();
         if(visible&&origin&&w&&h&&uint64_t(origin)+uint64_t(w)*h*2<=8*1024*1024){
             next->width=w;next->height=h;next->native.resize(size_t(w)*h);
@@ -681,7 +696,8 @@ public:
             screen_bytes.fetch_add(next->native.size()*2);
             next->visible=true;
         } else next->native.assign(1,0);
-        {std::lock_guard lock(mutex);if(stopping)return false;screen_pending.swap(next);start_locked();}
+        {std::lock_guard lock(mutex);if(stopping)return false;screen_pending.swap(next);
+            if(next&&!screen_spare)screen_spare=std::move(next);start_locked();}
         return g_gpu_window_owned.load();
     }
     bool copy_frame(uint32_t scene,uint32_t height,std::vector<uint16_t>& pixels,uint32_t& w,uint32_t& h) {
@@ -692,7 +708,7 @@ public:
         return true;
     }
     void shutdown() {
-        {std::lock_guard lock(mutex);stopping=true;pending.reset();screen_pending.reset();spare.reset();}
+        {std::lock_guard lock(mutex);stopping=true;pending.reset();screen_pending.reset();screen_spare.reset();spare.reset();}
         wake.notify_one();
         if(worker.joinable()){
             // DXGI can require the HWND message pump during teardown. Keep it
@@ -718,6 +734,10 @@ public:
             <<" ms; last submitted snapshot age: "<<display_age_ms.load()<<" ms.\n";
         std::cout<<"[GPU resources] Surface allocations: "<<final_stats.surface_allocations<<", input allocations: "<<final_stats.input_allocations
             <<", raster dispatches: "<<final_stats.dispatches<<", readback bytes: "<<final_stats.readback_bytes<<".\n";
+        std::cout<<"[HD GPU preparation] Bins: "<<final_stats.bin_count<<", empty: "<<final_stats.empty_bins
+            <<", references: "<<final_stats.bin_references<<", bin build: "<<final_stats.bin_build_us
+            <<" us; input upload: "<<final_stats.upload_bytes<<" bytes in "<<final_stats.upload_us
+            <<" us; readback Map: "<<final_stats.map_count<<" calls in "<<final_stats.map_wait_us<<" us.\n";
         std::cout<<"[DXGI] Presents: "<<final_stats.presents<<", occluded: "<<final_stats.occluded<<", busy skipped: "<<final_stats.present_skipped
             <<", resizes: "<<final_stats.resize_count<<", resident HD frames: "<<resident_frames.load()<<", final CPU readbacks: "<<final_stats.final_readbacks<<".\n";
         std::cout<<"[GPU timeline] Samples: "<<final_stats.gpu_samples<<", average replay span: "
@@ -844,7 +864,10 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
         if(g_native_gpu&&!gpu_disabled&&gpu) {
             auto original=interpreter;
             auto* live_ram=interpreter.rdram;
+            const auto snapshot_start=std::chrono::steady_clock::now();
             private_ram.assign(live_ram,live_ram+8*1024*1024);
+            g_native_snapshot_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-snapshot_start).count(),std::memory_order_relaxed);
+            g_native_snapshot_count.fetch_add(1,std::memory_order_relaxed);
             try {
                 interpreter.rdram=private_ram.data();interpreter.raster_backend=gpu.get();
                 gpu->begin_frame(false);
@@ -869,17 +892,11 @@ static void process_graphics_task(F3DEX2Interpreter& interpreter,const OSTask* t
         static uint32_t captured_race_tasks=0;
         const auto index=++captured_race_tasks;
         if(index==16||index==60||index==120) {
-            // Private diagnostic input, tied to this executable's ABI. Never
-            // serialize pointers, container ownership or include it in releases.
-            const auto* tail=reinterpret_cast<const char*>(&interpreter.layout_width);
-            const uint32_t tail_bytes=uint32_t(sizeof(interpreter)-(tail-reinterpret_cast<const char*>(&interpreter)));
-            const uint32_t header[]={0x43504754,1,tail_bytes,uint32_t(task->t.data_ptr),uint32_t(task->t.ucode_data),uint32_t(task->t.ucode_data_size)};
+            // Captures contain game memory and must stay outside releases.
             std::ofstream capture("cpu_task_"+std::to_string(index)+".bin",std::ios::binary);
-            capture.write(reinterpret_cast<const char*>(header),sizeof(header));
-            capture.write(reinterpret_cast<const char*>(interpreter.segments),sizeof(interpreter.segments));
-            capture.write(reinterpret_cast<const char*>(interpreter.tmem),sizeof(interpreter.tmem));
-            capture.write(tail,tail_bytes);
-            capture.write(reinterpret_cast<const char*>(interpreter.rdram),8*1024*1024);
+            if(!tgod::capture::write(capture,interpreter,uint32_t(task->t.data_ptr),
+                uint32_t(task->t.ucode_data),uint32_t(task->t.ucode_data_size)))
+                std::cerr<<"[Performance] Failed to save private graphics capture.\n";
         }
     }
     if (g_resolution_check && !g_resolution_check_done.load() && mode==2 && ++race_frames==100) {
@@ -1059,6 +1076,7 @@ public:
     void enable_instant_present() override {}
 
     void send_dl(const OSTask* task) override {
+        const auto task_start=std::chrono::steady_clock::now();
         uint32_t count = dl_count++;
         if (task && task->t.data_ptr) {
             process_graphics_task(interpreter,task);
@@ -1071,6 +1089,8 @@ public:
                       << ", data_ptr: 0x" << (uintptr_t)task->t.data_ptr
                       << ", data_size: 0x" << task->t.data_size << std::dec << "\n";
         }
+        g_send_dl_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-task_start).count(),std::memory_order_relaxed);
+        g_send_dl_count.fetch_add(1,std::memory_order_relaxed);
     }
 
     void send_dummy_workload(uint32_t) override {}
@@ -2072,6 +2092,8 @@ int main(int argc, char** argv) {
     std::cout << "[Native render] Average: " << g_native_render_us.load()/std::max(uint64_t(1),g_native_render_count.load())
               << " us, maximum: " << g_native_render_max_us.load() << " us; scale: " << authoritative_scale << ".\n";
     std::cout<<"[Native GPU] Completed: "<<g_native_gpu_tasks.load()<<", failed tasks retried on CPU: "<<g_native_gpu_fallbacks.load()<<".\n";
+    std::cout<<"[Graphics timing] send_dl calls: "<<g_send_dl_count.load()<<", total: "<<g_send_dl_us.load()
+        <<" us; native snapshot copies: "<<g_native_snapshot_count.load()<<", total: "<<g_native_snapshot_us.load()<<" us.\n";
     g_audio_backend.shutdown();
     ultramodern::join_saving_thread();
     if (std::filesystem::exists("saves/tgod_usa.bin")) {
@@ -2083,6 +2105,11 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_resolution_check && !g_resolution_check_done.load())
         std::cerr << "[Resolution comparison] Race frame was not captured; increase --seconds.\n";
+#ifdef TGOD_PGO_GENERATE
+    // quick_exit intentionally bypasses normal static destructors/atexit.
+    // Dump only for explicitly instrumented builds after worker shutdown.
+    __gcov_dump();
+#endif
     std::quick_exit((loaded_count == 4 && (!g_resolution_check || g_resolution_check_done.load()) &&
         (!g_presentation_check || g_hd_renderer.presented())) ? 0 : 2);
 }

@@ -54,6 +54,7 @@ y conservando las lecturas de framebuffer que necesitan los efectos del juego.
 
 - [Compilación, ROM local, pruebas y controles](docs/BUILDING.md)
 - [Estado, evidencia y pendientes](docs/STATUS.md)
+- [Análisis y plan de optimización por etapas](docs/OPTIMIZATION-PLAN-2026-11-13.md)
 - [Dependencias y avisos de terceros](THIRD_PARTY_NOTICES.md)
 - [Empaquetar y publicar versiones separadas](docs/RELEASES.md)
 

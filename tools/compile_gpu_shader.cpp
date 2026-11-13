@@ -12,6 +12,9 @@ const char raster_source[]=
 const char present_source[]=
 #include "../src/gpu_present_shader.inc"
 ;
+const char import_source[]=
+#include "../src/gpu_import_shader.inc"
+;
 bool compile(std::ofstream& out,const char* source,const char* name) {
     ID3DBlob* code=nullptr;ID3DBlob* errors=nullptr;
     const HRESULT hr=D3DCompile(source,std::strlen(source),name,nullptr,nullptr,"main","cs_5_0",
@@ -28,5 +31,5 @@ int main(int argc,char** argv) {
     const std::filesystem::path target(argv[1]);std::filesystem::create_directories(target.parent_path());
     std::ofstream out(target,std::ios::binary|std::ios::trunc);
     out<<"// Generated port-owned shaders. Do not edit.\n#pragma once\n";
-    return compile(out,raster_source,"tgod_gpu_shader")&&compile(out,present_source,"tgod_present_shader") ? 0:1;
+    return compile(out,raster_source,"tgod_gpu_shader")&&compile(out,present_source,"tgod_present_shader")&&compile(out,import_source,"tgod_import_shader") ? 0:1;
 }

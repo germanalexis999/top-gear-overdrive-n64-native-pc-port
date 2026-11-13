@@ -15,7 +15,7 @@ int4 unpack16(uint c){return int4(((c>>11)&31)*255/31,((c>>6)&31)*255/31,((c>>1)
 uint texbyte(uint b,uint address){uint word=Textures[C(b,1)+((address&4095)>>2)];return (word>>((address&3)*8))&255;}
 int coord(int v,int extent,uint cl,uint mi,uint mask){
     if(cl!=0)v=clamp(v,0,extent-1);
-    if(mask!=0){int period=1<<mask;int phase=v%(period*2);if(phase<0)phase+=period*2;v=mi!=0&&phase>=period ? period*2-1-phase : phase%period;}
+    if(mask!=0){uint period=1u<<mask;uint phase=uint(v)&(period*2u-1u);v=int(mi!=0&&phase>=period ? period*2u-1u-phase : phase&(period-1u));}
     return v;
 }
 bool fetch(uint b,uint ti,int x,int y,out int4 col){
@@ -127,16 +127,6 @@ uint2 lodTiles(uint b,float footprint,out int fraction){
     if(detail||sharp)level=max(level,0);else f=max(f,0);
     fraction=int(f*255);return uint2(clamp(level,0,int(C(b,22))),clamp(level+1,0,int(C(b,22))));
 }
-bool secondTexture(uint b){
-    if(C(b,17)==0||((C(b,8)>>20)&3)!=1)return false;
-    if((C(b,8)&65536)!=0&&C(b,22)==0)return false;
-    uint w0=C(b,15),w1=C(b,16);
-    [unroll]for(uint i=0;i<2;++i){uint tex=i!=0 ? 1:2;
-        uint4 colors=i!=0 ? uint4((w0>>5)&15,(w1>>24)&15,w0&31,(w1>>6)&7):uint4((w0>>20)&15,(w1>>28)&15,(w0>>15)&31,(w1>>15)&7);
-        uint4 alphas=i!=0 ? uint4((w1>>21)&7,(w1>>3)&7,(w1>>18)&7,w1&7):uint4((w0>>12)&7,(w1>>12)&7,(w0>>9)&7,(w1>>9)&7);
-        if(any(colors==tex)||colors.z==tex+7||any(alphas==tex))return true;
-    }return false;
-}
 bool validTile(uint b,uint ti){uint t=b+64+ti*4;uint w2=Commands[t+2],w3=Commands[t+3];int w=int(w3&65535)-int(w2&65535)+1,h=int(w3>>16)-int(w2>>16)+1;return w>0&&h>0&&w<=1024&&h<=1024;}
 [numthreads(8,8,1)]
 void main(uint3 id:SV_DispatchThreadID){
@@ -158,6 +148,14 @@ void main(uint3 id:SV_DispatchThreadID){
             if(!((area>0&&w0>=0&&w1>=0&&w2>=0)||(area<0&&w0<=0&&w1<=0&&w2<=0)))continue;
             float3 weights=float3(w0,w1,w2)/area;
             curZ=dot(weights,float3(F(b,34),F(b,42),F(b,50)));
+            // Reject hidden triangles before texture sampling. Depth is only
+            // written after alpha/blend accepts the pixel, as in the late path.
+            if(C(b,6)!=0){
+                if(C(b,6)==2)z=pixel;
+                else if(!depthLoaded){z=Depth[at];depthLoaded=true;}
+                zValue=(mode&4)!=0 ? C(b,20)&32767:uint(clamp(curZ*32,0,65532));
+                if((mode&16)!=0&&zValue>z)continue;
+            }
             shade=int4(clamp(weights.x*unpack(C(b,38))+weights.y*unpack(C(b,46))+weights.z*unpack(C(b,54)),0,255));
             uint base=tile;if(!validTile(b,base)&&validTile(b,0))base=0;
             bool textured=C(b,23)!=0&&validTile(b,base);
@@ -165,15 +163,18 @@ void main(uint3 id:SV_DispatchThreadID){
                 float3 inv=float3(F(b,35),F(b,43),F(b,51));float3 wp=float3(w0,w1,w2)*inv;
                 float sum=wp.x+wp.y+wp.z,invSum=abs(sum)>1e-7 ? 1/sum:1;
                 float2 uv=(wp.x*uvAt(b,32)+wp.y*uvAt(b,40)+wp.z*uvAt(b,48))*invSum;
-                float3 dx=float3(c.y-v.y,a.y-c.y,v.y-a.y)*inv,dy=float3(v.x-c.x,c.x-a.x,a.x-v.x)*inv;
-                float wx=dx.x+dx.y+dx.z,wy=dy.x+dy.y+dy.z;
-                float2 ux=dx.x*uvAt(b,32)+dx.y*uvAt(b,40)+dx.z*uvAt(b,48);
-                float2 uy=dy.x*uvAt(b,32)+dy.y*uvAt(b,40)+dy.z*uvAt(b,48);
-                float2 fx=abs((ux-uv*wx)*invSum),fy=abs((uy-uv*wy)*invSum);
-                uint2 levels=lodTiles(b,max(max(fx.x,fx.y)/ScaleX,max(fy.x,fy.y)/ScaleY),lod);
+                uint2 levels=uint2(0,1);
+                if((C(b,8)&65536)!=0){
+                    float3 dx=float3(c.y-v.y,a.y-c.y,v.y-a.y)*inv,dy=float3(v.x-c.x,c.x-a.x,a.x-v.x)*inv;
+                    float wx=dx.x+dx.y+dx.z,wy=dy.x+dy.y+dy.z;
+                    float2 ux=dx.x*uvAt(b,32)+dx.y*uvAt(b,40)+dx.z*uvAt(b,48);
+                    float2 uy=dy.x*uvAt(b,32)+dy.y*uvAt(b,40)+dy.z*uvAt(b,48);
+                    float2 fx=abs((ux-uv*wx)*invSum),fy=abs((uy-uv*wy)*invSum);
+                    levels=lodTiles(b,max(max(fx.x,fx.y)/ScaleX,max(fy.x,fy.y)/ScaleY),lod);
+                }
                 uint first=levels.x!=0 ? (tile+levels.x)&7:base;
                 if(!sampleTile(b,first,uv,filtered,tex0))continue;
-                tex1=tex0;if(secondTexture(b))sampleTile(b,(tile+levels.y)&7,uv,filtered,tex1);
+                tex1=tex0;if(C(b,24)!=0)sampleTile(b,(tile+levels.y)&7,uv,filtered,tex1);
             }
         }else if(kind==2){
             float2 delta=float2(id.xy)/float2(ScaleX,ScaleY)-float2(F(b,32),F(b,33));if(C(b,38)!=0)delta=delta.yx;
@@ -188,7 +189,7 @@ void main(uint3 id:SV_DispatchThreadID){
             curZ=F(b,34)+(F(b,42)-F(b,34))*t;
             shade=(C(b,10)&4)==0 ? unpack(C(b,11)):(C(b,10)&0x200000)==0 ? unpack(C(b,54)):int4(clamp(lerp(unpack(C(b,38)),unpack(C(b,46)),t),0,255));
         }
-        if(C(b,6)!=0){
+        if(kind!=0&&C(b,6)!=0){
             if(C(b,6)==2)z=pixel;
             else if(!depthLoaded){z=Depth[at];depthLoaded=true;}
             zValue=(mode&4)!=0 ? C(b,20)&32767:uint(clamp(curZ*32,0,65532));

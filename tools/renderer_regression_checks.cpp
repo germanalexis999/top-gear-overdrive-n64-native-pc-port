@@ -1,4 +1,6 @@
 #include "f3dex2.hpp"
+#include "renderer_capture.hpp"
+#include "gpu_bins.hpp"
 #include "rom_loader.hpp"
 #include "vi_scanout.hpp"
 #include "controller_input.hpp"
@@ -840,6 +842,71 @@ static void check_cpu_texture_math(uint8_t* ram) {
     std::cout<<"PASS: CPU texture math matches reference LOD boundaries/random values, shifts/filtering and signed mask addressing.\n";
 }
 
+static void check_gpu_bins() {
+    using namespace tgod::gpu_bins;
+    uint32_t random=1234567;
+    auto next=[&]{random^=random<<13;random^=random>>17;random^=random<<5;return random;};
+    std::vector<uint32_t> spans,refs,cursors;
+    for(unsigned run=0;run<100;++run){
+        const uint32_t w=1+next()%257,h=1+next()%257,bx=(w+31)/32,by=(h+31)/32;
+        const unsigned count=run==99 ? 8192 : next()%200;
+        std::vector<Command> commands(count);
+        std::vector<std::vector<uint32_t>> reference(size_t(bx)*by);
+        for(unsigned i=0;i<count;++i){auto& c=commands[i];
+            c[2]=next()%w;c[3]=next()%h;c[4]=c[2]+1+next()%(w-c[2]);c[5]=c[3]+1+next()%(h-c[3]);
+            if(i%17==0)c[4]=c[2];
+            if(c[2]>=c[4]||c[3]>=c[5])continue;
+            for(uint32_t y=c[3]/32;y<=(c[5]-1)/32;++y)
+                for(uint32_t x=c[2]/32;x<=(c[4]-1)/32;++x)reference[size_t(y)*bx+x].push_back(i*command_words);
+        }
+        build(commands,bx,by,spans,refs,cursors);
+        size_t offset=0;
+        for(size_t i=0;i<reference.size();++i){
+            require(spans[i*2]==offset&&spans[i*2+1]==reference[i].size(),"GPU bin span mismatch");
+            for(uint32_t value:reference[i])require(refs[offset++]==value,"GPU bin order mismatch");
+        }
+        require(offset==refs.size(),"GPU bin reference count mismatch");
+        const auto span_capacity=spans.capacity(),ref_capacity=refs.capacity(),cursor_capacity=cursors.capacity();
+        build(commands,bx,by,spans,refs,cursors);
+        require(spans.capacity()==span_capacity&&refs.capacity()==ref_capacity&&cursors.capacity()==cursor_capacity,"GPU bins did not reuse capacity");
+    }
+    std::vector<Command> invalid(1);invalid[0][4]=65;invalid[0][5]=1;
+    bool rejected=false;try{build(invalid,2,1,spans,refs,cursors);}catch(const std::runtime_error&){rejected=true;}
+    require(rejected,"Out-of-range GPU bin command accepted");
+    std::cout<<"PASS: stable GPU bin spans, ordering, bounds and capacity reuse.\n";
+}
+
+static void check_capture_format() {
+    std::vector<uint8_t> ram(8*1024*1024,0x5a),restored_ram(ram.size());
+    F3DEX2Interpreter source(ram.data()),restored(restored_ram.data());
+    source.layout_width=640;source.layout_height=240;source.color_image_addr=0x123456;
+    source.segments[3]=0x80012345;source.tmem[4095]=0xa7;source.other_mode_h=0x12345678;
+    source.tiles[3].uls=13;source.tiles[3].ult_fraction=3;source.vertex_buffer[7].screen_x=-1.25f;
+    source.vertex_buffer[7].is_screen_space=true;source.modelview_stack[2].m[1][3]=42.5f;
+    source.modelview_stack_depth=3;source.proj_stack_depth=2;source.dl_stack_depth=4;
+    source.microcode=F3DEX2Interpreter::Microcode::L3DEX2;source.lights[2].direction[1]=-0.75f;
+    std::ostringstream encoded(std::ios::out|std::ios::binary);
+    require(tgod::capture::write(encoded,source,0x1000,0x2000,0x800),"Write capture v2");
+    const auto bytes=encoded.str();std::istringstream input(bytes,std::ios::in|std::ios::binary);
+    uint32_t h[6]{};tgod::capture::Archive<true> header(input);for(auto& v:h)header.field(v);
+    require(header.ok()&&h[0]==tgod::capture::magic&&h[1]==2&&h[3]==0x1000&&h[4]==0x2000&&h[5]==0x800,"Capture header");
+    require(tgod::capture::read_v2(input,restored,h[2]),"Read capture v2");
+    input.read(reinterpret_cast<char*>(restored_ram.data()),restored_ram.size());
+    require(bool(input)&&restored_ram==ram&&input.peek()==std::char_traits<char>::eof(),"Capture RAM roundtrip");
+    std::ostringstream roundtrip(std::ios::out|std::ios::binary);
+    require(tgod::capture::write(roundtrip,restored,h[3],h[4],h[5])&&roundtrip.str()==bytes,"Capture state roundtrip");
+    std::istringstream short_state(bytes.substr(24,h[2]-1),std::ios::in|std::ios::binary);
+    require(!tgod::capture::read_v2(short_state,restored,h[2]),"Truncated capture accepted");
+    std::istringstream oversized("",std::ios::in|std::ios::binary);
+    require(!tgod::capture::read_v2(oversized,restored,uint32_t(tgod::capture::max_state_bytes+1)),"Oversized capture accepted");
+    source.dl_stack_depth=F3DEX2Interpreter::MAX_DL_STACK+1;
+    std::ostringstream invalid(std::ios::out|std::ios::binary);require(tgod::capture::write(invalid,source,0,0,0),"Write invalid test state");
+    std::istringstream bad(invalid.str(),std::ios::in|std::ios::binary);tgod::capture::Archive<true> bad_header(bad);
+    for(auto& v:h)bad_header.field(v);
+    require(!tgod::capture::read_v2(bad,restored,h[2]),"Invalid stack depth accepted");
+    std::cout<<"PASS: versioned explicit capture roundtrip, truncation, size and stack bounds.\n";
+}
+
 int main() {
     try {
         check_controller_ports();
@@ -854,6 +921,8 @@ int main() {
         require(tgod::normalize_rom_bytes(swapped32) && swapped32 == expected, "n64 normalization failed");
         require(!tgod::normalize_rom_bytes(invalid) && !tgod::normalize_rom_bytes(truncated), "Invalid ROM header accepted");
         std::vector<uint8_t> ram(8 * 1024 * 1024);
+        check_gpu_bins();
+        check_capture_format();
         check_cpu_texture_math(ram.data());
         check_texture_rows(ram.data());
         check_tile_sampling(ram.data());

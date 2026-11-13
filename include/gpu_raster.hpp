@@ -32,6 +32,8 @@ public:
         uint64_t final_readbacks=0,dispatches=0,presents=0,resize_count=0,occluded=0,present_skipped=0;
         uint64_t gpu_samples=0,gpu_elapsed_us=0,gpu_max_us=0,timing_skipped=0;
         uint64_t gpu_long_spans=0,gpu_first_long_frame=0;
+        uint64_t bin_build_us=0,upload_us=0,upload_bytes=0,map_wait_us=0,map_count=0;
+        uint64_t bin_references=0,empty_bins=0,bin_count=0;
     };
     Statistics statistics() const;
     void begin_frame(bool keep_on_gpu=false);
